@@ -20,7 +20,7 @@ from pathlib import Path
 
 import allure
 import pytest
-from PySide6.QtCore import QEvent, QPoint
+from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint
 
 from ok_helper import gui
 
@@ -572,6 +572,129 @@ class TestNavigation:
         window.on_refresh()
 
         assert '[КАТАЛОГ]' in log_text(window)
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2a. Выделение в дереве и его сохранение
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Выделение в дереве')
+class TestTreeSelection:
+    """Перестройка дерева не должна терять выделенный элемент.
+
+    FileTreeModel.refresh() пересоздаёт все элементы, и без
+    восстановления файл выглядел выделенным, но действия («В
+    проводнике», F2, Ctrl+Y) срабатывали только после повторного клика.
+    """
+
+    def test_select_path_sets_current_item(self, window, files):
+        target = files / 'track.plt'
+
+        assert window._select_path(target) is True
+        assert window._selected_path() == target
+        index = window.tree_view.currentIndex()
+        assert index.isValid()
+        assert index in window.tree_view.selectionModel().selectedIndexes()
+
+    def test_select_path_of_missing_item(self, window, files):
+        assert window._select_path(files / 'нет-такого.gpx') is False
+        assert window._select_path(None) is False
+
+    @pytest.mark.smoke
+    def test_rebuild_keeps_selection(self, window, files):
+        target = files / '2026-09-17_11-55_бабушка.gpx'
+        select(window, target)
+
+        window.rebuild_tree()
+
+        assert window._selected_path() == target
+        assert window.tree_view.currentIndex().isValid()
+        assert window.tree_view.selectionModel().selectedIndexes()
+
+    def test_rebuild_keeps_directory_selection(self, window, files):
+        target = files / '2026-09-23_Moscow'
+        select(window, target)
+
+        window.rebuild_tree()
+
+        assert window._selected_path() == target
+
+    def test_rebuild_keeps_selection_in_nested_folder(self, window, files):
+        """Выделение внутри раскрытой вложенной папки тоже сохраняется."""
+        target = files / '2026-09-23_Moscow' / '100m.gpx'
+        select(window, target)
+
+        window.rebuild_tree()
+
+        assert window._selected_path() == target
+
+    def test_rebuild_after_file_disappears(self, window, files):
+        """Если выбранный файл исчез, выделения просто нет."""
+        target = files / 'track.plt'
+        select(window, target)
+        target.unlink()
+
+        window.rebuild_tree()
+
+        assert window._selected_path() is None
+
+    def test_selected_path_falls_back_to_selection_model(self, window, files):
+        """Запасной путь: выделение есть, а текущий индекс пуст.
+
+        Именно так ведёт себя Qt: после перестройки модели текущий
+        индекс может очиститься, а выделенная строка остаться.
+        """
+        target = files / 'track.plt'
+        item = window.tree_model.find_item(target)
+        index = window.tree_model.indexFromItem(item)
+        window.tree_view.setCurrentIndex(gui.QModelIndex())
+        window.tree_view.selectionModel().select(
+            index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+
+        assert window.tree_view.currentIndex().isValid() is False
+        assert window._selected_path() == target
+
+    def test_selected_path_without_selection(self, window, files):
+        window.tree_view.clearSelection()
+        window.tree_view.setCurrentIndex(gui.QModelIndex())
+
+        assert window._selected_path() is None
+
+    def test_rename_selects_new_name(self, window, files, monkeypatch):
+        src = files / 'track.plt'
+        select(window, src)
+        stub_dialog(monkeypatch, 'RenameDialog', result='renamed.plt')
+
+        window.on_rename()
+
+        assert window._selected_path() == files / 'renamed.plt'
+
+    def test_apply_fix_selects_new_name(self, window, files):
+        src = files / '2026-09-17_11-55_бабушка.gpx'
+        select(window, src)
+
+        window.on_apply_fix()
+
+        assert window._selected_path() == files / '20260917_Babushka.gpx'
+
+    def test_fix_all_selects_last_fixed(self, window, files, msgbox):
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_fix_all()
+
+        assert window._selected_path() == files / '20260917_Babushka.gpx'
+
+    def test_selection_survives_refresh_after_new_file(self, window, files,
+                                                       qapp):
+        """Сценарий пользователя: файл скачался -> дерево перестроилось."""
+        target = files / 'track.plt'
+        select(window, target)
+        (files / 'новая_папка').mkdir()
+        qapp.processEvents()
+
+        window._do_refresh()
+
+        assert window._selected_path() == target
 
 
 # ─────────────────────────────────────────────────────────────────

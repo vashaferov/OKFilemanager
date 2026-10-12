@@ -2356,10 +2356,37 @@ class MainWindow(QMainWindow):
 
     # ---------- дерево ----------
     def rebuild_tree(self):
+        """Перечитывает дерево, сохраняя выделенный элемент.
+
+        FileTreeModel.refresh() пересоздаёт все элементы, поэтому
+        currentIndex и выделение терялись: после любой перестройки
+        (watchdog, перенос, правка имени, загрузка на FTP) файл
+        выглядел выделенным, но действия работали только после
+        повторного клика.
+        """
+        selected = self._selected_path()
         self.tree_model.refresh()
         self._restore_expansion()
+        self._select_path(selected)
         self.path_edit.setText(str(self.tree_root))
         self.update_status()
+
+    def _select_path(self, path: Optional[Path]) -> bool:
+        """Делает элемент path текущим и выделенным.
+
+        Возвращает False, если элемента нет: после перестройки дерево
+        могло измениться.
+        """
+        if path is None:
+            return False
+        item = self.tree_model.find_item(path)
+        if item is None:
+            return False
+        index = self.tree_model.indexFromItem(item)
+        if not index.isValid():
+            return False
+        self.tree_view.setCurrentIndex(index)
+        return True
 
     def _restore_expansion(self):
         for p in sorted(self.tree_model.expanded_paths,
@@ -2371,16 +2398,20 @@ class MainWindow(QMainWindow):
             self.tree_view.setExpanded(idx, True)
 
     def _selected_path(self) -> Optional[Path]:
-        idx = self.tree_view.currentIndex()
-        if not idx.isValid():
-            return None
-        item = self.tree_model.itemFromIndex(idx)
-        if item is None:
-            return None
-        p_str = item.data(ROLE_PATH)
-        if not p_str:
-            return None
-        return Path(p_str)
+        """Путь выделенного элемента.
+
+        Сначала currentIndex (обычный случай), затем запасной путь по
+        выделенным строкам: после перестройки модели Qt может очистить
+        текущий индекс, оставив выделение.
+        """
+        path = self._path_from_index(self.tree_view.currentIndex())
+        if path is not None:
+            return path
+        for index in self.tree_view.selectionModel().selectedRows():
+            path = self._path_from_index(index)
+            if path is not None:
+                return path
+        return None
 
     def _path_from_index(self, index: QModelIndex) -> Optional[Path]:
         item = self.tree_model.itemFromIndex(index)
@@ -2711,6 +2742,9 @@ class MainWindow(QMainWindow):
             self.log(f'[ОШБ] {e}', 'error')
             return
         self.rebuild_tree()
+        # Держим выделение на переименованном файле: старое имя
+        # исчезло, а новое должно быть готово к следующему действию.
+        self._select_path(new_path)
 
     def on_move(self):
         if self._warn_wrong_tab('Переместить'):
@@ -2817,6 +2851,7 @@ class MainWindow(QMainWindow):
             self.log(f'[ОШБ] {e}', 'error')
             return
         self.rebuild_tree()
+        self._select_path(new_path)
 
     def on_fix_all(self):
         files: List[Tuple[Path, str]] = []
@@ -2834,6 +2869,7 @@ class MainWindow(QMainWindow):
         ) != QMessageBox.Yes:
             return
         count = 0
+        last_renamed: Optional[Path] = None
         for path, new_name in files:
             new_path = path.with_name(new_name)
             if new_path.exists():
@@ -2843,10 +2879,13 @@ class MainWindow(QMainWindow):
                 path.rename(new_path)
                 self.log(f'[OK] {path.name} -> {new_name}', 'ok')
                 count += 1
+                last_renamed = new_path
             except OSError as e:
                 self.log(f'[ОШБ] {path.name}: {e}', 'error')
         self.log(f'[OK] Исправлено: {count}', 'ok')
         self.rebuild_tree()
+        # Показываем результат: выделяем последний исправленный файл.
+        self._select_path(last_renamed)
 
     # ---------- FTP ----------
     def on_ftp_connect(self):
