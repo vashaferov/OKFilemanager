@@ -23,18 +23,20 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import (
-    QModelIndex, QObject, Qt, QTimer, Signal, Slot,
+    QModelIndex, QObject, QSize, Qt, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QKeySequence,
-    QStandardItem, QStandardItemModel, QTextCharFormat, QTextCursor,
+    QAction, QColor, QDesktopServices, QIcon, QKeySequence,
+    QStandardItem, QStandardItemModel, QTextBlockFormat, QTextCharFormat,
+    QTextCursor, QTextOption,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QPlainTextEdit, QPushButton, QSplitter, QStyle,
-    QStatusBar, QTabWidget, QToolBar, QTreeView, QVBoxLayout, QWidget,
+    QDockWidget, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSplitter,
+    QStyle, QToolButton, QStatusBar, QTabWidget, QToolBar, QTreeView,
+    QVBoxLayout, QWidget,
 )
 
 from config import config_path, save_config
@@ -48,7 +50,7 @@ from ok_helper.ftp import (
     upload_extensions_hint, upload_file, upload_reason_for,
     validate_folder_name, validate_upload_target,
 )
-from ok_helper.handlers import DirHandler
+from ok_helper.handlers import DirHandler, DownloadsHandler
 from ok_helper.translit import transliterate
 
 from watchdog.observers import Observer
@@ -57,6 +59,83 @@ from watchdog.observers import Observer
 STUB_TEXT = '(загрузка…)'
 ROLE_PATH = Qt.UserRole + 1
 ROLE_FTP_NAME = Qt.UserRole + 2
+
+# Ключи ввода-вывода состояния интерфейса в конфиге.
+UI_STATE_KEYS = ('window_geometry', 'splitter_state', 'tree_column_widths',
+                 'log_visible')
+
+# Отступ журнала под отметку времени: продолжение длинной записи
+# переносится с этим отступом, а не под цифрами времени.
+LOG_INDENT = 62
+
+
+def _ui_geometry(width: int, height: int, x: int, y: int) -> str:
+    return f'{int(width)},{int(height)},{int(x)},{int(y)}'
+
+
+def _parse_ui_geometry(text: str) -> Optional[Tuple[int, int, int, int]]:
+    """Разбирает 'ШxВ+X+Y', записанную _ui_geometry.
+
+    Возвращает None, если строка пустая или испорченная, чтобы окно
+    открылось с размерами по умолчанию и не потерялось за экраном.
+    """
+    if not text or text.count(',') != 3:
+        return None
+    try:
+        width, height, x, y = (int(part) for part in text.split(','))
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height, x, y
+
+
+def _parse_ui_columns(text: str) -> Optional[Tuple[int, int, int]]:
+    """Разбирает ширины колонок дерева 'имя,размер,статус'."""
+    if not text or text.count(',') != 2:
+        return None
+    try:
+        widths = tuple(int(part) for part in text.split(','))
+    except ValueError:
+        return None
+    if any(width < 0 for width in widths):
+        return None
+    return widths  # type: ignore[return-value]
+
+
+def _std_icon(sp: QStyle.StandardPixmap) -> QIcon:
+    """Иконка из набора стиля Qt.
+
+    Своих ресурсов в проекте нет, поэтому берём системные глифы: они
+    уже многоразмерные и согласованы с платформой, без лишних
+    зависимостей вроде QtSvg.
+    """
+    style = QApplication.style()
+    if style is None:
+        return QIcon()
+    return style.standardIcon(sp)
+
+
+def reveal_in_file_manager(path: Path) -> bool:
+    """Открывает системный файловый менеджер, выделяя path.
+
+    Windows — Проводник, macOS — Finder, Linux — xdg-open на папке.
+    Возвращает False, если система не поддерживается или запуск не
+    удался: вызывающий сам решает, что записать в журнал.
+    """
+    try:
+        if sys.platform == 'win32':
+            subprocess.Popen(
+                ['explorer', f'/select,{path}'],
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            return True
+        if sys.platform == 'darwin':
+            subprocess.Popen(['open', '-R', str(path)])
+            return True
+        return bool(QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(path.parent))))
+    except Exception:
+        return False
 
 
 # ====================== тема ======================
@@ -83,48 +162,78 @@ def resolve_theme(setting: str) -> str:
     return setting if setting in ('dark', 'light') else 'light'
 
 
+# Палитра: холодные нейтрали, раздельные border/border_soft
+# (жёсткая рамка у полей, мягкая у разделителей), hover — отдельный тон,
+# accent_p — состояние нажатия.
 THEMES: Dict[str, Dict[str, str]] = {
     'dark': {
-        'bg':         '#1f1f1f',
-        'bg_alt':     '#252526',
-        'bg_elev':    '#2d2d30',
-        'text':       '#e6e6e6',
-        'text_dim':   '#9c9c9c',
-        'border':     '#3c3c3c',
-        'accent':     '#0a84ff',
-        'accent_h':   '#1a8fff',
-        'sel_bg':     '#0a3d91',
-        'sel_fg':     '#ffffff',
-        'tree_dir':   '#ffaf5f',
-        'tree_file':  '#e6e6e6',
-        'tree_err':   '#ff5f5f',
-        'tree_up':    '#5fd75f',
-        'log_bg':     '#141414',
-        'log_fg':     '#e0e0e0',
+        'bg':          '#17181c',
+        'bg_alt':      '#1e2025',
+        'bg_elev':     '#272a31',
+        'text':        '#e8eaed',
+        'text_dim':    '#9aa1ad',
+        'border':      '#31343c',
+        'border_soft': '#26282f',
+        'accent':      '#3b82f6',
+        'accent_h':    '#5b97f8',
+        'accent_p':    '#2f6fd0',
+        'sel_bg':      '#2c4a77',
+        'sel_fg':      '#ffffff',
+        'hover':       '#2b2f37',
+        'tree_dir':    '#e2a94a',
+        'tree_file':   '#e8eaed',
+        'tree_err':    '#f2746c',
+        'tree_up':     '#5cc98b',
+        'tree_warn':   '#d9a441',
+        'log_bg':      '#141519',
+        'log_fg':      '#dfe3e8',
     },
     'light': {
-        'bg':         '#f3f3f3',
-        'bg_alt':     '#ffffff',
-        'bg_elev':    '#fafafa',
-        'text':       '#1f1f1f',
-        'text_dim':   '#606060',
-        'border':     '#d0d0d0',
-        'accent':     '#0078d4',
-        'accent_h':   '#1a8dde',
-        'sel_bg':     '#cce4f7',
-        'sel_fg':     '#000000',
-        'tree_dir':   '#d75f00',
-        'tree_file':  '#000000',
-        'tree_err':   '#c10000',
-        'tree_up':    '#007800',
-        'log_bg':     '#ffffff',
-        'log_fg':     '#1c1c1c',
+        'bg':          '#f4f6f9',
+        'bg_alt':      '#ffffff',
+        'bg_elev':     '#f8fafc',
+        'text':        '#1b1f26',
+        'text_dim':    '#6b7280',
+        'border':      '#e2e6ec',
+        'border_soft': '#edf0f4',
+        'accent':      '#2563eb',
+        'accent_h':    '#3b82f6',
+        'accent_p':    '#1d4ed8',
+        'sel_bg':      '#dbeafe',
+        'sel_fg':      '#12305e',
+        'hover':       '#eef2f7',
+        'tree_dir':    '#b45309',
+        'tree_file':   '#1b1f26',
+        'tree_err':    '#c62828',
+        'tree_up':     '#0f7b3f',
+        'tree_warn':   '#8a6100',
+        'log_bg':      '#ffffff',
+        'log_fg':      '#24292f',
     },
 }
 
 
 def build_stylesheet(name: str) -> str:
     c = THEMES[name]
+    # Галочка чек-бокса: QSS не рисует отметку сам, если переопределён
+    # indicator, поэтому подставляем SVG с белым штрихом (фон — акцент).
+    check_mark = (
+        "url(\"data:image/svg+xml;utf8,"
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>"
+        "<path d='M3.5 8.5l3 3 6-7' fill='none' stroke='%23ffffff'"
+        " stroke-width='2' stroke-linecap='round'"
+        " stroke-linejoin='round'/></svg>\")"
+    )
+    # Шеврон ComboBox и стрелка закрытой ветки дерева: системные
+    # глифы в тёмной теме почти не видны, поэтому рисуем свои.
+    dim = c['text_dim'].lstrip('#')
+    chevron = (
+        "url(\"data:image/svg+xml;utf8,"
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>"
+        f"<path d='M4 6.5l4 4 4-4' fill='none' stroke='%23{dim}'"
+        " stroke-width='1.8' stroke-linecap='round'"
+        " stroke-linejoin='round'/></svg>\")"
+    )
     return f"""
         QWidget {{
             background: {c['bg']};
@@ -132,39 +241,78 @@ def build_stylesheet(name: str) -> str:
             font-family: 'Segoe UI', sans-serif;
             font-size: 10pt;
         }}
-        QMainWindow {{
+        QMainWindow, QDialog {{
             background: {c['bg']};
         }}
         QLabel {{ background: transparent; }}
         QLabel#Heading {{
+            font-size: 11pt;
             font-weight: 600;
             color: {c['text']};
-            padding: 2px 0;
+            padding: 2px 0 4px 0;
         }}
         QLabel#Dim {{ color: {c['text_dim']}; }}
+        QLabel#Suggestion {{
+            color: {c['accent']};
+            font-weight: 600;
+            padding: 1px 0;
+        }}
+        QLabel#SectionTitle {{
+            font-size: 9pt;
+            font-weight: 600;
+            color: {c['text_dim']};
+            padding: 2px 0;
+        }}
         QFrame#Card {{
             background: {c['bg_alt']};
             border: 1px solid {c['border']};
-            border-radius: 6px;
+            border-radius: 10px;
+        }}
+        QFrame#Separator {{
+            background: {c['border_soft']};
+            border: none;
+            max-height: 1px;
         }}
         QLineEdit, QComboBox {{
             background: {c['bg_alt']};
             color: {c['text']};
             border: 1px solid {c['border']};
-            border-radius: 4px;
-            padding: 4px 8px;
+            border-radius: 7px;
+            padding: 6px 10px;
+            min-height: 20px;
             selection-background-color: {c['accent']};
             selection-color: #ffffff;
         }}
+        QLineEdit:hover, QComboBox:hover {{
+            border-color: {c['text_dim']};
+        }}
         QLineEdit:focus, QComboBox:focus {{
             border: 1px solid {c['accent']};
+            background: {c['bg_elev']};
+        }}
+        QLineEdit:disabled, QComboBox:disabled {{
+            color: {c['text_dim']};
+            background: {c['bg']};
+            border-color: {c['border_soft']};
+        }}
+        QComboBox::drop-down {{
+            border: none;
+            width: 22px;
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
+        }}
+        QComboBox::down-arrow {{
+            image: {chevron};
+            width: 14px;
+            height: 14px;
         }}
         QPushButton {{
             background: {c['bg_alt']};
             color: {c['text']};
             border: 1px solid {c['border']};
-            border-radius: 4px;
-            padding: 5px 14px;
+            border-radius: 7px;
+            padding: 6px 14px;
+            min-height: 20px;
             min-width: 60px;
         }}
         QPushButton:hover {{
@@ -172,169 +320,310 @@ def build_stylesheet(name: str) -> str:
             border-color: {c['accent']};
         }}
         QPushButton:pressed {{
-            background: {c['accent']};
-            color: #ffffff;
+            background: {c['hover']};
+            border-color: {c['accent_p']};
+        }}
+        QPushButton:focus {{
+            border: 1px solid {c['accent']};
+        }}
+        QPushButton:disabled {{
+            color: {c['text_dim']};
+            background: {c['bg']};
+            border-color: {c['border_soft']};
         }}
         QPushButton#Accent {{
             background: {c['accent']};
             color: #ffffff;
             border: 1px solid {c['accent']};
+            font-weight: 600;
         }}
         QPushButton#Accent:hover {{
             background: {c['accent_h']};
+            border-color: {c['accent_h']};
+        }}
+        QPushButton#Accent:pressed {{
+            background: {c['accent_p']};
+            border-color: {c['accent_p']};
+        }}
+        QPushButton#Accent:disabled {{
+            background: {c['border']};
+            border-color: {c['border']};
+            color: {c['text_dim']};
+        }}
+        QPushButton:default {{
+            border: 1px solid {c['accent']};
         }}
         QToolBar {{
             background: {c['bg_alt']};
             border: none;
             border-bottom: 1px solid {c['border']};
-            spacing: 2px;
-            padding: 4px 6px;
+            spacing: 3px;
+            padding: 6px 8px;
+        }}
+        QToolBar::separator {{
+            background: {c['border']};
+            width: 1px;
+            margin: 5px 6px;
         }}
         QToolBar QToolButton {{
             background: transparent;
             color: {c['text']};
             border: 1px solid transparent;
-            border-radius: 4px;
-            padding: 5px 10px;
+            border-radius: 7px;
+            padding: 6px 11px;
         }}
         QToolBar QToolButton:hover {{
-            background: {c['bg_elev']};
+            background: {c['hover']};
             border-color: {c['border']};
         }}
-        QToolBar QToolButton:pressed {{
-            background: {c['accent']};
-            color: #ffffff;
+        QToolBar QToolButton:pressed, QToolBar QToolButton:checked {{
+            background: {c['sel_bg']};
+            border-color: {c['accent']};
+            color: {c['sel_fg']};
         }}
         QTabWidget::pane {{
             border: 1px solid {c['border']};
-            border-radius: 4px;
+            border-radius: 10px;
             top: -1px;
             background: {c['bg_alt']};
         }}
+        QTabBar {{ qproperty-drawBase: 0; }}
         QTabBar::tab {{
             background: transparent;
             color: {c['text_dim']};
-            padding: 7px 18px;
-            border: 1px solid transparent;
+            padding: 8px 18px;
+            border: none;
             border-bottom: 2px solid transparent;
             margin-right: 2px;
         }}
         QTabBar::tab:hover {{ color: {c['text']}; }}
         QTabBar::tab:selected {{
             color: {c['text']};
+            font-weight: 600;
             border-bottom: 2px solid {c['accent']};
         }}
-        QTreeView {{
+        QTreeView, QListView, QTableView {{
             background: {c['bg_alt']};
             color: {c['text']};
             border: 1px solid {c['border']};
-            border-radius: 4px;
+            border-radius: 10px;
             selection-background-color: {c['sel_bg']};
             selection-color: {c['sel_fg']};
             alternate-background-color: {c['bg']};
             outline: 0;
         }}
         QTreeView::item {{
-            padding: 3px 4px;
+            padding: 5px 4px;
             border: none;
         }}
         QTreeView::item:hover {{
-            background: {c['bg_elev']};
+            background: {c['hover']};
         }}
         QTreeView::item:selected {{
             background: {c['sel_bg']};
             color: {c['sel_fg']};
         }}
+        QTreeView::branch:has-children:closed {{
+            image: {chevron};
+        }}
         QHeaderView::section {{
             background: {c['bg_elev']};
             color: {c['text_dim']};
             border: none;
-            border-right: 1px solid {c['border']};
+            border-right: 1px solid {c['border_soft']};
             border-bottom: 1px solid {c['border']};
-            padding: 6px 8px;
+            padding: 8px 10px;
             font-weight: 600;
+            font-size: 9pt;
+        }}
+        QHeaderView::section:hover {{ color: {c['text']}; }}
+        QTableCornerButton::section {{
+            background: {c['bg_elev']};
+            border: none;
         }}
         QPlainTextEdit {{
             background: {c['log_bg']};
             color: {c['log_fg']};
             border: 1px solid {c['border']};
-            border-radius: 4px;
-            font-family: Consolas, 'Cascadia Mono', monospace;
-            font-size: 10pt;
+            border-radius: 10px;
+            padding: 6px 8px;
+            font-family: 'Cascadia Mono', Consolas, monospace;
+            font-size: 9.5pt;
+            selection-background-color: {c['accent']};
         }}
         QStatusBar {{
             background: {c['bg_alt']};
             color: {c['text_dim']};
             border-top: 1px solid {c['border']};
+            padding: 2px 6px;
         }}
+        QStatusBar::item {{ border: none; }}
+        QStatusBar QLabel {{
+            font-size: 9pt;
+            color: {c['text_dim']};
+        }}
+        QLabel#Counter {{ font-size: 9pt; color: {c['text_dim']}; }}
+        QLabel#CounterOk {{ font-size: 9pt; color: {c['tree_up']}; }}
+        QLabel#CounterErr {{ font-size: 9pt; color: {c['tree_err']}; }}
+        QLabel#CounterWarn {{ font-size: 9pt; color: {c['tree_warn']}; }}
         QMenu {{
             background: {c['bg_alt']};
             color: {c['text']};
             border: 1px solid {c['border']};
-            padding: 4px;
+            border-radius: 8px;
+            padding: 6px;
         }}
         QMenu::item {{
-            padding: 5px 24px 5px 20px;
-            border-radius: 3px;
+            padding: 6px 26px 6px 20px;
+            border-radius: 6px;
         }}
         QMenu::item:selected {{
             background: {c['accent']};
             color: #ffffff;
         }}
+        QMenu::item:disabled {{ color: {c['text_dim']}; }}
+        QMenu::separator {{
+            height: 1px;
+            background: {c['border']};
+            margin: 5px 8px;
+        }}
         QMenuBar {{
             background: {c['bg_alt']};
             color: {c['text']};
-            padding: 2px 0;
+            padding: 2px 4px;
+            border-bottom: 1px solid {c['border_soft']};
         }}
         QMenuBar::item {{
-            padding: 5px 12px;
+            padding: 6px 12px;
+            border-radius: 6px;
             background: transparent;
         }}
         QMenuBar::item:selected {{
             background: {c['accent']};
             color: #ffffff;
         }}
-        QSplitter::handle {{
-            background: {c['border']};
-        }}
-        QCheckBox {{ spacing: 6px; }}
-        QCheckBox::indicator {{
-            width: 16px; height: 16px;
+        QToolTip {{
+            background: {c['bg_elev']};
+            color: {c['text']};
             border: 1px solid {c['border']};
-            border-radius: 3px;
+            border-radius: 6px;
+            padding: 5px 8px;
+        }}
+        QSplitter::handle {{
+            background: {c['border_soft']};
+        }}
+        QSplitter::handle:hover {{
+            background: {c['accent']};
+        }}
+        QSplitter::handle:horizontal {{ width: 3px; }}
+        QSplitter::handle:vertical {{ height: 3px; }}
+        QCheckBox {{ spacing: 8px; }}
+        QCheckBox::indicator {{
+            width: 17px; height: 17px;
+            border: 1.5px solid {c['text_dim']};
+            border-radius: 5px;
             background: {c['bg_alt']};
+        }}
+        QCheckBox::indicator:hover {{
+            border-color: {c['accent']};
         }}
         QCheckBox::indicator:checked {{
             background: {c['accent']};
             border-color: {c['accent']};
+            image: {check_mark};
+        }}
+        QCheckBox::indicator:disabled {{
+            border-color: {c['border']};
+            background: {c['bg']};
         }}
         QScrollBar:vertical {{
-            background: {c['bg']};
-            width: 12px; margin: 0;
+            background: transparent;
+            width: 12px;
+            margin: 2px;
         }}
         QScrollBar::handle:vertical {{
             background: {c['border']};
             border-radius: 5px;
-            min-height: 24px;
-            margin: 2px;
+            min-height: 28px;
         }}
         QScrollBar::handle:vertical:hover {{
             background: {c['text_dim']};
         }}
-        QScrollBar::add-line:vertical,
-        QScrollBar::sub-line:vertical {{ height: 0; }}
         QScrollBar:horizontal {{
-            background: {c['bg']};
-            height: 12px; margin: 0;
+            background: transparent;
+            height: 12px;
+            margin: 2px;
         }}
         QScrollBar::handle:horizontal {{
             background: {c['border']};
             border-radius: 5px;
-            min-width: 24px;
-            margin: 2px;
+            min-width: 28px;
         }}
-        QScrollBar::add-line:horizontal,
-        QScrollBar::sub-line:horizontal {{ width: 0; }}
+        QScrollBar::handle:horizontal:hover {{
+            background: {c['text_dim']};
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line {{
+            height: 0; width: 0;
+        }}
+        QScrollBar::add-page, QScrollBar::sub-page {{
+            background: transparent;
+        }}
+        /* Выпадающий список ComboBox: без этого в тёмной теме он
+           остаётся системным светлым. */
+        QComboBox QAbstractItemView {{
+            background: {c['bg_alt']};
+            color: {c['text']};
+            border: 1px solid {c['border']};
+            border-radius: 8px;
+            padding: 4px;
+            selection-background-color: {c['accent']};
+            selection-color: #ffffff;
+            outline: 0;
+        }}
+        /* Плашка предсказуемого отказа над содержимым. */
+        QFrame#Notice {{
+            background: {c['bg_elev']};
+            border: 1px solid {c['border']};
+            border-radius: 10px;
+        }}
+        QFrame#Notice[level="info"] {{ border-left: 3px solid {c['accent']}; }}
+        QFrame#Notice[level="warn"] {{ border-left: 3px solid {c['tree_warn']}; }}
+        QFrame#Notice[level="error"] {{ border-left: 3px solid {c['tree_err']}; }}
+        QFrame#Notice QLabel {{ background: transparent; padding: 2px 0; }}
+        QToolButton#NoticeClose {{
+            border: none;
+            background: transparent;
+            color: {c['text_dim']};
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 11pt;
+        }}
+        QToolButton#NoticeClose:hover {{
+            color: {c['text']};
+            background: {c['hover']};
+        }}
+        /* Док журнала: заголовок в тон панелей, кнопка закрытия — как
+           остальные иконки. */
+        QDockWidget {{
+            color: {c['text']};
+            font-size: 10pt;
+        }}
+        QDockWidget::title {{
+            background: {c['bg_alt']};
+            border-top: 1px solid {c['border']};
+            padding: 6px 10px;
+            text-align: left;
+        }}
+        QDockWidget::close-button, QDockWidget::float-button {{
+            border: none;
+            background: transparent;
+            padding: 2px;
+        }}
+        QDockWidget::close-button:hover, QDockWidget::float-button:hover {{
+            background: {c['hover']};
+            border-radius: 4px;
+        }}
+        QDialogButtonBox QPushButton {{ min-width: 92px; }}
     """
 
 
@@ -684,6 +973,10 @@ class MainWindow(QMainWindow):
         self.watch_dir = self.tree_root
         self.observer: Optional[Observer] = None
 
+        self.downloads_observer: Optional[Observer] = None
+        # Защита от повторного показа диалога для одного и того же файла.
+        self._seen_downloads: Set[Path] = set()
+
         self.ftp_folder = ''
         self.ftp_connected = False
         self.ftp_loading = False
@@ -691,7 +984,11 @@ class MainWindow(QMainWindow):
         self._refresh_pending = False
 
         self.setWindowTitle('ok-helper')
-        self.resize(1280, 800)
+        # Иконка на самом окне: тесты и превью создают QApplication
+        # сами, поэтому полагаться на run_gui нельзя.
+        self.setWindowIcon(_std_icon(QStyle.SP_FileDialogDetailedView))
+        saved_geometry = _parse_ui_geometry(
+            str(config.get('window_geometry', '')))
 
         self._build_ui()
         self._build_menu()
@@ -700,70 +997,115 @@ class MainWindow(QMainWindow):
 
         self.apply_theme()
 
+        # Размеры и положение из прошлого запуска; при испорченной
+        # записи остаются размеры по умолчанию.
+        if saved_geometry:
+            width, height, x, y = saved_geometry
+            self.resize(width, height)
+            self.move(x, y)
+        else:
+            self.resize(1280, 800)
+
+        self._restore_ui_state()
+
         self._start_watch()
+        self._start_downloads_watch()
         self.set_tree_root(self.tree_root, save=False)
         self.scan_dir(self.tree_root)
+
+        # Ширины колонок ставим после первой загрузки дерева: иначе
+        # режим «по содержимому» пересчитывает их и перебивает наши.
+        self._restore_tree_columns()
+
+        # Высоту дока журнала задаём последней: до показа окна Qt ещё
+        # не знает итоговую компоновку и молча теряет resizeDocks.
+        QTimer.singleShot(0, self._restore_log_dock_height)
 
     # ---------- UI ----------
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
 
-        splitter = QSplitter(Qt.Horizontal)
-        outer.addWidget(splitter, 1)
+        # Плашка предсказуемых отказов: не прерывает работу, в отличие
+        # от модальных окон. Скрыта, пока нет сообщения.
+        self.notice_bar = self._build_notice_bar()
+        outer.addWidget(self.notice_bar)
 
-        left = QFrame()
-        left.setObjectName('Card')
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(10, 10, 10, 10)
-        left_layout.setSpacing(6)
+        self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        outer.addWidget(self.tabs, 1)
 
-        h = QLabel('Журнал')
-        h.setObjectName('Heading')
-        left_layout.addWidget(h)
+        self._build_files_tab()
+        self._build_ftp_tab()
+        self._build_log_dock()
+
+    def _build_log_dock(self):
+        """Журнал — сворачиваемая панель внизу, а не колонка слева.
+
+        Внизу он не отнимает ширину у дерева, а длинные записи
+        помещаются целиком: список строк без переноса.
+        """
+        dock = QDockWidget('Журнал', self)
+        dock.setObjectName('LogDock')
+        dock.setAllowedAreas(Qt.BottomDockWidgetArea)
+        # Кнопки закрытия и отрыва не нужны: панель управляется
+        # переключателем «Журнал» (Ctrl+L).
+        dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.log_dock = dock
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(8, 4, 8, 8)
+        layout.setSpacing(6)
 
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setMaximumBlockCount(2000)
-        left_layout.addWidget(self.log_edit, 1)
+        # Перенос длинных записей с висячим отступом: продолжение
+        # строки не уезжает под колонку времени, как при обычном wrap.
+        self.log_edit.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        layout.addWidget(self.log_edit, 1)
 
-        clear_btn = QPushButton('Очистить журнал')
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addStretch(1)
+
+        copy_btn = QPushButton('Копировать журнал')
+        copy_btn.setToolTip('Скопировать журнал целиком (Ctrl+Shift+L)')
+        copy_btn.clicked.connect(self.on_copy_log)
+        row.addWidget(copy_btn)
+
+        save_btn = QPushButton('Сохранить в файл…')
+        save_btn.setToolTip('Записать журнал в .txt')
+        save_btn.clicked.connect(self.on_save_log)
+        row.addWidget(save_btn)
+
+        clear_btn = QPushButton('Очистить')
+        clear_btn.setToolTip('Очистить журнал')
         clear_btn.clicked.connect(self.on_clear_log)
-        left_layout.addWidget(clear_btn)
+        row.addWidget(clear_btn)
 
-        splitter.addWidget(left)
+        layout.addLayout(row)
+        dock.setWidget(content)
 
-        right = QFrame()
-        right.setObjectName('Card')
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(10, 10, 10, 10)
-        right_layout.setSpacing(6)
-
-        self.tabs = QTabWidget()
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-        right_layout.addWidget(self.tabs, 1)
-
-        self._build_files_tab()
-        self._build_ftp_tab()
-
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([400, 880])
+        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        # Переключатель видимости работает с доком целиком.
+        self.log_frame = dock
 
     def _build_files_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         nav = QHBoxLayout()
         nav.setSpacing(6)
 
         self.btn_up = QPushButton('↑ Вверх')
+        self.btn_up.setToolTip('Перейти в родительскую папку')
         self.btn_up.clicked.connect(self.on_up)
         nav.addWidget(self.btn_up)
 
@@ -773,6 +1115,7 @@ class MainWindow(QMainWindow):
         nav.addWidget(self.path_edit, 1)
 
         self.btn_browse = QPushButton('Обзор…')
+        self.btn_browse.setToolTip('Выбрать директорию (Ctrl+O)')
         self.btn_browse.clicked.connect(self.on_browse_dir)
         nav.addWidget(self.btn_browse)
 
@@ -806,38 +1149,22 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.tree_view, 1)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(6)
-
-        for label, slot in (
-            ('+ Папка', self.on_new_folder),
-            ('Переименовать', self.on_rename),
-            ('Переместить', self.on_move),
-            ('Копировать имя', self.on_copy_name),
-            ('Открыть', self.on_open_selected),
-            ('⇪ FTP', self.on_upload_selected),
-            ('Правка', self.on_apply_fix),
-        ):
-            b = QPushButton(label)
-            b.clicked.connect(slot)
-            actions.addWidget(b)
-        actions.addStretch(1)
-
-        layout.addLayout(actions)
-
+        # Отдельной панели действий здесь нет: те же команды живут в
+        # toolbar, в меню «Правка» и в контекстном меню дерева.
         hint = QLabel(
-            'Двойной клик по папке — раскрыть / свернуть; '
-            'Enter — сделать корнем дерева; правый клик — меню.')
+            'Двойной клик по папке — раскрыть / свернуть, по файлу — меню '
+            'действий; Enter — сделать корнем дерева; правый клик — меню.')
         hint.setObjectName('Dim')
         layout.addWidget(hint)
 
         self.tabs.addTab(tab, 'Файлы')
 
+
     def _build_ftp_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         nav = QHBoxLayout()
         nav.setSpacing(6)
@@ -849,10 +1176,13 @@ class MainWindow(QMainWindow):
 
         btn_connect = QPushButton('Подключиться')
         btn_connect.setObjectName('Accent')
+        btn_connect.setToolTip('Прочитать листинг папки на сервере')
         btn_connect.clicked.connect(self.on_ftp_connect)
         nav.addWidget(btn_connect)
 
-        btn_refresh = QPushButton('↻ Обновить')
+        btn_refresh = QPushButton('Обновить')
+        btn_refresh.setIcon(_std_icon(QStyle.SP_BrowserReload))
+        btn_refresh.setToolTip('Обновить листинг FTP')
         btn_refresh.clicked.connect(self.on_ftp_refresh)
         nav.addWidget(btn_refresh)
 
@@ -888,11 +1218,13 @@ class MainWindow(QMainWindow):
         actions = QHBoxLayout()
         actions.setSpacing(6)
 
-        btn_del = QPushButton('Удалить выделенное')
-        btn_del.clicked.connect(self.on_ftp_delete_selected)
-        actions.addWidget(btn_del)
+        self.btn_ftp_delete = QPushButton('Удалить выделенное')
+        self.btn_ftp_delete.setIcon(_std_icon(QStyle.SP_TrashIcon))
+        self.btn_ftp_delete.clicked.connect(self.on_ftp_delete_selected)
+        actions.addWidget(self.btn_ftp_delete)
 
         btn_up = QPushButton('Загрузить файл сюда…')
+        btn_up.setIcon(_std_icon(QStyle.SP_ArrowUp))
         btn_up.clicked.connect(self.on_ftp_upload_here)
         actions.addWidget(btn_up)
 
@@ -906,45 +1238,316 @@ class MainWindow(QMainWindow):
         layout.addWidget(hint)
 
         self.tabs.addTab(tab, 'FTP')
+        self._sync_ftp_actions()
+
+    def _sync_ftp_actions(self):
+        """Согласует доступность кнопок FTP с режимом эмуляции.
+
+        В read-only удаление всё равно запрещено, поэтому кнопка честно
+        выключена, а не выдаёт отказ по нажатию.
+        """
+        button = getattr(self, 'btn_ftp_delete', None)
+        if button is None:
+            return
+        readonly = self._cfg_bool(self.config, 'ftp_readonly', False)
+        button.setEnabled(not readonly)
+        button.setToolTip(
+            'Удаление недоступно: ftp_readonly = true' if readonly
+            else 'Удалить выделенный файл на сервере (Del)')
+
+
+    def _build_notice_bar(self) -> QFrame:
+        """Плашка над содержимым вместо модального окна для отказов."""
+        bar = QFrame()
+        bar.setObjectName('Notice')
+        bar.setProperty('level', 'info')
+        bar.setVisible(False)
+
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 6, 6, 6)
+        row.setSpacing(8)
+
+        self.notice_label = QLabel('')
+        self.notice_label.setWordWrap(True)
+        row.addWidget(self.notice_label, 1)
+
+        close_btn = QToolButton()
+        close_btn.setObjectName('NoticeClose')
+        close_btn.setText('✕')
+        close_btn.setToolTip('Скрыть сообщение')
+        close_btn.setAutoRaise(True)
+        close_btn.clicked.connect(self.hide_notice)
+        row.addWidget(close_btn)
+
+        return bar
+
+    def show_notice(self, text: str, level: str = 'info'):
+        """Показывает неблокирующее сообщение над содержимым.
+
+        level: info | warn | error — влияет только на цвет полосы.
+        """
+        if level not in ('info', 'warn', 'error'):
+            level = 'info'
+        self.notice_label.setText(text)
+        self.notice_bar.setProperty('level', level)
+        # Переполировка нужна, чтобы QSS подхватил новый level.
+        style = self.notice_bar.style()
+        style.unpolish(self.notice_bar)
+        style.polish(self.notice_bar)
+        self.notice_bar.setVisible(True)
+
+    def hide_notice(self):
+        self.notice_bar.setVisible(False)
+        self.notice_label.setText('')
+
+    def on_settings_saved_log_visibility(self):
+        """Синхронизирует переключатель после сохранения настроек."""
+        self._apply_log_visible(
+            self._cfg_bool(self.config, 'log_visible', True))
+        self._commit_log_visibility()
+
+    def _show_notice_or_box(self, title: str, text: str,
+                            level: str = 'warn'):
+        """Отказ: плашкой, а если включён предсказуемый режим — окном.
+
+        blocking_errors = true возвращает модальное окно, к которому
+        привыкли раньше.
+        """
+        if self._cfg_bool(self.config, 'blocking_errors', False):
+            QMessageBox.critical(self, title, text)
+        else:
+            self.show_notice(text, level)
+
+    # ---------- состояние интерфейса ----------
+    @staticmethod
+    def _cfg_bool(config: dict, key: str, default: bool = True) -> bool:
+        """Читает логический ключ конфига, перенося старые конфиги.
+
+        Ключа может не быть в файле, созданном прежней версией, тогда
+        берётся значение по умолчанию.
+        """
+        try:
+            return bool(config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _restore_ui_state(self):
+        """Возвращает видимость и высоту панели журнала."""
+        self._apply_log_visible(
+            self._cfg_bool(self.config, 'log_visible', True))
+        self._commit_log_visibility()
+
+    def _restore_tree_columns(self):
+        """Возвращает сохранённые ширины колонок дерева файлов.
+
+        Колонки «Размер» и «Статус» по умолчанию считаются по
+        содержимому: в этом режиме resizeSection игнорируется, поэтому
+        сначала переводим все колонки в ручной режим.
+        """
+        widths = _parse_ui_columns(
+            str(self.config.get('tree_column_widths', '')))
+        if not widths:
+            return
+        header = self.tree_view.header()
+        for column in range(header.count()):
+            header.setSectionResizeMode(column, QHeaderView.Interactive)
+        for column, width in enumerate(widths):
+            if width > 0:
+                header.resizeSection(column, width)
+
+    def _save_ui_state(self):
+        """Пишет размеры окна, высоту журнала и колонок в конфиг."""
+        normal = self.normalGeometry() if self.isMaximized() \
+            else self.geometry()
+        self.config['window_geometry'] = _ui_geometry(
+            normal.width(), normal.height(), normal.x(), normal.y())
+        # splitter_state — ключ прежних версий; пишем пустое значение,
+        # чтобы старые конфиги не хранили мусор.
+        self.config['splitter_state'] = ''
+        height = self._dock_height()
+        if height > 0:
+            self.config['log_dock_height'] = height
+        header = self.tree_view.header()
+        self.config['tree_column_widths'] = ','.join(
+            str(header.sectionSize(column))
+            for column in range(header.count()))
+        try:
+            save_config(self.config)
+        except Exception:
+            pass
+
+    def _dock_height(self) -> int:
+        """Текущая высота панели журнала; 0 — панель скрыта."""
+        dock = getattr(self, 'log_dock', None)
+        if dock is None:
+            return 0
+        try:
+            if not dock.isVisible():
+                return 0
+            return int(dock.height())
+        except RuntimeError:
+            # C++-объект уже удалён (окно закрыто) — высоты нет.
+            return 0
+
+    def _restore_log_dock_height(self):
+        """Возвращает сохранённую высоту панели журнала."""
+        dock = getattr(self, 'log_dock', None)
+        if dock is None:
+            return
+        try:
+            if not dock.isVisible():
+                return
+        except RuntimeError:
+            return
+        try:
+            height = int(self.config.get('log_dock_height', 180))
+        except (TypeError, ValueError):
+            height = 180
+        self.resizeDocks([dock], [max(80, min(height, 1200))],
+                         Qt.Vertical)
+        self._log_height_applied = True
+
+    def showEvent(self, event):
+        """Применяет высоту журнала, когда окно уже показано.
+
+        До первого показа Qt ещё не знает компоновку и молча теряет
+        resizeDocks, поэтому одной установки в конструкторе мало.
+        """
+        super().showEvent(event)
+        if not getattr(self, '_log_height_applied', False):
+            QTimer.singleShot(0, self._restore_log_dock_height)
+
+    def _apply_log_visible(self, visible: bool):
+        """Показывает или прячет панель журнала внизу."""
+        dock = getattr(self, 'log_dock', None)
+        if dock is not None:
+            try:
+                dock.setVisible(bool(visible))
+            except RuntimeError:
+                return
+            if visible:
+                self._restore_log_dock_height()
+        self.config['log_visible'] = bool(visible)
+
+    def _commit_log_visibility(self):
+        """Синхронизирует переключатель «Журнал» с фактическим состоянием.
+
+        setChecked() шлёт toggled, поэтому ставим только при расхождении
+        и приглушаем сигнал: иначе получается рекурсия.
+        """
+        action = getattr(self, 'log_action', None)
+        if action is None:
+            return
+        visible = self.log_frame.isVisibleTo(self)
+        if action.isChecked() == visible:
+            return
+        action.blockSignals(True)
+        action.setChecked(visible)
+        action.blockSignals(False)
+
+    def on_toggle_log(self, checked: bool):
+        self._apply_log_visible(bool(checked))
+        self.log(f'[i] Панель журнала: {"показана" if checked else "скрыта"}',
+                 'info')
+
+    # ---------- журнал: копирование и сохранение ----------
+    def on_copy_log(self):
+        text = self.log_edit.toPlainText()
+        if not text:
+            return
+        if copy_to_clipboard(text):
+            self.log('[БУФЕР] Журнал скопирован', 'ok')
+        else:
+            self.log('[ОШБ] Буфер обмена недоступен', 'error')
+
+    def on_save_log(self):
+        default = str(Path.home() / 'ok-helper-log.txt')
+        name, _ = QFileDialog.getSaveFileName(
+            self, 'Сохранить журнал', default, 'Текстовые файлы (*.txt)')
+        if not name:
+            return
+        try:
+            Path(name).write_text(self.log_edit.toPlainText(),
+                                  encoding='utf-8')
+        except OSError as e:
+            self._show_notice_or_box('Журнал', f'Не сохранить журнал: {e}',
+                                     'error')
+            return
+        self.log(f'[OK] Журнал сохранён: {name}', 'ok')
 
     def _build_menu(self):
         menubar = self.menuBar()
 
         m_file = menubar.addMenu('Файл')
         self._act(m_file, 'Выбрать директорию…', 'Ctrl+O',
-                  self.on_browse_dir)
+                  self.on_browse_dir, QStyle.SP_DirOpenIcon)
         m_file.addSeparator()
-        self._act(m_file, 'Настройки…', 'F10', self.open_settings)
+        self._act(m_file, 'Настройки…', 'F10', self.open_settings,
+                  QStyle.SP_FileDialogDetailedView)
         m_file.addSeparator()
         self._act(m_file, 'Выход', 'Ctrl+Q', self.close)
 
         m_edit = menubar.addMenu('Правка')
-        self._act(m_edit, 'Обновить', 'F5', self.on_refresh)
+        self._act(m_edit, 'Обновить', 'F5', self.on_refresh,
+                  QStyle.SP_BrowserReload)
         m_edit.addSeparator()
-        self._act(m_edit, 'Создать папку…', 'Ctrl+N', self.on_new_folder)
+        self._act(m_edit, 'Создать папку…', 'Ctrl+N', self.on_new_folder,
+                  QStyle.SP_FileDialogNewFolder)
         self._act(m_edit, 'Переименовать…', 'F2', self.on_rename)
-        self._act(m_edit, 'Переместить…', 'Ctrl+X', self.on_move)
+        self._act(m_edit, 'Переместить…', 'Ctrl+X', self.on_move,
+                  QStyle.SP_FileDialogToParent)
         self._act(m_edit, 'Копировать имя', 'Ctrl+Y', self.on_copy_name)
+        self._act(m_edit, 'Копировать путь', 'Ctrl+Shift+C',
+                  self.on_copy_path)
+        self._act(m_edit, 'Открыть', None, self.on_open_selected)
+        self._act(m_edit, 'Показать в проводнике', 'Ctrl+E',
+                  self.on_reveal_selected, QStyle.SP_DirOpenIcon)
         m_edit.addSeparator()
-        self._act(m_edit, 'Применить автоправку', None, self.on_apply_fix)
-        self._act(m_edit, 'Исправить все', 'Ctrl+F5', self.on_fix_all)
+        self._act(m_edit, 'Применить автоправку', None, self.on_apply_fix,
+                  QStyle.SP_DialogApplyButton)
+        self._act(m_edit, 'Исправить все', 'Ctrl+F5', self.on_fix_all,
+                  QStyle.SP_DialogApplyButton)
+        m_edit.addSeparator()
+        self._act(m_edit, 'Копировать журнал', 'Ctrl+Shift+L',
+                  self.on_copy_log)
+        self._act(m_edit, 'Сохранить журнал в файл…', None, self.on_save_log,
+                  QStyle.SP_DialogSaveButton)
 
         m_ftp = menubar.addMenu('FTP')
         self._act(m_ftp, 'Загрузить выделенный на FTP', 'F12',
-                  self.on_upload_selected)
+                  self.on_upload_selected, QStyle.SP_ArrowUp)
         self._act(m_ftp, 'Загрузить файл в текущую папку FTP…', None,
                   self.on_ftp_upload_here)
         m_ftp.addSeparator()
-        self._act(m_ftp, 'Обновить листинг FTP', None, self.on_ftp_refresh)
+        self._act(m_ftp, 'Обновить листинг FTP', None, self.on_ftp_refresh,
+                  QStyle.SP_BrowserReload)
         self._act(m_ftp, 'Удалить файл на FTP', 'Del',
-                  self.on_ftp_delete_selected)
+                  self.on_ftp_delete_selected, QStyle.SP_TrashIcon)
 
         m_help = menubar.addMenu('Справка')
-        self._act(m_help, 'Справка', 'F1', self.open_help)
-        self._act(m_help, 'О программе', None, self.open_about)
+        self._act(m_help, 'Справка', 'F1', self.open_help,
+                  QStyle.SP_DialogHelpButton)
+        self._act(m_help, 'О программе', None, self.open_about,
+                  QStyle.SP_MessageBoxInformation)
 
-    def _act(self, menu: QMenu, text: str, shortcut: Optional[str], slot):
+        # Быстрое переключение вкладок: подсказка в плашке ссылается
+        # на Ctrl+1, значит сочетание должно работать.
+        m_view = menubar.addMenu('Вид')
+        self._act(m_view, 'Вкладка «Файлы»', 'Ctrl+1',
+                  lambda: self.tabs.setCurrentIndex(0))
+        self._act(m_view, 'Вкладка «FTP»', 'Ctrl+2',
+                  lambda: self.tabs.setCurrentIndex(1))
+        m_view.addSeparator()
+        # Ctrl+L висит на самом переключателе в тулбаре; здесь — без
+        # второго сочетания, иначе Qt считает shortcut неоднозначным.
+        self._act(m_view, 'Показать / скрыть журнал', None,
+                  lambda: self.log_action.toggle())
+
+    def _act(self, menu: QMenu, text: str, shortcut: Optional[str], slot,
+             icon: Optional[QStyle.StandardPixmap] = None):
         a = QAction(text, self)
+        if icon is not None:
+            a.setIcon(_std_icon(icon))
         if shortcut:
             a.setShortcut(QKeySequence(shortcut))
         a.triggered.connect(slot)
@@ -955,33 +1558,106 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self):
         tb = QToolBar('Основные')
         tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        tb.setIconSize(QSize(16, 16))
         self.addToolBar(tb)
+        self.toolbar = tb
 
-        def add(text, slot, tooltip=None):
+        def add(text, slot, tooltip=None, icon=None):
             a = QAction(text, self)
+            if icon is not None:
+                a.setIcon(_std_icon(icon))
             a.triggered.connect(slot)
             if tooltip:
                 a.setToolTip(tooltip)
             tb.addAction(a)
+            return a
 
-        add('↑ Вверх', self.on_up, 'Перейти в родительскую папку')
+        add('Вверх', self.on_up, 'Перейти в родительскую папку',
+            QStyle.SP_ArrowUp)
         tb.addSeparator()
-        add('Обновить', self.on_refresh, 'Перечитать содержимое (F5)')
+        add('Обновить', self.on_refresh, 'Перечитать содержимое (F5)',
+            QStyle.SP_BrowserReload)
         add('Исправить все', self.on_fix_all,
-            'Переименовать все уверенные случаи')
+            'Переименовать все уверенные случаи (Ctrl+F5)',
+            QStyle.SP_DialogApplyButton)
         tb.addSeparator()
-        add('+ Папка', self.on_new_folder, 'Создать папку')
-        add('Переименовать', self.on_rename, 'Переименовать файл')
-        add('Переместить', self.on_move, 'Переместить в другую папку')
+        add('Папка', self.on_new_folder, 'Создать папку (Ctrl+N)',
+            QStyle.SP_FileDialogNewFolder)
+        add('Переименовать', self.on_rename, 'Переименовать файл (F2)',
+            QStyle.SP_FileDialogDetailedView)
+        add('Переместить', self.on_move, 'Переместить в другую папку (Ctrl+X)',
+            QStyle.SP_FileDialogToParent)
+        add('Копировать имя', self.on_copy_name,
+            'Скопировать имя в буфер обмена (Ctrl+Y)',
+            QStyle.SP_FileIcon)
         tb.addSeparator()
         add('На FTP', self.on_upload_selected,
-            'Загрузить выделенный файл на FTP')
+            'Загрузить выделенный файл на FTP (F12)',
+            QStyle.SP_ArrowUp)
+        add('В проводнике', self.on_reveal_selected,
+            'Открыть папку с выделением файла (Ctrl+E)',
+            QStyle.SP_DirOpenIcon)
+        tb.addSeparator()
+
+        # Переключатель панели журнала: состояние сохраняется в конфиге.
+        self.log_action = QAction('Журнал', self)
+        self.log_action.setCheckable(True)
+        self.log_action.setToolTip('Показать или скрыть панель журнала (Ctrl+L)')
+        self.log_action.setShortcut(QKeySequence('Ctrl+L'))
+        self.log_action.toggled.connect(self.on_toggle_log)
+        tb.addAction(self.log_action)
+        self.addAction(self.log_action)
 
     def _build_statusbar(self):
         sb = QStatusBar()
         self.setStatusBar(sb)
+        sb.setSizeGripEnabled(True)
+
+        # Слева — сообщение о текущей операции, справа постоянно живёт
+        # блок «счётчики + путь»: он не затирается сообщениями.
         self.status_label = QLabel('Готово.')
-        sb.addWidget(self.status_label, 1)
+        sb.addWidget(self.status_label)
+        sb.addWidget(QLabel(''), 1)
+
+        # Счётчики отдельными подписями: у ошибок и заливки свой цвет.
+        self.count_files_label = QLabel('')
+        self.count_errors_label = QLabel('')
+        self.count_ftp_label = QLabel('')
+        for label in (self.count_files_label, self.count_errors_label,
+                      self.count_ftp_label):
+            label.setObjectName('Counter')
+            sb.addPermanentWidget(label)
+
+        self.path_label = QLabel('')
+        self.path_label.setObjectName('Dim')
+        self.path_label.setToolTip('Корень дерева файлов')
+        sb.addPermanentWidget(self.path_label)
+        self._set_counters(0, 0, 0)
+
+    def status_line(self) -> str:
+        """Счётчики одной строкой: файлов, ошибок, залитых на FTP."""
+        counts = '   ·   '.join(label.text() for label in (
+            self.count_files_label, self.count_errors_label,
+            self.count_ftp_label))
+        return counts
+
+    def _set_counters(self, total: int, errors: int, uploaded: int):
+        """Обновляет счётчики, подсвечивая проблемы."""
+        self.count_files_label.setText(f'Файлов: {total}')
+        self.count_files_label.setObjectName('Counter')
+        self.count_errors_label.setText(f'ошибок: {errors}')
+        self.count_errors_label.setObjectName(
+            'CounterErr' if errors else 'Counter')
+        self.count_ftp_label.setText(f'залито на FTP: {uploaded}')
+        self.count_ftp_label.setObjectName(
+            'CounterOk' if uploaded else 'Counter')
+        for label in (self.count_files_label, self.count_errors_label,
+                      self.count_ftp_label):
+            style = label.style()
+            style.unpolish(label)
+            style.polish(label)
+
 
     # ---------- тема ----------
     def apply_theme(self):
@@ -994,12 +1670,37 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'ftp_model'):
             self.ftp_model.set_theme(name)
         if hasattr(self, 'log_edit'):
+            # Держим inline-стиль панели журнала: она одна представляет
+            # собственный «терминальный» фон, отличный от панелей.
             c = THEMES[name]
             self.log_edit.setStyleSheet(
                 f'background:{c["log_bg"]};color:{c["log_fg"]};'
-                f'border:1px solid {c["border"]};border-radius:4px;'
-                f'font-family:Consolas,monospace;'
+                f'border:1px solid {c["border"]};border-radius:10px;'
+                f'padding:6px 8px;'
+                f"font-family:'Cascadia Mono',Consolas,monospace;"
             )
+        # Счётчики статусбара перекрашиваются вместе с темой.
+        self._refresh_counters()
+
+    def _refresh_counters(self):
+        """Перечитывает счётчики из бейджей и перекрашивает их.
+
+        Нужно после смены темы: objectName управляет цветом, и QSS
+        перестаёт применяться, пока виджет не переполирован.
+        """
+        if not hasattr(self, 'count_files_label'):
+            return
+
+        def value(label: QLabel) -> int:
+            tail = label.text().partition(': ')[2]
+            try:
+                return int(tail)
+            except ValueError:
+                return 0
+
+        self._set_counters(value(self.count_files_label),
+                           value(self.count_errors_label),
+                           value(self.count_ftp_label))
 
     # ---------- лог ----------
     def log(self, msg: str, level: str = 'info'):
@@ -1014,11 +1715,17 @@ class MainWindow(QMainWindow):
         color_map = {
             'info':  c['log_fg'],
             'ok':    c['tree_up'],
-            'warn':  '#ffd700',
+            'warn':  c['tree_warn'],
             'error': c['tree_err'],
-            'cfg':   '#5fd7ff',
+            'cfg':   c['accent_h'],
         }
         color = color_map.get(level, c['log_fg'])
+
+        # Прокручиваем только если пользователь и так внизу: иначе
+        # чтение истории срывалось бы на каждой новой записи.
+        bar = self.log_edit.verticalScrollBar()
+        at_value = bar.value()
+        at_bottom = at_value >= bar.maximum()
 
         ts = datetime.now().strftime('%H:%M:%S')
         cursor = self.log_edit.textCursor()
@@ -1027,9 +1734,21 @@ class MainWindow(QMainWindow):
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
         cursor.insertText(f'{ts}  {msg}\n', fmt)
+        # Висячий отступ: продолжение длинной записи начинается под
+        # текстом сообщения, а не под отметкой времени.
+        block_fmt = QTextBlockFormat()
+        block_fmt.setLeftMargin(LOG_INDENT)
+        block_fmt.setTextIndent(-LOG_INDENT)
+        cursor.mergeBlockFormat(block_fmt)
 
         self.log_edit.setTextCursor(cursor)
-        self.log_edit.ensureCursorVisible()
+        if at_bottom:
+            self.log_edit.ensureCursorVisible()
+            bar.setValue(bar.maximum())
+        else:
+            # setTextCursor сам подтягивает вид к курсору — возвращаем
+            # позицию, чтобы чтение истории не срывалось.
+            bar.setValue(at_value)
 
     def set_status(self, text: str):
         self.status_label.setText(text)
@@ -1058,6 +1777,107 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self.observer = None
+
+        # ---------- watchdog: папка загрузок ----------
+    def _start_downloads_watch(self):
+        """Запускает наблюдатель за downloads_dir, если он включён."""
+        self._stop_downloads_watch()
+
+        if not bool(self.config.get('watch_downloads', False)):
+            return
+
+        d = self.config.get('downloads_dir_resolved')
+        if not d:
+            return
+        d = Path(d)
+        if not d.is_dir():
+            self.log(f'[watchdog] downloads_dir не директория: {d}',
+                     'warn')
+            return
+        # Не дублировать, если папка загрузок совпадает с корнем.
+        try:
+            if d.resolve() == self.tree_root.resolve():
+                return
+        except OSError:
+            pass
+
+        try:
+            handler = DownloadsHandler(self._on_download_event)
+            obs = Observer()
+            obs.schedule(handler, str(d), recursive=False)
+            obs.start()
+            self.downloads_observer = obs
+            self.log(f'[watchdog] Слежение за загрузками: {d}', 'cfg')
+        except Exception as e:
+            self.log(f'[watchdog] загрузки: {e}', 'error')
+
+    def _stop_downloads_watch(self):
+        if self.downloads_observer:
+            try:
+                self.downloads_observer.stop()
+                self.downloads_observer.join(timeout=2)
+            except Exception:
+                pass
+            self.downloads_observer = None
+
+    def _on_download_event(self, path: Path):
+        """Вызывается из потока watchdog — уходим в главный поток."""
+        QTimer.singleShot(0, lambda: self._handle_new_download(path))
+
+    def _handle_new_download(self, path: Path):
+        if path in self._seen_downloads:
+            return
+        self._seen_downloads.add(path)
+
+        # Небольшая задержка: дать браузеру дописать файл и
+        # отпустить блокировку.
+        QTimer.singleShot(1200,
+                          lambda: self._offer_move_download(path))
+
+    def _offer_move_download(self, path: Path):
+        if not path.exists() or not path.is_file():
+            return
+
+        self.log(f'[ЗАГРУЗКИ] Новый файл: {path.name}', 'info')
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle('Новый файл в загрузках')
+        msg.setText(f'Обнаружен новый файл:\n{path.name}')
+        msg.setInformativeText(
+            f'Перенести его в дерево?\n{self.tree_root}')
+
+        btn_move = msg.addButton('Переместить в корень',
+                                 QMessageBox.AcceptRole)
+        btn_choose = msg.addButton('Выбрать папку…',
+                                   QMessageBox.ActionRole)
+        btn_skip = msg.addButton('Игнорировать', QMessageBox.RejectRole)
+        msg.setDefaultButton(btn_move)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked is btn_skip:
+            return
+
+        if clicked is btn_move:
+            target_dir = self.tree_root
+        else:
+            dlg = MoveDialog(self, path, self.tree_root)
+            if dlg.exec() != QDialog.Accepted or dlg.result is None:
+                return
+            target_dir = dlg.result
+
+        dst = target_dir / path.name
+        if dst.exists():
+            self.log(f'[ОШБ] Уже существует: {dst}', 'error')
+            return
+        try:
+            shutil.move(str(path), str(dst))
+            self.log(f'[ЗАГРУЗКИ] {path.name} → {target_dir}', 'ok')
+        except OSError as e:
+            self.log(f'[ОШБ] Перенос: {e}', 'error')
+            return
+        self.rebuild_tree()
 
     def _on_fs_event(self, _path: Optional[Path]):
         QTimer.singleShot(0, self._schedule_refresh)
@@ -1135,7 +1955,7 @@ class MainWindow(QMainWindow):
             if item is not None:
                 self.tree_model.load_children_if_stub(item)
         else:
-            self.open_path(path)
+            self.show_file_menu(index)
 
     def on_tree_activated(self, index: QModelIndex):
         path = self._path_from_index(index)
@@ -1152,8 +1972,14 @@ class MainWindow(QMainWindow):
         if path is None:
             return
 
-        self.tree_view.setCurrentIndex(index)
+        self.show_file_menu(index, global_pos=self.tree_view.viewport()
+                            .mapToGlobal(pos))
 
+    def build_element_menu(self, index: QModelIndex, path: Path) -> QMenu:
+        """Собирает меню действий, доступных для элемента дерева.
+
+        Используется и правым кликом, и двойным кликом по файлу.
+        """
         menu = QMenu(self)
         if path.is_dir():
             a = menu.addAction('Сделать корнем дерева')
@@ -1165,12 +1991,48 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
         a3 = menu.addAction('Копировать имя')
         a3.triggered.connect(self.on_copy_name)
+        a4 = menu.addAction('Копировать путь')
+        a4.triggered.connect(self.on_copy_path)
+        a5 = menu.addAction('Показать в проводнике')
+        a5.triggered.connect(self.on_reveal_path)
         if path.is_file():
             menu.addSeparator()
             menu.addAction('Переименовать…', self.on_rename)
             menu.addAction('Переместить…', self.on_move)
             menu.addAction('Открыть', self.on_open_selected)
-        menu.exec(self.tree_view.viewport().mapToGlobal(pos))
+        return menu
+
+    def show_file_menu(self, index: QModelIndex, global_pos=None):
+        """Показывает меню действий для файла (двойной клик по файлу).
+
+        Пункт «Открыть» внутри меню открывает файл системным приложением.
+        """
+        path = self._path_from_index(index)
+        if path is None:
+            return
+
+        self.tree_view.setCurrentIndex(index)
+
+        if global_pos is None:
+            rect = self.tree_view.visualRect(index)
+            global_pos = self.tree_view.viewport().mapToGlobal(rect.center())
+
+        menu = self.build_element_menu(index, path)
+        try:
+            menu.exec(global_pos)
+        finally:
+            self._dispose_menu(menu)
+
+    @staticmethod
+    def _dispose_menu(menu):
+        """Освобождает меню после показа.
+
+        У QMenu (и его замены в тестах) может не быть deleteLater —
+        освобождение в этом случае лишь необязательная уборка.
+        """
+        delete_later = getattr(menu, 'deleteLater', None)
+        if callable(delete_later):
+            delete_later()
 
     def set_tree_root(self, p: Path, save: bool = True):
         try:
@@ -1212,9 +2074,8 @@ class MainWindow(QMainWindow):
             if self._is_uploaded_to_ftp(p):
                 uploaded += 1
 
-        self.set_status(
-            f'Файлов: {total}   ·   ошибок: {errors}   ·   '
-            f'залито на FTP: {uploaded}   ·   {self.tree_root}')
+        self._set_counters(total, errors, uploaded)
+        self.path_label.setText(str(self.tree_root))
 
     def _iter_loaded_files(self):
         def walk(parent: QStandardItem):
@@ -1283,6 +2144,26 @@ class MainWindow(QMainWindow):
             self.log('[КАТАЛОГ] Все имена корректны', 'ok')
 
     # ---------- вкладки ----------
+    def _files_tab_active(self) -> bool:
+        return self.tabs.currentIndex() == 0
+
+    def _ftp_tab_active(self) -> bool:
+        return self.tabs.currentIndex() == 1
+
+    def _warn_wrong_tab(self, action: str) -> bool:
+        """Предупреждает, если файловая команда вызвана на вкладке FTP.
+
+        Горячие клавиши висят на окне, поэтому без этой проверки F2 на
+        вкладке FTP открывал бы переименование локального файла.
+        Возвращает True, если действие нужно прервать.
+        """
+        if self._files_tab_active():
+            return False
+        self.show_notice(
+            f'«{action}» работает с файлами на вкладке «Файлы». '
+            f'Переключитесь на неё (Ctrl+1).', 'warn')
+        return True
+
     def _on_tab_changed(self, idx: int):
         if idx != 1:
             return
@@ -1343,6 +2224,8 @@ class MainWindow(QMainWindow):
         self.rebuild_tree()
 
     def on_rename(self):
+        if self._warn_wrong_tab('Переименовать'):
+            return
         p = self._selected_path()
         if p is None or not p.is_file():
             QMessageBox.information(self, 'Переименование',
@@ -1368,6 +2251,8 @@ class MainWindow(QMainWindow):
         self.rebuild_tree()
 
     def on_move(self):
+        if self._warn_wrong_tab('Переместить'):
+            return
         p = self._selected_path()
         if p is None or not p.is_file():
             QMessageBox.information(self, 'Перемещение', 'Выберите файл')
@@ -1406,6 +2291,33 @@ class MainWindow(QMainWindow):
             self.log(f'[БУФЕР] Скопировано: {p.name}', 'ok')
         else:
             self.log('[ОШБ] Буфер обмена недоступен', 'error')
+
+    def on_copy_path(self):
+        """Копирует полный путь выделенного элемента."""
+        p = self._selected_path()
+        if p is None:
+            self.show_notice('Выберите файл или папку, чтобы скопировать '
+                             'путь.', 'info')
+            return
+        if copy_to_clipboard(str(p)):
+            self.log(f'[БУФЕР] Путь скопирован: {p}', 'ok')
+        else:
+            self.log('[ОШБ] Буфер обмена недоступен', 'error')
+
+    def on_reveal_selected(self):
+        p = self._selected_path()
+        if p is None:
+            return
+        if not reveal_in_file_manager(p):
+            self._show_notice_or_box(
+                'Проводник',
+                'Не удалось открыть системный файловый менеджер.', 'error')
+            return
+        self.log(f'[ОТКР] Проводник: {p}', 'ok')
+
+    def on_reveal_path(self):
+        """Пункт контекстного меню: показать элемент в файловом менеджере."""
+        self.on_reveal_selected()
 
     def open_path(self, p: Path):
         try:
@@ -1640,16 +2552,20 @@ class MainWindow(QMainWindow):
         self.do_upload(p, folder)
 
     def on_upload_selected(self):
+        if self._warn_wrong_tab('Загрузить на FTP'):
+            return
         p = self._selected_path()
         if p is None or not p.is_file():
             QMessageBox.information(self, 'FTP', 'Выберите файл')
             return
         info = analyze_file(p)
         if not is_uploadable(p, info):
+            # Предсказуемый отказ: не модальное окно, а плашка.
             reason = upload_reason_for(p, info)
-            QMessageBox.critical(
-                self, 'FTP',
-                f'Нельзя отправить {p.name}\n{reason}\n\n'
+            self.log(f'[FTP] {p.name} — {reason}', 'warn')
+            self._show_notice_or_box(
+                'FTP',
+                f'Нельзя отправить {p.name}: {reason}. '
                 f'Разрешены: {upload_extensions_hint()}')
             return
         folder, found = find_target_folder(p.parent)
@@ -1663,13 +2579,14 @@ class MainWindow(QMainWindow):
                 return
         ok, reason = validate_folder_name(folder)
         if not ok:
-            QMessageBox.critical(self, 'FTP', reason)
+            self._show_notice_or_box('FTP', reason)
             return
         base = self.config.get('ftp_path', '/') or '/'
         ok, reason = validate_upload_target(base, folder)
         if not ok:
-            QMessageBox.critical(self, 'FTP', reason)
+            self._show_notice_or_box('FTP', reason)
             return
+        self.hide_notice()
         self.do_upload(p, folder)
 
     def do_upload(self, src: Path, folder: str):
@@ -1719,10 +2636,16 @@ class MainWindow(QMainWindow):
             return
         self.log(f'[НАСТР] Сохранено: {config_path()}', 'ok')
         self.apply_theme()
+        # Режим эмуляции мог измениться прямо из F10.
+        self._sync_ftp_actions()
+
+        # Настройки могли изменить видимость журнала прямо из F10.
+        self.on_settings_saved_log_visibility()
 
         new_root = Path(self.config['root_dir']).expanduser().resolve()
         if new_root.is_dir() and new_root != self.tree_root:
             self.set_tree_root(new_root)
+            self._start_downloads_watch()
 
     def open_help(self):
         dlg = HelpDialog(self, self.config)
@@ -1742,9 +2665,10 @@ class MainWindow(QMainWindow):
 
     # ---------- close ----------
     def closeEvent(self, event):
+        self._save_ui_state()
         self._stop_watch()
+        self._stop_downloads_watch()
         super().closeEvent(event)
-
 
 # ====================== диалоги ======================
 
@@ -1752,83 +2676,113 @@ class SettingsDialog(QDialog):
     def __init__(self, parent, config: dict):
         super().__init__(parent)
         self.setWindowTitle('Настройки')
-        self.setMinimumWidth(620)
+        # Минимум — под маленькие экраны; удобный размер задаётся resize.
+        self.setMinimumWidth(440)
+        self.resize(520, 640)
         self.config = config
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
-        form = QFormLayout()
-        form.setSpacing(8)
+        layout.setSpacing(12)
 
         self.fields: Dict[str, QLineEdit] = {}
 
-        def add_field(label: str, key: str, password=False):
+        def add_field(form: QFormLayout, label: str, key: str,
+                      password=False):
             e = QLineEdit(str(config.get(key, '')))
             if password:
                 e.setEchoMode(QLineEdit.Password)
             self.fields[key] = e
             form.addRow(label, e)
 
-        add_field('Корневая папка', 'root_dir')
-        add_field('Папка загрузок', 'downloads_dir')
+        def section(title: str) -> QVBoxLayout:
+            """Заголовок раздела и карточка под ним."""
+            lbl = QLabel(title)
+            lbl.setObjectName('SectionTitle')
+            layout.addWidget(lbl)
 
-        layout.addLayout(form)
+            card = QFrame()
+            card.setObjectName('Card')
+            inner = QVBoxLayout(card)
+            inner.setContentsMargins(14, 12, 14, 12)
+            inner.setSpacing(10)
+            layout.addWidget(card)
+            return inner
+
+        # --- Папки ---
+        folders = section('Папки')
+        folders_form = QFormLayout()
+        folders_form.setSpacing(8)
+        add_field(folders_form, 'Корневая папка', 'root_dir')
+        add_field(folders_form, 'Папка загрузок', 'downloads_dir')
+        folders.addLayout(folders_form)
 
         self.watch_cb = QCheckBox('Следить за папкой загрузок')
         self.watch_cb.setChecked(bool(config.get('watch_downloads', False)))
-        layout.addWidget(self.watch_cb)
+        self.watch_cb.setToolTip(
+            'Предлагать переносить новые файлы из папки загрузок')
+        folders.addWidget(self.watch_cb)
+
+        # --- Интерфейс ---
+        ui = section('Интерфейс')
 
         theme_row = QHBoxLayout()
-        theme_row.addWidget(QLabel('Тема интерфейса'))
+        theme_row.setSpacing(8)
+        theme_row.addWidget(QLabel('Тема:'))
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(['auto', 'light', 'dark'])
         self.theme_combo.setCurrentText(config.get('theme', 'auto'))
+        self.theme_combo.setToolTip('auto — по системной теме Windows')
         theme_row.addWidget(self.theme_combo)
-        theme_row.addWidget(QLabel('  auto — по системной теме'))
+
+        dim = QLabel('auto — по системной теме')
+        dim.setObjectName('Dim')
+        theme_row.addWidget(dim)
         theme_row.addStretch(1)
-        layout.addLayout(theme_row)
+        ui.addLayout(theme_row)
 
         self.help_cb = QCheckBox('Показывать справку при старте')
         self.help_cb.setChecked(
             bool(config.get('help_visible_at_start', True)))
-        layout.addWidget(self.help_cb)
+        ui.addWidget(self.help_cb)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setFrameShadow(QFrame.Sunken)
-        layout.addWidget(sep)
+        self.log_visible_cb = QCheckBox('Показывать панель журнала')
+        self.log_visible_cb.setChecked(
+            bool(config.get('log_visible', True)))
+        self.log_visible_cb.setToolTip('Панель журнала внизу окна (Ctrl+L)')
+        ui.addWidget(self.log_visible_cb)
 
+        self.blocking_errors_cb = QCheckBox(
+            'Показывать отказы модальным окном (иначе — плашкой сверху)')
+        self.blocking_errors_cb.setChecked(
+            bool(config.get('blocking_errors', False)))
+        ui.addWidget(self.blocking_errors_cb)
+
+        # --- FTP ---
+        ftp = section('FTP')
         ftp_form = QFormLayout()
         ftp_form.setSpacing(8)
+        add_field(ftp_form, 'Хост', 'ftp_host')
+        add_field(ftp_form, 'Порт', 'ftp_port')
+        add_field(ftp_form, 'Логин', 'ftp_user')
+        add_field(ftp_form, 'Пароль', 'ftp_password', password=True)
+        add_field(ftp_form, 'Базовый путь', 'ftp_path')
+        ftp.addLayout(ftp_form)
 
-        def add_ftp(label: str, key: str, password=False):
-            e = QLineEdit(str(config.get(key, '')))
-            if password:
-                e.setEchoMode(QLineEdit.Password)
-            self.fields[key] = e
-            ftp_form.addRow(label, e)
-
-        add_ftp('FTP хост', 'ftp_host')
-        add_ftp('FTP порт', 'ftp_port')
-        add_ftp('FTP логин', 'ftp_user')
-        add_ftp('FTP пароль', 'ftp_password', password=True)
-        add_ftp('FTP путь', 'ftp_path')
-
-        layout.addLayout(ftp_form)
-
-        self.ftp_readonly_cb = QCheckBox(
-            'FTP: режим эмуляции (read-only)')
+        self.ftp_readonly_cb = QCheckBox('Режим эмуляции (read-only)')
         self.ftp_readonly_cb.setChecked(
             bool(config.get('ftp_readonly', False)))
-        layout.addWidget(self.ftp_readonly_cb)
+        self.ftp_readonly_cb.setToolTip(
+            'Подключаться и читать листинг, но не создавать, '
+            'не загружать и не удалять файлы')
+        ftp.addWidget(self.ftp_readonly_cb)
 
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText('Сохранить')
+        buttons.button(QDialogButtonBox.Save).setObjectName('Accent')
         buttons.button(QDialogButtonBox.Cancel).setText('Отмена')
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
@@ -1864,6 +2818,8 @@ class SettingsDialog(QDialog):
         c['watch_downloads'] = bool(self.watch_cb.isChecked())
         c['theme'] = theme
         c['help_visible_at_start'] = bool(self.help_cb.isChecked())
+        c['log_visible'] = bool(self.log_visible_cb.isChecked())
+        c['blocking_errors'] = bool(self.blocking_errors_cb.isChecked())
         c['ftp_host'] = self.fields['ftp_host'].text().strip()
         c['ftp_port'] = port
         c['ftp_user'] = self.fields['ftp_user'].text().strip()
@@ -1887,15 +2843,38 @@ class HelpDialog(QDialog):
   Ctrl+N    Создать папку
   Ctrl+X    Переместить файл в другую папку
   Ctrl+Y    Копировать имя выделенного
+  Ctrl+Shift+C  Копировать полный путь
+  Ctrl+E    Показать файл в проводнике
+  Ctrl+L    Показать / скрыть панель журнала
+  Ctrl+1    Вкладка «Файлы»
+  Ctrl+2    Вкладка «FTP»
   F12       Загрузить файл на FTP
   Delete    Удалить файл на FTP (во вкладке FTP)
   F10       Настройки
 
+Команды файлов (F2, Ctrl+X, Ctrl+Y, F12 и другие) работают на
+вкладке «Файлы». Если вызвать их на вкладке FTP, появится
+напоминание над списком, а не диалог для локального файла.
+
 Работа с деревом «Файлы»:
   Двойной клик по папке  — раскрыть / свернуть
-  Двойной клик по файлу  — открыть системным приложением
+  Двойной клик по файлу  — меню доступных действий, файл открывает
+                           пункт «Открыть» в этом меню
   Enter на папке         — сделать корнем дерева
-  Правый клик            — контекстное меню
+  Правый клик            — контекстное меню: открыть, переименовать,
+                           переместить, копировать имя или путь,
+                           показать в проводнике
+
+Журнал слева:
+  Панель можно показать или скрыть панель журнала кнопкой «Журнал»
+  на панели инструментов (Ctrl+L) — состояние запоминается между
+  запусками. Журнал сам прокручивается вниз только если вы уже
+  внизу, поэтому чтение истории не срывается. Ctrl+Shift+L копирует
+  журнал целиком, «Правка → Сохранить журнал в файл…» пишет его
+  в .txt.
+
+Размеры окна, разделитель и ширины колонок запоминаются в конфиге
+при закрытии окна.
 
 FTP — автоподстановка пути:
   На вкладке FTP есть чек-бокс «Следить за папкой из «Файлы»».
@@ -1951,7 +2930,8 @@ FTP-синхронизация:
     def __init__(self, parent, config: dict):
         super().__init__(parent)
         self.setWindowTitle('Справка')
-        self.setMinimumSize(760, 560)
+        self.setMinimumSize(520, 360)
+        self.resize(760, 620)
         self.config = config
 
         layout = QVBoxLayout(self)
@@ -1982,16 +2962,17 @@ class RenameDialog(QDialog):
     def __init__(self, parent, path: Path):
         super().__init__(parent)
         self.setWindowTitle('Переименование')
-        self.setMinimumWidth(620)
+        self.setMinimumWidth(420)
         self.path = path
         self.result: Optional[str] = None
 
         info = analyze_file(path)
         self.suggestion = info['new_name'] or path.name
+        changed = self.suggestion != path.name
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
         form = QFormLayout()
         form.setSpacing(8)
@@ -2000,8 +2981,14 @@ class RenameDialog(QDialog):
         lbl_old.setObjectName('Dim')
         form.addRow('Было:', lbl_old)
 
-        lbl_sugg = QLabel(self.suggestion)
-        lbl_sugg.setStyleSheet('font-weight:600;')
+        # Предложение и итоговое поле визуально разные: раньше обе
+        # строки выглядели одинаково, и правка была незаметна.
+        if changed:
+            lbl_sugg = QLabel(self.suggestion)
+            lbl_sugg.setObjectName('Suggestion')
+        else:
+            lbl_sugg = QLabel('имя уже корректно')
+            lbl_sugg.setObjectName('Dim')
         form.addRow('Предложение:', lbl_sugg)
 
         self.edit = QLineEdit(self.suggestion)
@@ -2009,6 +2996,11 @@ class RenameDialog(QDialog):
         form.addRow('Новое имя:', self.edit)
 
         layout.addLayout(form)
+
+        if not changed:
+            note = QLabel('Файл уже назван по правилам — можно оставить как есть.')
+            note.setObjectName('Dim')
+            layout.addWidget(note)
 
         hint = QLabel('Ctrl+T — транслит + нормализация')
         hint.setObjectName('Dim')
@@ -2052,7 +3044,7 @@ class NewFolderDialog(QDialog):
     def __init__(self, parent, config: dict, default_dir: Path):
         super().__init__(parent)
         self.setWindowTitle('Новая папка')
-        self.setMinimumWidth(620)
+        self.setMinimumWidth(420)
         self.config = config
         self.default_dir = default_dir
         self.result: Optional[Path] = None
@@ -2128,7 +3120,8 @@ class MoveDialog(QDialog):
     def __init__(self, parent, src: Path, initial_dir: Path):
         super().__init__(parent)
         self.setWindowTitle('Перемещение файла')
-        self.setMinimumSize(620, 480)
+        self.setMinimumSize(420, 320)
+        self.resize(620, 480)
         self.src = src
         self.result: Optional[Path] = None
         self.current_dir = initial_dir.resolve()
@@ -2242,6 +3235,9 @@ def run_gui(initial_dir: Path, config: dict):
         app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName('ok-helper')
+    # Своей иконки в проекте нет: берём системную, иначе в заголовке
+    # окна и на панели задач остаётся значок Python.
+    app.setWindowIcon(_std_icon(QStyle.SP_FileDialogDetailedView))
 
     window = MainWindow(config, initial_dir)
     window.show()

@@ -1,7 +1,8 @@
 """Тесты общей валидации имён файлов (ok_helper.analyzer).
 
 Функциональность: analyze_file(), sanitize_callsign(),
-normalize_callsign(), extract_date_from_gpx().
+normalize_callsign(), extract_date_from_gpx(), is_m_gpx(),
+validate_new_folder_name(), human_size().
 
 Группировка в Allure:
   epic    = ok-helper-tui
@@ -16,8 +17,11 @@ from pathlib import Path
 from ok_helper.analyzer import (
     analyze_file,
     extract_date_from_gpx,
+    human_size,
+    is_m_gpx,
     normalize_callsign,
     sanitize_callsign,
+    validate_new_folder_name,
 )
 
 
@@ -584,3 +588,222 @@ class TestSanitizeCallsign:
     ])
     def test_sanitize(self, inp, expected):
         assert sanitize_callsign(inp) == expected
+
+
+# ─────────────────────────────────────────────────────────────────
+# 13. validate_new_folder_name — имена локальных папок (Ctrl+N)
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Имя новой локальной папки')
+class TestValidateNewFolderName:
+    @pytest.mark.smoke
+    @pytest.mark.parametrize('name', [
+        '2026-09-23_Moscow',
+        '10-Tracks',
+        'Москва',
+        'папка с пробелами',
+        'a',
+        '123',
+        'точка.внутри',
+    ])
+    def test_valid(self, name):
+        ok, reason = validate_new_folder_name(name)
+
+        assert ok is True, f'{name}: {reason}'
+        assert reason == ''
+
+    @pytest.mark.smoke
+    @pytest.mark.parametrize('name', ['', '   ', '\t\n'])
+    def test_empty_rejected(self, name):
+        ok, reason = validate_new_folder_name(name)
+
+        assert ok is False
+        assert reason == 'пустое имя'
+
+    @pytest.mark.parametrize('name', ['.', '..', ' . '])
+    def test_dot_names_rejected(self, name):
+        ok, reason = validate_new_folder_name(name)
+
+        assert ok is False
+        assert reason == 'некорректное имя'
+
+    @pytest.mark.parametrize('char', list('/\\:*?"<>|') + ['\x00'])
+    def test_forbidden_characters_rejected(self, char):
+        ok, reason = validate_new_folder_name(f'a{char}b')
+
+        assert ok is False
+        assert 'недопустимые символы' in reason
+        # В сообщении перечислены все запрещённые символы.
+        assert '/' in reason and '|' in reason
+
+    @pytest.mark.parametrize('name', ['имя.', 'a.', 'Moscow.'])
+    def test_trailing_dot_rejected(self, name):
+        ok, reason = validate_new_folder_name(name)
+
+        assert ok is False
+        assert 'оканчиваться точкой' in reason
+
+    def test_whitespace_is_trimmed(self):
+        ok, _ = validate_new_folder_name('  2026-09-23_Moscow  ')
+
+        assert ok is True
+
+    def test_dot_inside_is_allowed(self):
+        ok, _ = validate_new_folder_name('2026.09.23_Moscow')
+
+        assert ok is True
+
+    def test_message_lists_symbols(self):
+        _, reason = validate_new_folder_name('a/b')
+
+        for char in '\\/:*?"<>|':
+            assert char in reason
+
+
+# ─────────────────────────────────────────────────────────────────
+# 14. is_m_gpx — исключение <1-4 цифры>m.gpx
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('is_m_gpx')
+class TestIsMGpx:
+    @pytest.mark.parametrize('name', [
+        '1m.gpx', '12m.gpx', '100m.gpx', '9999m.gpx',
+        '20260923_100m.gpx', 'track_100m.gpx',
+        '100M.GPX', '100m.Gpx',
+    ])
+    def test_true(self, name):
+        assert is_m_gpx(Path(name)) is True
+
+    @pytest.mark.parametrize('name', [
+        'm.gpx', '12345m.gpx', 'track.gpx', 'track_100ms.gpx',
+        'track_m100.gpx', '100m.plt', '100m.wpt', '100m', '100',
+    ])
+    def test_false(self, name):
+        assert is_m_gpx(Path(name)) is False
+
+    def test_filename_inside_100m_folder(self):
+        """Важен только суффикс имени файла, а не путь."""
+        assert is_m_gpx(Path('/tmp/10-Tracks/100m.gpx')) is True
+
+    def test_digit_immediately_before_m_matters(self):
+        assert is_m_gpx(Path('1000m.gpx')) is True
+        assert is_m_gpx(Path('10000m.gpx')) is False
+
+
+# ─────────────────────────────────────────────────────────────────
+# 15. human_size — размер для колонок дерева и FTP
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('human_size')
+class TestHumanSize:
+    @pytest.mark.smoke
+    @pytest.mark.parametrize('size,expected', [
+        (0, '0 Б'),
+        (1, '1 Б'),
+        (512, '512 Б'),
+        (1023, '1023 Б'),
+        (1024, '1.0 КБ'),
+        (1536, '1.5 КБ'),
+        (1024 ** 2, '1.0 МБ'),
+        (int(1.5 * 1024 ** 2), '1.5 МБ'),
+        (1024 ** 3, '1.0 ГБ'),
+        (1024 ** 4, '1.0 ТБ'),
+    ])
+    def test_units(self, size, expected):
+        assert human_size(size) == expected
+
+    def test_bytes_are_integers(self):
+        assert human_size(1000) == '1000 Б'
+
+    def test_larger_units_have_one_decimal(self):
+        assert human_size(1024 ** 5) == '1024.0 ТБ'
+
+    def test_result_ends_with_unit(self):
+        for size in (0, 1024, 1024 ** 3):
+            assert human_size(size).split()[-1] in \
+                ('Б', 'КБ', 'МБ', 'ГБ', 'ТБ')
+
+
+# ─────────────────────────────────────────────────────────────────
+# 16. Ветви причин в analyze_file
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Причины отказа')
+class TestReasonBranches:
+    def test_date_without_callsign(self, tmp_path):
+        """Дата есть, а позывного в имени не осталось."""
+        info = analyze_file(touch(tmp_path / '2026-09-17_.gpx'))
+
+        assert info['has_error'] is True
+        assert info['new_name'] is None
+        assert info['confidence'] == 'low'
+        assert 'позывной пуст' in info['reason']
+
+    def test_content_date_without_callsign(self, tmp_path):
+        """Дата взята из содержимого, но имя не даёт позывного."""
+        info = analyze_file(make_gpx(tmp_path / '_.gpx'))
+
+        assert info['has_error'] is True
+        assert info['new_name'] is None
+        assert info['confidence'] == 'low'
+        assert 'из файла' in info['reason']
+        assert '20260917' in info['reason']
+
+    def test_content_date_with_placeholder_name(self, tmp_path):
+        """Имя-заглушка + дата из содержимого файла."""
+        info = analyze_file(make_gpx(tmp_path / 'безымянный.gpx'))
+
+        assert info['has_error'] is True
+        assert info['new_name'] == '20260917_Bezymyannyy.gpx'
+        assert info['confidence'] == 'low'
+        assert 'из содержимого файла' in info['reason']
+        assert 'заглушк' in info['reason']
+
+    def test_dirty_date_ignored(self, tmp_path):
+        """Несуществующая дата в имени не принимается."""
+        info = analyze_file(touch(tmp_path / '2026-13-45_бабушка.gpx'))
+
+        assert info['has_error'] is True
+        assert info['reason'] == 'дата не найдена ни в имени, ни в файле'
+
+    def test_normalization_reason(self, tmp_path):
+        info = analyze_file(touch(tmp_path / '2026-09-17_11-55_бабушка.gpx'))
+
+        assert info['reason'] == 'дата + позывной из имени'
+        assert info['confidence'] == 'medium'
+
+    def test_high_confidence_reason(self, tmp_path):
+        info = analyze_file(touch(tmp_path / '20260923_иванов.gpx'))
+
+        assert info['reason'] == 'нормализация позывного'
+        assert info['confidence'] == 'high'
+
+
+# ─────────────────────────────────────────────────────────────────
+# 17. Страховочные ветви normalize_callsign
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('normalize_callsign: страховки')
+class TestNormalizeFallbacks:
+    @pytest.mark.parametrize('inp,expected', [
+        # база состоит только из разделителей — возврат как есть
+        ('_-1', '_-1'),
+        ('-_5', '-_5'),
+        # база не из чистых букв и уже оканчивается цифрой
+        ('1_2', '1_2'),
+        # база не из чистых букв, номер добивается нулём
+        ('ab1c_5', 'Ab1c05'),
+        ('ab1c5', 'Ab1c5'),
+    ])
+    def test_fallback_paths(self, inp, expected):
+        assert normalize_callsign(inp) == expected
+
+    def test_idempotent_for_fallbacks(self):
+        for x in ('_-1', '1_2', 'ab1_2', 'ab1c_5'):
+            once = normalize_callsign(x)
+            assert normalize_callsign(once) == once, x
+
+    @pytest.mark.parametrize('inp', ['_', '-', '__', '---'])
+    def test_only_separators(self, inp):
+        assert normalize_callsign(inp) == inp
+

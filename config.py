@@ -33,7 +33,26 @@ DEFAULT_CONFIG = {
     # Первый запуск сервиса. После первого запуска ставится в False,
     # чтобы не показывать окно настроек при каждом старте.
     'first_run': True,
+    # --- состояние интерфейса (пишется при закрытии окна) ---
+    # 'ШxВ+X+Y' главного окна; пустая строка — размеры по умолчанию.
+    'window_geometry': '',
+    # Состояние сплиттера «журнал / вкладки» (QSplitter.saveState).
+    'splitter_state': '',
+    # Ширина колонок дерева файлов: 'имя,размер,статус'.
+    'tree_column_widths': '',
+    # Показывать панель журнала (док внизу окна).
+    'log_visible': True,
+    # Высота панели журнала в пикселях.
+    'log_dock_height': 180,
+    # Показывать предсказуемые отказы (не тот формат, нет папки)
+    # блокирующим окном вместо плашки над содержимым.
+    'blocking_errors': False,
 }
+
+
+# Логические настройки: при чтении приводятся к bool.
+_BOOL_KEYS = ('watch_downloads', 'ftp_readonly', 'help_visible_at_start',
+              'first_run', 'log_visible', 'blocking_errors')
 
 
 _LITERAL_KEYS = {
@@ -141,14 +160,17 @@ def load_config() -> dict:
     except (ValueError, TypeError):
         cfg['ftp_port'] = 21
 
-    cfg['watch_downloads'] = bool(cfg.get('watch_downloads', False))
-    cfg['ftp_readonly'] = bool(cfg.get('ftp_readonly', False))
-    cfg['help_visible_at_start'] = bool(
-        cfg.get('help_visible_at_start', True))
-    cfg['first_run'] = bool(cfg.get('first_run', True))
+    try:
+        cfg['log_dock_height'] = int(cfg.get('log_dock_height', 180))
+    except (ValueError, TypeError):
+        cfg['log_dock_height'] = 180
+
+    for key in _BOOL_KEYS:
+        cfg[key] = bool(cfg.get(key, DEFAULT_CONFIG[key]))
 
     for k in ('root_dir', 'downloads_dir', 'ftp_host', 'ftp_user',
-              'ftp_password', 'ftp_path'):
+              'ftp_password', 'ftp_path', 'window_geometry',
+              'splitter_state', 'tree_column_widths'):
         cfg[k] = str(cfg.get(k, DEFAULT_CONFIG[k]))
 
     cfg['root_dir_resolved'] = _as_path(cfg['root_dir'])
@@ -176,10 +198,23 @@ def save_config(cfg: dict):
     if theme not in ('auto', 'dark', 'light'):
         theme = 'auto'
 
-    watch = bool(cfg.get('watch_downloads', False))
-    readonly = bool(cfg.get('ftp_readonly', False))
-    help_at_start = bool(cfg.get('help_visible_at_start', True))
-    first_run = bool(cfg.get('first_run', True))
+    bools = {key: bool(cfg.get(key, DEFAULT_CONFIG.get(key, False)))
+             for key in _BOOL_KEYS}
+    watch = bools['watch_downloads']
+    readonly = bools['ftp_readonly']
+    help_at_start = bools['help_visible_at_start']
+    first_run = bools['first_run']
+    log_visible = bools['log_visible']
+    blocking_errors = bools['blocking_errors']
+    try:
+        log_dock_height = int(cfg.get('log_dock_height', 180))
+    except (ValueError, TypeError):
+        log_dock_height = 180
+    if not 1 <= log_dock_height <= 10000:
+        log_dock_height = 180
+    window_geometry = str(cfg.get('window_geometry', ''))
+    splitter_state = str(cfg.get('splitter_state', ''))
+    tree_column_widths = str(cfg.get('tree_column_widths', ''))
 
     lines = [
         '# Конфиг ok-helper-tui',
@@ -224,6 +259,17 @@ def save_config(cfg: dict):
         '',
         f'help_visible_at_start = {_toml_value("help_visible_at_start", help_at_start)}',
         f'first_run             = {_toml_value("first_run", first_run)}',
+        '',
+        '# --- Состояние интерфейса ---',
+        '# Пишется автоматически при закрытии окна; можно удалить —',
+        '# тогда окно откроется с размерами по умолчанию.',
+        '',
+        f'window_geometry     = {_toml_value("window_geometry", window_geometry)}',
+        f'splitter_state      = {_toml_value("splitter_state", splitter_state)}',
+        f'tree_column_widths  = {_toml_value("tree_column_widths", tree_column_widths)}',
+        f'log_visible         = {_toml_value("log_visible", log_visible)}',
+        f'log_dock_height     = {log_dock_height}',
+        f'blocking_errors     = {_toml_value("blocking_errors", blocking_errors)}',
         '',
     ]
     try:
