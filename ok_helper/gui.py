@@ -25,12 +25,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import (
-    QModelIndex, QObject, QPointF, QSize, Qt, QTimer, QUrl, Signal, Slot,
+    QEvent, QModelIndex, QObject, QPointF, QSize, Qt, QTimer, QUrl,
+    Signal, Slot,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QDesktopServices, QIcon, QImage, QKeySequence,
-    QPainter, QPen, QStandardItem, QStandardItemModel, QTextBlockFormat,
-    QTextCharFormat, QTextCursor, QTextOption,
+    QAction, QColor, QDesktopServices, QFontMetrics, QIcon, QImage,
+    QKeySequence, QPainter, QPen, QStandardItem, QStandardItemModel,
+    QTextBlockFormat, QTextCharFormat, QTextCursor, QTextOption,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -74,6 +75,10 @@ LOG_INDENT = 62
 # не дойти (сетевой диск, OneDrive, антивирус, сон машины), поэтому
 # папку загрузок дополнительно перечитываем по таймеру.
 DOWNLOAD_POLL_MS = 3000
+
+# Запас к ширине текста кнопки: внутренние отступы (6px 14px) и рамка
+# из таблицы стилей плюс небольшой люфт под системный шрифт.
+BUTTON_WIDTH_MARGIN = 40
 
 
 def _ui_geometry(width: int, height: int, x: int, y: int) -> str:
@@ -258,6 +263,94 @@ def build_qss_icons(theme: str) -> Dict[str, str]:
     }
     _qss_icon_cache[theme_name] = result
     return result
+
+
+def button_text_width(button) -> int:
+    """Минимальная ширина кнопки, при которой её текст помещается.
+
+    В QSS у нас задан min-width, а QStyleSheetStyle считает его не
+    нижней границей, а самой шириной кнопки: текст длиннее отведённого
+    места обрезается. Поэтому ширину считаем по метрикам шрифта с
+    запасом на внутренние отступы и рамку из таблицы стилей.
+    """
+    text = button.text()
+    if not text:
+        return 0
+    font = getattr(button, 'font', None)
+    if not callable(font):
+        return 0
+    metrics = QFontMetrics(font())
+    return metrics.horizontalAdvance(text) + BUTTON_WIDTH_MARGIN
+
+
+def set_min_button_widths(box, buttons=None):
+    """Задаёт кнопкам ширину по их тексту.
+
+    Нужно для QMessageBox: там кнопки добавляются по одной и не
+    получают подсказку по размеру, поэтому длинные подписи вроде
+    «Переместить в корень» обрезались.
+
+    buttons можно передать явно — тогда обход виджетов не нужен (и
+    работает с заменами QMessageBox в тестах).
+    """
+    if buttons is None:
+        finder = getattr(box, 'findChildren', None)
+        if finder is None:
+            return box
+        buttons = finder(QPushButton)
+    for button in buttons:
+        text = getattr(button, 'text', None)
+        if not callable(text) or not callable(getattr(button, 'font', None)):
+            # Не кнопка (в тестах встречаются замены QMessageBox).
+            continue
+        width = button_text_width(button)
+        if width:
+            button.setMinimumWidth(width)
+    return box
+
+
+def _message_box(parent, icon, title: str, text: str,
+                 buttons=None, default=None):
+    """QMessageBox с кнопками, ширина которых вмещает их текст.
+
+    Оставлено для явных случаев; обычные QMessageBox.information() и
+    QMessageBox.critical() подгоняются фильтром _MessageBoxSizer.
+    """
+    msg = QMessageBox(parent)
+    msg.setIcon(icon)
+    msg.setWindowTitle(title)
+    msg.setText(text)
+    if buttons is not None:
+        msg.setStandardButtons(buttons)
+        set_min_button_widths(msg)
+    if default is not None:
+        msg.setDefaultButton(default)
+    return msg
+
+
+class _MessageBoxSizer(QObject):
+    """Подгоняет ширину кнопок у модальных окон Qt.
+
+    QSS задаёт min-width, а QStyleSheetStyle считает его не нижней
+    границей, а самой шириной кнопки: подписи вроде «Переместить в
+    корень» обрезались. Ждать Show от самой кнопки надёжнее, чем
+    трогать статические QMessageBox.information()/critical(): так
+    правка работает для любого модального окна, включая будущие.
+    """
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Show and isinstance(obj, QPushButton):
+            width = button_text_width(obj)
+            if width and obj.minimumWidth() < width:
+                obj.setMinimumWidth(width)
+        return False
+
+
+def install_message_box_sizer(app) -> _MessageBoxSizer:
+    """Ставит фильтр, подгоняющий кнопки модальных окон."""
+    sizer = _MessageBoxSizer(app)
+    app.installEventFilter(sizer)
+    return sizer
 
 
 def reveal_in_file_manager(path: Path) -> bool:
@@ -2196,6 +2289,7 @@ class MainWindow(QMainWindow):
         btn_choose = msg.addButton('Выбрать папку…',
                                    QMessageBox.ActionRole)
         btn_skip = msg.addButton('Игнорировать', QMessageBox.RejectRole)
+        set_min_button_widths(msg, [btn_move, btn_choose, btn_skip])
         msg.setDefaultButton(btn_move)
         msg.exec()
 
@@ -3601,6 +3695,9 @@ def run_gui(initial_dir: Path, config: dict):
         app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName('ok-helper')
+    # Кнопки модальных окон: QSS-овый min-width обрезал длинные
+    # подписи, фильтр подгоняет ширину при показе окна.
+    install_message_box_sizer(app)
     # Своей иконки в проекте нет: берём системную, иначе в заголовке
     # окна и на панели задач остаётся значок Python.
     app.setWindowIcon(_std_icon(QStyle.SP_FileDialogDetailedView))

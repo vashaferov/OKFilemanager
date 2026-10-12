@@ -79,19 +79,66 @@ def _install_fake_message_box(monkeypatch, recorder):
     """Подменяет QMessageBox: ничего не показывает, всё записывает."""
     import ok_helper.gui as gui
 
+    # Подписи стандартных кнопок: Qt отдаёт их на языке системы, в
+    # тестах достаточно устойчивых названий.
+    fake_standard_texts = {
+        0x00000400: 'OK',        # Ok
+        0x00000800: 'Сохранить',  # Save
+        0x00400000: 'Отмена',     # Cancel
+        0x00200000: 'Закрыть',    # Close
+        0x00004000: 'Да',         # Yes
+        0x00010000: 'Нет',        # No
+        0x02000000: 'Применить',  # Apply
+    }
+
+    class FakeButton:
+        """Кнопка заглушки: помнит подпись и минимальную ширину."""
+
+        def __init__(self, box, text, standard=0):
+            self._box = box
+            self._text = text
+            self.standard = standard
+            self.minimum_width = 0
+
+        def text(self):
+            return self._text
+
+        def set_text(self, value):
+            self._text = value
+
+        def setMinimumWidth(self, value):
+            self.minimum_width = value
+
+        def font(self):
+            from PySide6.QtGui import QFont
+            return QFont()
+
     class FakeMessageBox:
-        Yes = 'Yes'
-        No = 'No'
-        Ok = 'Ok'
-        Cancel = 'Cancel'
-        Question = 32
+        # Значения совпадают с Qt: код обращается к кнопкам по этим
+        # константам, и заглушка обязана отвечать так же.
+        NoButton = 0x00000000
+        Ok = 0x00000400
+        Save = 0x00000800
+        Cancel = 0x00400000
+        Close = 0x00200000
+        Yes = 0x00004000
+        No = 0x00010000
+        Apply = 0x02000000
+        NoIcon = 0
+        Information = 1
+        Warning = 2
+        Critical = 3
+        Question = 4
+        # Ответ question() и роли кнопок.
         AcceptRole = 0
         ActionRole = 1
         RejectRole = 2
 
         def __init__(self, parent=None):
             self._buttons = []
+            self._by_key = {}
             self._chosen = None
+            self._standard = 0
 
         # --- модальное окно «Новый файл в загрузках» ---
         def setIcon(self, *a):
@@ -107,11 +154,32 @@ def _install_fake_message_box(monkeypatch, recorder):
             pass
 
         def addButton(self, text, role=0):
-            token = object()
+            token = FakeButton(self, text)
             self._buttons.append((token, text))
             if recorder.click_text is None or text == recorder.click_text:
                 self._chosen = token
             return token
+
+        def setStandardButtons(self, buttons):
+            self._standard = buttons
+
+        def button(self, which):
+            """Возвращает кнопку по константе (Ok, Save, Cancel…)."""
+            token = self._by_key.get(which)
+            if token is None:
+                token = FakeButton(self, '', which)
+                self._by_key[which] = token
+            return token
+
+        def findChildren(self, _type=None):
+            """Как QObject.findChildren: все кнопки, включая стандартные."""
+            found = [token for token, _ in self._buttons]
+            found.extend(self._by_key.values())
+            for token in found:
+                if not token.text():
+                    token.set_text(fake_standard_texts.get(
+                        token.standard, 'OK'))
+            return found
 
         def setDefaultButton(self, *a):
             pass
@@ -120,7 +188,11 @@ def _install_fake_message_box(monkeypatch, recorder):
             return 0
 
         def clickedButton(self):
-            return self._chosen
+            if self._chosen is not None:
+                return self._chosen
+            if self._by_key:
+                return next(iter(self._by_key.values()))
+            return None
 
         # --- статические хелперы ---
         @classmethod
@@ -141,7 +213,9 @@ def _install_fake_message_box(monkeypatch, recorder):
         @classmethod
         def question(cls, parent, title, text='', *a, **kw):
             recorder.calls.append(('question', title, str(text)))
-            return recorder.answer
+            # Как настоящий Qt: возвращаем константу кнопки, а не строку.
+            answer = str(recorder.answer).strip().lower()
+            return cls.No if answer in ('no', 'n') else cls.Yes
 
     monkeypatch.setattr(gui, 'QMessageBox', FakeMessageBox)
     return recorder

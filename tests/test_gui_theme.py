@@ -16,7 +16,8 @@ from pathlib import Path
 
 import allure
 import pytest
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QFontMetrics, QImage, QShowEvent
+from PySide6.QtWidgets import QApplication
 
 from ok_helper import gui
 
@@ -340,12 +341,17 @@ class TestQssIcons:
         for name in gui.THEMES:
             assert 'data:image' not in gui.build_stylesheet(name)
 
-    def test_stylesheet_points_to_existing_files(self, qapp):
+    def test_stylesheet_points_to_existing_files(self, qapp, tmp_path,
+                                                 monkeypatch):
+        monkeypatch.setattr(gui, 'qss_icon_dir', lambda: tmp_path)
+        monkeypatch.setattr(gui, '_qss_icon_cache', {})
+
         qss = gui.build_stylesheet('light')
 
         for key, value in gui.build_qss_icons('light').items():
             assert value in qss, key
-            assert Path(value[len('url("'):-len('")')]).is_file(), key
+            path = Path(value[len('url("'):-len('")')])
+            assert path.is_file(), key
 
     def test_branch_rules_for_both_states(self):
         """Раскрытая и закрытая ветка имеют свои стрелки."""
@@ -361,3 +367,134 @@ class TestQssIcons:
         qss = gui.build_stylesheet('dark')
 
         assert gui.build_qss_icons('dark')['chevron_down'] in qss
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4c. Ширина кнопок под их текст
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Кнопки диалогов')
+class TestButtonWidths:
+    """QSS задаёт min-width, и QStyleSheetStyle считает его шириной
+    кнопки: длинные подписи обрезались. Ширину считаем по шрифту.
+    """
+
+    def test_text_width_covers_text(self, qapp, monkeypatch):
+        from PySide6.QtWidgets import QPushButton
+
+        button = QPushButton('Переместить в корень')
+        needed = gui.button_text_width(button)
+        text = QFontMetrics(button.font()).horizontalAdvance(button.text())
+
+        assert needed >= text + 28   # отступы и рамка из QSS
+
+    def test_text_width_of_empty_button(self, qapp):
+        from PySide6.QtWidgets import QPushButton
+
+        assert gui.button_text_width(QPushButton('')) == 0
+
+    @pytest.mark.parametrize('theme', ['light', 'dark'])
+    def test_offer_dialog_buttons_fit_their_text(self, qapp, theme):
+        """Главный случай: кнопки окна «Новый файл в загрузках»."""
+        from PySide6.QtWidgets import QMessageBox, QPushButton
+
+        app = QApplication.instance()
+        app.setStyleSheet(gui.build_stylesheet(theme))
+        msg = QMessageBox()
+        msg.setText('Обнаружен новый файл')
+        buttons = [
+            msg.addButton('Переместить в корень', QMessageBox.AcceptRole),
+            msg.addButton('Выбрать папку…', QMessageBox.ActionRole),
+            msg.addButton('Игнорировать', QMessageBox.RejectRole),
+        ]
+
+        gui.set_min_button_widths(msg, buttons)
+        msg.show()
+        app.processEvents()
+        try:
+            for button in buttons:
+                needed = QFontMetrics(button.font()).horizontalAdvance(
+                    button.text())
+                assert button.minimumWidth() >= needed + 28
+        finally:
+            msg.close()
+
+    def test_set_min_button_widths_tolerates_plain_objects(self, qapp):
+        """Замены QMessageBox в тестах не обязаны быть виджетами."""
+        from PySide6.QtGui import QFont
+
+        class Fake:
+            def __init__(self):
+                self.widths = []
+
+            def setMinimumWidth(self, value):
+                self.widths.append(value)
+
+        class FakeButton(Fake):
+            def text(self):
+                return 'Длинная подпись кнопки'
+
+            def font(self):
+                return QFont()
+
+        class Token(Fake):
+            """Ни текста, ни шрифта — как токен кнопки в заглушках."""
+
+        button = FakeButton()
+
+        gui.set_min_button_widths(None, [button, Token()])
+
+        assert button.widths and button.widths[0] >= 150
+        assert Token().widths == []
+
+    def test_message_box_helper_sizes_standard_buttons(self, qapp):
+        from PySide6.QtWidgets import QMessageBox, QPushButton
+
+        msg = gui._message_box(None, QMessageBox.Critical, 'Ошибка',
+                               'Уже существует: файл.gpx', QMessageBox.Ok)
+
+        assert isinstance(msg, QMessageBox)
+        assert msg.text() == 'Уже существует: файл.gpx'
+        for button in msg.findChildren(QPushButton):
+            assert button.minimumWidth() >= 60
+
+    def test_event_filter_sizes_buttons_when_shown(self, qapp):
+        """Общий механизм: фильтр ловит показ кнопки модального окна."""
+        from PySide6.QtWidgets import QMessageBox, QPushButton
+
+        app = QApplication.instance()
+        app.setStyleSheet(gui.build_stylesheet('light'))
+        sizer = gui.install_message_box_sizer(app)
+        msg = QMessageBox()
+        msg.setText('Обнаружен новый файл')
+        buttons = [
+            msg.addButton('Переместить в корень', QMessageBox.AcceptRole),
+            msg.addButton('Выбрать папку…', QMessageBox.ActionRole),
+            msg.addButton('Игнорировать', QMessageBox.RejectRole),
+        ]
+        for button in buttons:
+            button.setMinimumWidth(1)
+
+        msg.show()
+        app.processEvents()
+        try:
+            for button in buttons:
+                needed = QFontMetrics(button.font()).horizontalAdvance(
+                    button.text())
+                assert button.minimumWidth() >= needed + 28
+        finally:
+            msg.close()
+            app.removeEventFilter(sizer)
+
+    def test_event_filter_ignores_other_widgets(self, qapp):
+        from PySide6.QtWidgets import QLabel
+
+        app = QApplication.instance()
+        sizer = gui.install_message_box_sizer(app)
+        label = QLabel('обычная метка')
+
+        app.sendEvent(label, QShowEvent())
+
+        app.removeEventFilter(sizer)
+        assert label.minimumWidth() == 0
+
