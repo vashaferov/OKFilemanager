@@ -362,10 +362,7 @@ def reveal_in_file_manager(path: Path) -> bool:
     """
     try:
         if sys.platform == 'win32':
-            subprocess.Popen(
-                ['explorer', f'/select,{path}'],
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-            return True
+            return _reveal_in_explorer(path)
         if sys.platform == 'darwin':
             subprocess.Popen(['open', '-R', str(path)])
             return True
@@ -373,6 +370,33 @@ def reveal_in_file_manager(path: Path) -> bool:
             QUrl.fromLocalFile(str(path.parent))))
     except Exception:
         return False
+
+
+def _explorer_select_command(path: Path) -> str:
+    """Командная строка Проводника, выделяющая path.
+
+    Собираем строку вручную. list2cmdline здесь не годится: путь с
+    пробелами он берёт в кавычки вместе с ключом
+    («explorer "/select,C:\\...\\file.gpx"»), Проводник такой ключ не
+    распознаёт и открывает «Документы». Кавычки нужны только вокруг
+    пути: explorer /select,"C:\\Мои треки\\file.gpx".
+    """
+    target = str(path).replace('"', '')
+    if ' ' in target:
+        return f'explorer /select,"{target}"'
+    return f'explorer /select,{target}'
+
+
+def _reveal_in_explorer(path: Path) -> bool:
+    """Открывает Проводник с выделенным файлом.
+
+    Готовая командная строка вместо списка аргументов: иначе Python
+    сам расставляет кавычки и ломает ключ /select.
+    """
+    subprocess.Popen(
+        _explorer_select_command(path), shell=False,
+        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    return True
 
 
 # ====================== тема ======================
