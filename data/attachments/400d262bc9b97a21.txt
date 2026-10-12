@@ -1,0 +1,2 @@
+Не директория: C:\Users\runneradmin\AppData\Local\Temp\pytest-of-runneradmin\pytest-0\test_gui_not_started_without_d0\нет-такой
+Проверьте root_dir в C:\Users\runneradmin\AppData\Local\Temp\pytest-of-runneradmin\pytest-0\test_gui_not_started_without_d0\ok-helper-tui\config.toml
