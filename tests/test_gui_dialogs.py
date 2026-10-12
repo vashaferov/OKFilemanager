@@ -625,7 +625,7 @@ class TestHelpDialog:
     @pytest.mark.parametrize('key', [
         'F1', 'F2', 'F5', 'Ctrl+F5', 'Ctrl+N', 'Ctrl+O', 'Ctrl+X',
         'Ctrl+Y', 'F10', 'F12', 'Delete', 'Ctrl+E', 'Ctrl+L',
-        'Ctrl+1', 'Ctrl+2',
+        'Ctrl+1', 'Ctrl+2', 'Ctrl+D',
     ])
     def test_help_lists_documented_hotkeys(self, key):
         """Справка должна перечислять клавиши из README."""

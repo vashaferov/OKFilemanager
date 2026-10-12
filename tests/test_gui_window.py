@@ -2196,7 +2196,18 @@ class TestWatchdog:
 
         assert window.downloads_observer is not None
         assert FakeObserver.instances[-1].recursive is False
-        assert 'Слежение за загрузками' in log_text(window)
+        assert 'Слежение включено' in log_text(window)
+        assert window.downloads_watch_active() is True
+
+    def test_downloads_watch_disabled_is_logged(self, window, gui_config):
+        """Выключенное слежение должно быть видно в журнале, а не молчать."""
+        gui_config['watch_downloads'] = False
+
+        window._start_downloads_watch()
+
+        assert window.downloads_observer is None
+        assert window.downloads_watch_active() is False
+        assert 'Слежение выключено' in log_text(window)
 
     def test_downloads_watch_missing_dir(self, window, gui_config):
         gui_config['watch_downloads'] = True
@@ -2204,6 +2215,29 @@ class TestWatchdog:
 
         window._start_downloads_watch()
 
+        assert window.downloads_observer is None
+        assert 'Папка загрузок не задана' in log_text(window)
+
+    def test_downloads_watch_starts_poll_timer(self, window, gui_config,
+                                               monkeypatch):
+        """Кроме событий системы есть периодическая проверка папки."""
+        gui_config['watch_downloads'] = True
+        monkeypatch.setattr(gui, 'Observer', FakeObserver)
+
+        window._start_downloads_watch()
+
+        assert window.downloads_poll_timer is not None
+        assert window.downloads_poll_timer.interval() == gui.DOWNLOAD_POLL_MS
+
+    def test_stop_downloads_watch_stops_timer(self, window, gui_config,
+                                              monkeypatch):
+        gui_config['watch_downloads'] = True
+        monkeypatch.setattr(gui, 'Observer', FakeObserver)
+        window._start_downloads_watch()
+
+        window._stop_downloads_watch()
+
+        assert window.downloads_poll_timer is None
         assert window.downloads_observer is None
 
     def test_downloads_watch_not_a_directory(self, window, gui_config,
@@ -2214,7 +2248,8 @@ class TestWatchdog:
         window._start_downloads_watch()
 
         assert window.downloads_observer is None
-        assert 'downloads_dir не директория' in log_text(window)
+        assert 'Папки нет' in log_text(window)
+        assert 'слежение не запущено' in log_text(window)
 
     def test_downloads_watch_skips_tree_root(self, window, gui_config):
         gui_config['watch_downloads'] = True
@@ -2237,7 +2272,7 @@ class TestWatchdog:
     def test_offer_move_missing_file(self, window, tmp_path):
         window._offer_move_download(tmp_path / 'нет.gpx')
 
-        assert '[ЗАГРУЗКИ]' not in log_text(window)
+        assert 'Новый файл' not in log_text(window)
 
     def test_offer_move_ignored(self, window, tmp_path, msgbox):
         p = tmp_path / 'track.gpx'
@@ -2297,6 +2332,224 @@ class TestWatchdog:
             destroy(qapp, win)
 
         assert win.observer is None
+
+
+# ─────────────────────────────────────────────────────────────────
+# 10b. Папка загрузок: подстраховка, ручная проверка, меню
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def poll_timers(monkeypatch):
+    """Перехватывает QTimer: и singleShot, и периодические таймеры.
+
+    Позволяет «выстрелить» таймером проверки загрузок вручную.
+    """
+    rec = types.SimpleNamespace(instances=[], calls=[])
+
+    class FakeTimer:
+        def __init__(self, parent=None):
+            rec.instances.append(self)
+            self._interval = 0
+            self.started = False
+            self.timeout = FakeSignal()
+
+        def setInterval(self, ms):
+            self._interval = ms
+
+        def interval(self):
+            return self._interval
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.started = False
+
+        @staticmethod
+        def singleShot(ms, callback=None):
+            rec.calls.append((ms, callback))
+
+    monkeypatch.setattr(gui, 'QTimer', FakeTimer)
+    return rec
+
+
+@pytest.mark.story('Папка загрузок')
+class TestDownloadsWatch:
+    def downloads_dir(self, gui_config, window):
+        """Направляет слежение на отдельную папку рядом с tmp_path."""
+        d = Path(gui_config['root_dir_resolved']).parent / 'downloads'
+        d.mkdir(exist_ok=True)
+        gui_config['downloads_dir_resolved'] = d
+        gui_config['downloads_dir'] = str(d)
+        return d
+
+    def test_poll_offers_new_file(self, window, gui_config, monkeypatch,
+                                  poll_timers, msgbox):
+        """Подстраховка находит файл, даже если события не пришли."""
+        d = self.downloads_dir(gui_config, window)
+        gui_config['watch_downloads'] = True
+        monkeypatch.setattr(gui, 'Observer', FakeObserver)
+        window._start_downloads_watch()
+        msgbox.click_text = 'Игнорировать'
+        p = d / 'track.gpx'
+        p.write_text('')
+
+        offered = window.poll_downloads(ignore_before=0)
+
+        assert offered == 1
+        assert len([c for c in poll_timers.calls if c[0] == 1200]) == 1
+
+    def test_poll_skips_uninteresting_files(self, window, gui_config,
+                                            monkeypatch, poll_timers):
+        d = self.downloads_dir(gui_config, window)
+        (d / 'readme.txt').write_text('')
+        (d / 'archive.zip').write_text('')
+
+        assert window.poll_downloads(ignore_before=0) == 0
+
+    def test_poll_skips_stale_files(self, window, gui_config, monkeypatch,
+                                    poll_timers):
+        """Скачанное до запуска сервиса не предлагается."""
+        d = self.downloads_dir(gui_config, window)
+        p = d / 'old.gpx'
+        p.write_text('')
+
+        import time as _time
+        offered = window.poll_downloads(ignore_before=_time.time() + 10)
+
+        assert offered == 0
+        assert p in window._seen_downloads
+        assert poll_timers.calls == []
+
+    def test_poll_is_idempotent(self, window, gui_config, monkeypatch,
+                               poll_timers):
+        d = self.downloads_dir(gui_config, window)
+        (d / 'track.gpx').write_text('')
+
+        assert window.poll_downloads(ignore_before=0) == 1
+        assert window.poll_downloads(ignore_before=0) == 0
+
+    def test_check_downloads_reports_empty_folder(self, window, gui_config,
+                                                 poll_timers):
+        self.downloads_dir(gui_config, window)
+
+        window.on_check_downloads()
+
+        assert 'нет файлов .gpx, .plt, .wpt' in log_text(window)
+
+    def test_check_downloads_offers_old_file(self, window, gui_config,
+                                             monkeypatch, poll_timers,
+                                             msgbox):
+        """Ручная проверка предлагает и то, что скачано раньше."""
+        d = self.downloads_dir(gui_config, window)
+        (d / 'track.plt').write_text('')
+        msgbox.click_text = 'Игнорировать'
+
+        window.on_check_downloads()
+
+        assert 'найдено 1' in log_text(window)
+        assert len([c for c in poll_timers.calls if c[0] == 1200]) == 1
+
+    def test_check_downloads_without_folder(self, window, gui_config,
+                                            poll_timers):
+        gui_config['downloads_dir_resolved'] = None
+
+        window.on_check_downloads()
+
+        assert 'Слежение недоступно' in log_text(window)
+
+    def test_timer_triggers_poll_with_baseline(self, window, gui_config,
+                                               monkeypatch, poll_timers,
+                                               msgbox):
+        """Таймер проверяет папку с учётом времени запуска."""
+        d = self.downloads_dir(gui_config, window)
+        gui_config['watch_downloads'] = True
+        monkeypatch.setattr(gui, 'Observer', FakeObserver)
+        window._start_downloads_watch()
+        msgbox.click_text = 'Игнорировать'
+        poll_timers.calls.clear()
+        (d / 'fresh.gpx').write_text('')
+
+        window.downloads_poll_timer.timeout.emit()
+
+        assert len([c for c in poll_timers.calls if c[0] == 1200]) == 1
+
+    def test_baseline_has_tolerance_for_fresh_files(self, window, gui_config,
+                                                   monkeypatch, poll_timers):
+        """Файл, скачанный в момент запуска, не должен теряться.
+
+        Время изменения файла бывает на доли миллисекунды «старше»
+        метки запуска, поэтому фильтр обязан иметь небольшой допуск.
+        """
+        d = self.downloads_dir(gui_config, window)
+        gui_config['watch_downloads'] = True
+        monkeypatch.setattr(gui, 'Observer', FakeObserver)
+
+        window._start_downloads_watch()
+        p = d / 'right-at-start.gpx'
+        p.write_text('')
+
+        import time as _time
+        assert p.stat().st_mtime > window._downloads_baseline
+        assert window._downloads_baseline <= _time.time()
+
+    def test_toggle_action_updates_config_and_watch(self, window, gui_config,
+                                                    monkeypatch,
+                                                    poll_timers):
+        monkeypatch.setattr(gui, 'Observer', FakeObserver)
+        gui_config['downloads_dir_resolved'] = None
+
+        window.watch_downloads_action.setChecked(True)
+
+        assert window.config['watch_downloads'] is True
+        assert 'Слежение' in log_text(window)
+
+        window.watch_downloads_action.setChecked(False)
+
+        assert window.config['watch_downloads'] is False
+        assert window.downloads_observer is None
+
+    def test_sync_downloads_actions_reflects_settings(self, window,
+                                                      gui_config):
+        gui_config['watch_downloads'] = False
+
+        window._sync_downloads_actions()
+
+        assert window.watch_downloads_action.isChecked() is False
+        assert 'выключено' in window.downloads_action.toolTip()
+
+    def test_open_downloads_dir_without_folder(self, window, gui_config,
+                                              poll_timers):
+        gui_config['downloads_dir_resolved'] = None
+
+        window.on_open_downloads_dir()
+
+        assert window.notice_bar.isVisibleTo(window) is True
+
+    def test_open_downloads_dir_uses_file_manager(self, window, gui_config,
+                                                  monkeypatch, poll_timers):
+        d = self.downloads_dir(gui_config, window)
+        revealed = []
+        monkeypatch.setattr(gui, 'reveal_in_file_manager',
+                            lambda path: revealed.append(path) or True)
+
+        window.on_open_downloads_dir()
+
+        assert revealed == [d]
+
+    def test_downloads_menu_has_items(self, window):
+        """Меню «Загрузки» доступно из главного меню."""
+        texts = [a.text() for a in window.menuBar().actions()]
+        assert 'Загрузки' in texts
+        menu = window.menuBar().actions()[texts.index('Загрузки')].menu()
+        items = [a.text() for a in menu.actions() if a.text()]
+        assert 'Проверить папку загрузок' in items
+        assert 'Следить за папкой загрузок' in items
+        assert 'Открыть папку загрузок' in items
+
+    def test_check_action_shortcut(self, window):
+        assert window.downloads_action.shortcut() == \
+            gui.QKeySequence('Ctrl+D')
 
 
 # ─────────────────────────────────────────────────────────────────

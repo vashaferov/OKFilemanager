@@ -12,9 +12,11 @@ QApplication не требуется: проверяются только чис
 import re
 import sys
 import types
+from pathlib import Path
 
 import allure
 import pytest
+from PySide6.QtGui import QImage
 
 from ok_helper import gui
 
@@ -252,3 +254,110 @@ class TestBuildStylesheet:
         qss = gui.build_stylesheet('dark')
 
         assert gui.THEMES['dark']['accent'] in qss
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4b. Иконки QSS (галочка и стрелки) — рисуются в PNG
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Иконки QSS')
+class TestQssIcons:
+    """Qt не читает data-URI в QSS, поэтому иконки — файлы PNG.
+
+    Проверяем, что они действительно создаются и что таблица стилей
+    ссылается на существующие файлы: иначе галочка и стрелка ветки
+    молча не рисуются.
+    """
+
+    def test_icons_are_created_and_readable(self, qapp, tmp_path,
+                                            monkeypatch):
+        monkeypatch.setattr(gui, 'qss_icon_dir', lambda: tmp_path)
+        monkeypatch.setattr(gui, '_qss_icon_cache', {})
+
+        icons = gui.build_qss_icons('light')
+
+        assert set(icons) == {'check', 'chevron_down', 'chevron_right'}
+        for key, value in icons.items():
+            assert value.startswith('url("'), key
+            path = Path(value[len('url("'):-len('")')])
+            assert path.is_file(), key
+            image = QImage(str(path))
+            assert not image.isNull(), key
+            assert image.size().width() > 0
+            opaque = sum(1 for y in range(image.height())
+                         for x in range(image.width())
+                         if image.pixelColor(x, y).alpha() > 0)
+            assert opaque > 0, f'{key}: картинка пустая'
+
+    def test_check_mark_is_white(self, qapp, tmp_path, monkeypatch):
+        """Галочка ложится на акцентную заливку, значит она светлая."""
+        monkeypatch.setattr(gui, 'qss_icon_dir', lambda: tmp_path)
+        monkeypatch.setattr(gui, '_qss_icon_cache', {})
+
+        icons = gui.build_qss_icons('dark')
+        image = QImage(icons['check'][len('url("'):-len('")')])
+
+        colors = [image.pixelColor(x, y) for y in range(image.height())
+                  for x in range(image.width())
+                  if image.pixelColor(x, y).alpha() > 200]
+        assert colors
+        assert all(col.red() > 200 and col.green() > 200
+                   and col.blue() > 200 for col in colors)
+
+    def test_themes_have_own_files(self, qapp, tmp_path, monkeypatch):
+        monkeypatch.setattr(gui, 'qss_icon_dir', lambda: tmp_path)
+        monkeypatch.setattr(gui, '_qss_icon_cache', {})
+
+        light = gui.build_qss_icons('light')
+        dark = gui.build_qss_icons('dark')
+
+        assert light['chevron_down'] != dark['chevron_down']
+        assert Path(light['chevron_down'][5:-2]).name.startswith('light-')
+        assert Path(dark['chevron_down'][5:-2]).name.startswith('dark-')
+
+    def test_unknown_theme_falls_back_to_light(self, qapp, tmp_path,
+                                               monkeypatch):
+        monkeypatch.setattr(gui, 'qss_icon_dir', lambda: tmp_path)
+        monkeypatch.setattr(gui, '_qss_icon_cache', {})
+
+        icons = gui.build_qss_icons('не-такая')
+
+        assert 'light-' in icons['check']
+
+    def test_missing_icon_dir_does_not_break(self, qapp, monkeypatch):
+        """Если писать некуда — QSS собирается, правила без картинок."""
+        monkeypatch.setattr(gui, 'qss_icon_dir', lambda: None)
+        monkeypatch.setattr(gui, '_qss_icon_cache', {})
+
+        icons = gui.build_qss_icons('dark')
+
+        assert icons == {'check': '', 'chevron_down': '',
+                         'chevron_right': ''}
+        assert 'QCheckBox::indicator:checked' in gui.build_stylesheet('dark')
+
+    def test_stylesheet_has_no_data_uri(self):
+        """data-URI Qt не читает — их не должно остаться в QSS."""
+        for name in gui.THEMES:
+            assert 'data:image' not in gui.build_stylesheet(name)
+
+    def test_stylesheet_points_to_existing_files(self, qapp):
+        qss = gui.build_stylesheet('light')
+
+        for key, value in gui.build_qss_icons('light').items():
+            assert value in qss, key
+            assert Path(value[len('url("'):-len('")')]).is_file(), key
+
+    def test_branch_rules_for_both_states(self):
+        """Раскрытая и закрытая ветка имеют свои стрелки."""
+        for name in gui.THEMES:
+            qss = gui.build_stylesheet(name)
+            assert 'QTreeView::branch:has-children:closed' in qss
+            assert 'QTreeView::branch:has-children:open' in qss
+
+    def test_combo_arrow_uses_icon(self, qapp, tmp_path, monkeypatch):
+        monkeypatch.setattr(gui, 'qss_icon_dir', lambda: tmp_path)
+        monkeypatch.setattr(gui, '_qss_icon_cache', {})
+
+        qss = gui.build_stylesheet('dark')
+
+        assert gui.build_qss_icons('dark')['chevron_down'] in qss

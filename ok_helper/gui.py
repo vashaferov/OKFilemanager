@@ -17,18 +17,20 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import (
-    QModelIndex, QObject, QSize, Qt, QTimer, QUrl, Signal, Slot,
+    QModelIndex, QObject, QPointF, QSize, Qt, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QDesktopServices, QIcon, QKeySequence,
-    QStandardItem, QStandardItemModel, QTextBlockFormat, QTextCharFormat,
-    QTextCursor, QTextOption,
+    QAction, QColor, QDesktopServices, QIcon, QImage, QKeySequence,
+    QPainter, QPen, QStandardItem, QStandardItemModel, QTextBlockFormat,
+    QTextCharFormat, QTextCursor, QTextOption,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -67,6 +69,11 @@ UI_STATE_KEYS = ('window_geometry', 'splitter_state', 'tree_column_widths',
 # Отступ журнала под отметку времени: продолжение длинной записи
 # переносится с этим отступом, а не под цифрами времени.
 LOG_INDENT = 62
+
+# Периодическая подстраховка к watchdog: события файловой системы могут
+# не дойти (сетевой диск, OneDrive, антивирус, сон машины), поэтому
+# папку загрузок дополнительно перечитываем по таймеру.
+DOWNLOAD_POLL_MS = 3000
 
 
 def _ui_geometry(width: int, height: int, x: int, y: int) -> str:
@@ -114,6 +121,143 @@ def _std_icon(sp: QStyle.StandardPixmap) -> QIcon:
     if style is None:
         return QIcon()
     return style.standardIcon(sp)
+
+
+# ====================== иконки для QSS ======================
+
+# QSS берёт картинки только по имени файла: data-URI Qt не читает
+# (QImageReader отвечает «File not found»), поэтому галочка и стрелки
+# рисуются в PNG при старте и подставляются в таблицу стилей путями.
+QSS_ICON_SIZE = 16
+_qss_icon_cache: Dict[str, Dict[str, str]] = {}
+_qss_icon_dir: Optional[Path] = None
+
+
+def _icon_candidates() -> List[Path]:
+    """Куда можно положить сгенерированные иконки, по порядку."""
+    base = config_path().parent / 'icons'
+    temp = Path(tempfile.gettempdir()) / 'ok-helper-icons'
+    return [base, temp]
+
+
+def qss_icon_dir() -> Optional[Path]:
+    """Каталог для иконок QSS: первый, в который удалось записать.
+
+    Рядом с конфигом может не быть прав на запись (например, в
+    песочнице) — тогда берём временный каталог. None означает, что
+    писать некуда: правила с картинками просто не применятся.
+    """
+    global _qss_icon_dir
+    if _qss_icon_dir is not None:
+        return _qss_icon_dir
+    for candidate in _icon_candidates():
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        _qss_icon_dir = candidate
+        return candidate
+    return None
+
+
+def _render_icon_png(path: Path, size: int, draw) -> bool:
+    """Рисует иконку в PNG. False — если записать не удалось."""
+    try:
+        image = QImage(size, size, QImage.Format_ARGB32)
+        image.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(image)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            draw(painter)
+        finally:
+            painter.end()
+        return bool(image.save(str(path), 'PNG'))
+    except Exception:
+        return False
+
+
+def _icon_url(path: Path) -> str:
+    """Путь для QSS: url() требует прямые слэши и кавычки."""
+    return 'url("{}")'.format(path.as_posix())
+
+
+def _pen(color: str, width: float) -> QPen:
+    pen = QPen(QColor(color))
+    pen.setWidthF(width)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    return pen
+
+
+def build_qss_icons(theme: str) -> Dict[str, str]:
+    """Готовит PNG-иконки для темы и возвращает их QSS-пути.
+
+    Ключи: check, chevron_down, chevron_right. При ошибке записи ключ
+    получает пустую строку: правило с пустым image просто не
+    применяется, интерфейс не ломается.
+    """
+    theme_name = theme if theme in ('light', 'dark') else 'light'
+    cached = _qss_icon_cache.get(theme_name)
+    if cached is not None:
+        return cached
+
+    # Рисовать можно только при живом QApplication. Без него отдаём
+    # пустые пути: таблицу стилей всё равно собирать безопасно.
+    if QApplication.instance() is None:
+        return {'check': '', 'chevron_down': '', 'chevron_right': ''}
+
+    colors = THEMES[theme_name]
+    dim = colors['text_dim']
+    on_accent = '#ffffff'
+    size = QSS_ICON_SIZE
+    directory = qss_icon_dir()
+
+    def draw_check(painter):
+        painter.setPen(_pen(on_accent, 2.0))
+        painter.drawPolyline([QPointF(3.5, 8.5), QPointF(6.5, 11.5),
+                              QPointF(12.5, 4.5)])
+
+    def draw_chevron_down(painter):
+        painter.setPen(_pen(dim, 1.8))
+        painter.drawPolyline([QPointF(4, 6.5), QPointF(8, 10.5),
+                              QPointF(12, 6.5)])
+
+    def draw_chevron_right(painter):
+        painter.setPen(_pen(dim, 1.8))
+        painter.drawPolyline([QPointF(6.5, 4), QPointF(10.5, 8),
+                              QPointF(6.5, 12)])
+
+    draw_fns = {
+        'check.png': draw_check,
+        'chevron-down.png': draw_chevron_down,
+        'chevron-right.png': draw_chevron_right,
+    }
+    paths: Dict[str, str] = {}
+    for filename, draw in draw_fns.items():
+        if directory is None:
+            paths[filename] = ''
+            continue
+        target = directory / f'{theme_name}-{filename}'
+        # Уже нарисовано (например, темой по умолчанию при старте) —
+        # повторно не пишем: build_stylesheet зовут на каждое F10.
+        if target.is_file() and target.stat().st_size > 0:
+            paths[filename] = str(target)
+            continue
+        if _render_icon_png(target, size, draw):
+            paths[filename] = str(target)
+        else:
+            paths[filename] = ''
+
+    result = {
+        'check': _icon_url(Path(paths['check.png']))
+        if paths['check.png'] else '',
+        'chevron_down': _icon_url(Path(paths['chevron-down.png']))
+        if paths['chevron-down.png'] else '',
+        'chevron_right': _icon_url(Path(paths['chevron-right.png']))
+        if paths['chevron-right.png'] else '',
+    }
+    _qss_icon_cache[theme_name] = result
+    return result
 
 
 def reveal_in_file_manager(path: Path) -> bool:
@@ -215,25 +359,13 @@ THEMES: Dict[str, Dict[str, str]] = {
 
 def build_stylesheet(name: str) -> str:
     c = THEMES[name]
-    # Галочка чек-бокса: QSS не рисует отметку сам, если переопределён
-    # indicator, поэтому подставляем SVG с белым штрихом (фон — акцент).
-    check_mark = (
-        "url(\"data:image/svg+xml;utf8,"
-        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>"
-        "<path d='M3.5 8.5l3 3 6-7' fill='none' stroke='%23ffffff'"
-        " stroke-width='2' stroke-linecap='round'"
-        " stroke-linejoin='round'/></svg>\")"
-    )
-    # Шеврон ComboBox и стрелка закрытой ветки дерева: системные
-    # глифы в тёмной теме почти не видны, поэтому рисуем свои.
-    dim = c['text_dim'].lstrip('#')
-    chevron = (
-        "url(\"data:image/svg+xml;utf8,"
-        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>"
-        f"<path d='M4 6.5l4 4 4-4' fill='none' stroke='%23{dim}'"
-        " stroke-width='1.8' stroke-linecap='round'"
-        " stroke-linejoin='round'/></svg>\")"
-    )
+    icons = build_qss_icons(name)
+    # Отметки, которые Qt не рисует сам, приходят готовыми PNG. Пустая
+    # строка означает, что файл создать не удалось: правило с пустым
+    # image просто не применяется, фон остаётся акцентным.
+    check_mark = icons['check']
+    chevron = icons['chevron_down']
+    chevron_right = icons['chevron_right']
     return f"""
         QWidget {{
             background: {c['bg']};
@@ -424,6 +556,9 @@ def build_stylesheet(name: str) -> str:
             color: {c['sel_fg']};
         }}
         QTreeView::branch:has-children:closed {{
+            image: {chevron_right};
+        }}
+        QTreeView::branch:has-children:open {{
             image: {chevron};
         }}
         QHeaderView::section {{
@@ -974,6 +1109,9 @@ class MainWindow(QMainWindow):
         self.observer: Optional[Observer] = None
 
         self.downloads_observer: Optional[Observer] = None
+        self.downloads_poll_timer: Optional[QTimer] = None
+        # Время запуска слежения: файлы старше не предлагаем переносить.
+        self._downloads_baseline = 0.0
         # Защита от повторного показа диалога для одного и того же файла.
         self._seen_downloads: Set[Path] = set()
 
@@ -1255,6 +1393,28 @@ class MainWindow(QMainWindow):
             'Удаление недоступно: ftp_readonly = true' if readonly
             else 'Удалить выделенный файл на сервере (Del)')
 
+    def _sync_downloads_actions(self):
+        """Согласует меню «Загрузки» с настройками слежения."""
+        watch = self._cfg_bool(self.config, 'watch_downloads', False)
+        action = getattr(self, 'watch_downloads_action', None)
+        if action is not None and action.isChecked() != watch:
+            action.blockSignals(True)
+            action.setChecked(watch)
+            action.blockSignals(False)
+
+        check = getattr(self, 'downloads_action', None)
+        if check is None:
+            return
+        if not watch:
+            check.setToolTip('Слежение выключено '
+                             '(watch_downloads = false)')
+        elif self.downloads_watch_active():
+            folder = self.config.get('downloads_dir_resolved')
+            check.setToolTip(f'Проверить папку загрузок: {folder} (Ctrl+D)')
+        else:
+            check.setToolTip('Слежение не удалось запустить — '
+                             'подробности в журнале')
+
 
     def _build_notice_bar(self) -> QFrame:
         """Плашка над содержимым вместо модального окна для отказов."""
@@ -1530,6 +1690,27 @@ class MainWindow(QMainWindow):
         self._act(m_help, 'О программе', None, self.open_about,
                   QStyle.SP_MessageBoxInformation)
 
+        # Папка загрузок: слежение включается в F10, здесь — ручная
+        # проверка и понятное состояние.
+        m_downloads = menubar.addMenu('Загрузки')
+        self.downloads_action = self._act(
+            m_downloads, 'Проверить папку загрузок', 'Ctrl+D',
+            self.on_check_downloads, QStyle.SP_DialogOpenButton)
+        self.watch_downloads_action = QAction('Следить за папкой загрузок',
+                                              self)
+        self.watch_downloads_action.setCheckable(True)
+        self.watch_downloads_action.setChecked(
+            self._cfg_bool(self.config, 'watch_downloads', False))
+        self.watch_downloads_action.toggled.connect(
+            self.on_watch_downloads_toggled)
+        m_downloads.addAction(self.watch_downloads_action)
+        self.addAction(self.watch_downloads_action)
+        m_downloads.addSeparator()
+        self._act(m_downloads, 'Открыть папку загрузок', None,
+                  self.on_open_downloads_dir, QStyle.SP_DirOpenIcon)
+        self._act(m_downloads, 'Папка загрузок в настройках…', None,
+                  self.open_settings, QStyle.SP_FileDialogDetailedView)
+
         # Быстрое переключение вкладок: подсказка в плашке ссылается
         # на Ctrl+1, значит сочетание должно работать.
         m_view = menubar.addMenu('Вид')
@@ -1598,6 +1779,10 @@ class MainWindow(QMainWindow):
         add('В проводнике', self.on_reveal_selected,
             'Открыть папку с выделением файла (Ctrl+E)',
             QStyle.SP_DirOpenIcon)
+        tb.addSeparator()
+        add('Проверить загрузки', self.on_check_downloads,
+            'Проверить папку загрузок и предложить перенос (Ctrl+D)',
+            QStyle.SP_DialogOpenButton)
         tb.addSeparator()
 
         # Переключатель панели журнала: состояние сохраняется в конфиге.
@@ -1779,27 +1964,87 @@ class MainWindow(QMainWindow):
             self.observer = None
 
         # ---------- watchdog: папка загрузок ----------
-    def _start_downloads_watch(self):
-        """Запускает наблюдатель за downloads_dir, если он включён."""
-        self._stop_downloads_watch()
-
-        if not bool(self.config.get('watch_downloads', False)):
-            return
-
+    def _downloads_dir(self) -> Optional[Path]:
+        """Папка загрузок для слежения или None, если следить не за чем."""
         d = self.config.get('downloads_dir_resolved')
         if not d:
-            return
-        d = Path(d)
+            return None
+        try:
+            d = Path(d)
+        except TypeError:
+            return None
         if not d.is_dir():
-            self.log(f'[watchdog] downloads_dir не директория: {d}',
-                     'warn')
-            return
+            return None
         # Не дублировать, если папка загрузок совпадает с корнем.
         try:
             if d.resolve() == self.tree_root.resolve():
-                return
+                return None
         except OSError:
             pass
+        return d
+
+    def downloads_watch_active(self) -> bool:
+        """Идёт ли сейчас слежение за папкой загрузок."""
+        return self.downloads_observer is not None
+
+    def _download_candidates(self) -> List[Path]:
+        """Файлы в папке загрузок, с которыми работает сервис.
+
+        Список отсортирован по времени изменения: свежие — первыми.
+        """
+        d = self._downloads_dir()
+        if d is None:
+            return []
+        interesting = DownloadsHandler._INTERESTING_SUFFIXES
+        found: List[Tuple[float, Path]] = []
+        try:
+            for p in d.iterdir():
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in interesting:
+                    continue
+                try:
+                    found.append((p.stat().st_mtime, p))
+                except OSError:
+                    continue
+        except OSError as e:
+            self.log(f'[ЗАГРУЗКИ] Не прочитать папку: {e}', 'warn')
+            return []
+        found.sort(key=lambda item: item[0], reverse=True)
+        return [p for _, p in found]
+
+    def _start_downloads_watch(self):
+        """Запускает слежение за downloads_dir, если оно включено.
+
+        Пишет в журнал понятный итог: слежение включено, выключено или
+        папка недоступна — иначе непонятно, почему нет уведомлений.
+        """
+        self._stop_downloads_watch()
+
+        if not self._cfg_bool(self.config, 'watch_downloads', False):
+            self.log('[ЗАГРУЗКИ] Слежение выключено '
+                     '(watch_downloads = false в F10)', 'cfg')
+            return
+
+        configured = self.config.get('downloads_dir') or '~'
+        d = self.config.get('downloads_dir_resolved')
+        if not d:
+            self.log(f'[ЗАГРУЗКИ] Папка загрузок не задана в F10: '
+                     f'{configured} — слежение не запущено', 'warn')
+            return
+
+        d = Path(d)
+        if not d.is_dir():
+            self.log(f'[ЗАГРУЗКИ] Папки нет: {d} — слежение не запущено. '
+                     f'Укажите существующую папку в F10 '
+                     f'(«Папка загрузок»)', 'warn')
+            return
+
+        if self._downloads_dir() is None:
+            # Единственная причина здесь — папка совпала с корнем дерева.
+            self.log('[ЗАГРУЗКИ] Папка загрузок совпадает с корнем '
+                     'дерева — слежение не нужно', 'cfg')
+            return
 
         try:
             handler = DownloadsHandler(self._on_download_event)
@@ -1807,11 +2052,36 @@ class MainWindow(QMainWindow):
             obs.schedule(handler, str(d), recursive=False)
             obs.start()
             self.downloads_observer = obs
-            self.log(f'[watchdog] Слежение за загрузками: {d}', 'cfg')
         except Exception as e:
-            self.log(f'[watchdog] загрузки: {e}', 'error')
+            self.log(f'[ЗАГРУЗКИ] Не запустить наблюдение за {d}: {e}',
+                     'error')
+            return
+
+        self.log(f'[ЗАГРУЗКИ] Слежение включено: {d} '
+                 f'(.gpx, .plt, .wpt; проверка каждые '
+                 f'{DOWNLOAD_POLL_MS // 1000} с)', 'cfg')
+
+        # Файлы, скачанные до запуска сервиса, не предлагаем: иначе
+        # при каждом старте всплывало бы всё, что лежит в загрузках.
+        # Допуск в секунду — из-за гранулярности времени изменения
+        # файла: свежий файл может оказаться на доли миллисекунды
+        # «старше» метки запуска и без допуска был бы пропущен.
+        self._downloads_baseline = time.time() - 1.0
+
+        # Подстраховка к событиям файловой системы.
+        self.downloads_poll_timer = QTimer(self)
+        self.downloads_poll_timer.setInterval(DOWNLOAD_POLL_MS)
+        self.downloads_poll_timer.timeout.connect(
+            lambda: self.poll_downloads(ignore_before=self._downloads_baseline))
+        self.downloads_poll_timer.start()
 
     def _stop_downloads_watch(self):
+        if self.downloads_poll_timer is not None:
+            try:
+                self.downloads_poll_timer.stop()
+            except Exception:
+                pass
+            self.downloads_poll_timer = None
         if self.downloads_observer:
             try:
                 self.downloads_observer.stop()
@@ -1819,6 +2089,77 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self.downloads_observer = None
+
+    def poll_downloads(self, ignore_before: Optional[float] = None,
+                       limit: Optional[int] = None) -> int:
+        """Ищет новые файлы в папке загрузок и предлагает перенос.
+
+        Вызывается таймером-подстраховкой и вручную кнопкой
+        «Проверить загрузки». ignore_before позволяет не предлагать
+        файлы, скачанные до запуска сервиса. Возвращает число файлов,
+        по которым предложен перенос.
+        """
+        offered = 0
+        for path in self._download_candidates():
+            if path in self._seen_downloads:
+                continue
+            if limit is not None and offered >= limit:
+                return offered
+            if ignore_before is not None:
+                try:
+                    if path.stat().st_mtime < ignore_before:
+                        # Скачано до запуска — просто запоминаем.
+                        self._seen_downloads.add(path)
+                        continue
+                except OSError:
+                    continue
+            self._handle_new_download(path)
+            offered += 1
+        return offered
+
+    def on_check_downloads(self):
+        """Ручная проверка папки загрузок (кнопка «Проверить загрузки»)."""
+        d = self._downloads_dir()
+        if d is None:
+            self.log('[ЗАГРУЗКИ] Слежение недоступно: папка загрузок '
+                     'не задана или совпадает с корнем дерева', 'warn')
+            return
+
+        files = self._download_candidates()
+        if not files:
+            self.log(f'[ЗАГРУЗКИ] В {d} нет файлов .gpx, .plt, .wpt', 'info')
+            return
+
+        self.log(f'[ЗАГРУЗКИ] В {d} найдено {len(files)}, проверяю',
+                 'info')
+        offered = self.poll_downloads(limit=10)
+        if not offered:
+            self.log(f'[ЗАГРУЗКИ] Новых файлов нет: все {len(files)} уже '
+                     f'предлагались в этой сессии', 'info')
+
+    def on_watch_downloads_toggled(self, checked: bool):
+        """Переключатель слежения за загрузками из меню «Загрузки»."""
+        self.config['watch_downloads'] = bool(checked)
+        try:
+            save_config(self.config)
+        except Exception:
+            pass
+        self._start_downloads_watch()
+        self.log(f'[ЗАГРУЗКИ] Слежение '
+                 f'{"включено" if checked else "выключено"}', 'cfg')
+
+    def on_open_downloads_dir(self):
+        """Открывает папку загрузок в системном файловом менеджере."""
+        d = self.config.get('downloads_dir_resolved')
+        if not d or not Path(d).is_dir():
+            self.show_notice('Папка загрузок не задана или не существует. '
+                             'Укажите её в F10 («Папка загрузок»).', 'warn')
+            return
+        if not reveal_in_file_manager(Path(d)):
+            self.show_notice('Не удалось открыть системный файловый '
+                             'менеджер.', 'error')
+            return
+        self.log(f'[ЗАГРУЗКИ] Открыта папка: {d}', 'info')
 
     def _on_download_event(self, path: Path):
         """Вызывается из потока watchdog — уходим в главный поток."""
@@ -1828,6 +2169,9 @@ class MainWindow(QMainWindow):
         if path in self._seen_downloads:
             return
         self._seen_downloads.add(path)
+        # Список только растёт; старые записи не нужны.
+        if len(self._seen_downloads) > 400:
+            self._seen_downloads = {path}
 
         # Небольшая задержка: дать браузеру дописать файл и
         # отпустить блокировку.
@@ -2642,10 +2986,14 @@ class MainWindow(QMainWindow):
         # Настройки могли изменить видимость журнала прямо из F10.
         self.on_settings_saved_log_visibility()
 
+        # Слежение за загрузками применяем всегда: могли сменить саму
+        # папку, а не только флажок.
+        self._start_downloads_watch()
+        self._sync_downloads_actions()
+
         new_root = Path(self.config['root_dir']).expanduser().resolve()
         if new_root.is_dir() and new_root != self.tree_root:
             self.set_tree_root(new_root)
-            self._start_downloads_watch()
 
     def open_help(self):
         dlg = HelpDialog(self, self.config)
@@ -2846,6 +3194,7 @@ class HelpDialog(QDialog):
   Ctrl+Shift+C  Копировать полный путь
   Ctrl+E    Показать файл в проводнике
   Ctrl+L    Показать / скрыть панель журнала
+  Ctrl+D    Проверить папку загрузок
   Ctrl+1    Вкладка «Файлы»
   Ctrl+2    Вкладка «FTP»
   F12       Загрузить файл на FTP
@@ -2875,6 +3224,23 @@ class HelpDialog(QDialog):
 
 Размеры окна, разделитель и ширины колонок запоминаются в конфиге
 при закрытии окна.
+
+Папка загрузок:
+  Слежение включается в F10 («Следить за папкой загрузок») или в меню
+  «Загрузки». Когда в папке появляется новый .gpx, .plt или .wpt,
+  сервис предлагает перенести его в корень дерева или выбрать папку.
+  Временные файлы браузеров (.crdownload, .part и подобные) не
+  считаются готовыми и не предлагаются.
+
+  Папка проверяется и по событиям системы, и дополнительно каждые
+  несколько секунд — события могут не дойти на сетевом диске,
+  в OneDrive или после сна машины. Кнопка «Проверить загрузки»
+  (Ctrl+D) запускает проверку вручную; «Загрузки → Открыть папку
+  загрузок» открывает саму папку.
+
+  Файлы, скачанные до запуска сервиса, не предлагаются — иначе при
+  каждом старте всплывало бы всё содержимое папки. Итог слежения
+  всегда виден в журнале: включено, выключено или папка недоступна.
 
 FTP — автоподстановка пути:
   На вкладке FTP есть чек-бокс «Следить за папкой из «Файлы»».
