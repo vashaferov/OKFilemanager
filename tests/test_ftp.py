@@ -18,7 +18,7 @@ from ok_helper.ftp import (
 
 pytestmark = [
     pytest.mark.ftp,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('FTP'),
 ]
 

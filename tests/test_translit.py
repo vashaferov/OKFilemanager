@@ -3,7 +3,7 @@
 Функциональность: transliterate() — ГОСТ 7.79-2000, система B.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Транслитерация
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -16,7 +16,7 @@ from ok_helper.translit import transliterate
 
 pytestmark = [
     pytest.mark.translit,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Транслитерация'),
 ]
 

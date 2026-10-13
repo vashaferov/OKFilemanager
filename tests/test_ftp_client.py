@@ -8,7 +8,7 @@
 которая ведёт себя как настоящий сервер (папки, листинг, ошибки 550).
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = FTP
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -31,7 +31,7 @@ from ok_helper.ftp import (
 
 pytestmark = [
     pytest.mark.ftp,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('FTP'),
 ]
 

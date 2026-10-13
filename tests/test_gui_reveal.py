@@ -4,7 +4,7 @@
 которую получает Проводник, — на ней и была регрессия.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Проводник
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -19,7 +19,7 @@ from ok_helper import gui
 
 pytestmark = [
     pytest.mark.gui,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Проводник'),
 ]
 

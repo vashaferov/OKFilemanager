@@ -16,7 +16,7 @@ MANIFEST
 
 # PyInstaller
 *.spec
-!ok-helper-tui.spec
+!ok-filemanager.spec
 
 # Virtual environments
 .venv/

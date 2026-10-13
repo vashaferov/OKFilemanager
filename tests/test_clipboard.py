@@ -6,7 +6,7 @@
 Внешние зависимости подменяются, реальный буфер обмена не затрагивается.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Буфер обмена
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -22,7 +22,7 @@ from ok_helper import clipboard
 
 pytestmark = [
     pytest.mark.clipboard,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Буфер обмена'),
 ]
 

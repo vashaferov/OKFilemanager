@@ -4,7 +4,7 @@ build_stylesheet, THEMES).
 QApplication не требуется: проверяются только чистые функции.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Оформление
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -24,7 +24,7 @@ from ok_helper import gui
 
 pytestmark = [
     pytest.mark.theme,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Оформление'),
 ]
 

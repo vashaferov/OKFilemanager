@@ -7,7 +7,7 @@ MoveDialog (Ctrl+X), SettingsDialog (F10), HelpDialog (F1).
 проверяются поля, правила предзаполнения и результат _apply/_save.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Диалоги GUI
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -30,7 +30,7 @@ from ok_helper.gui import (
 
 pytestmark = [
     pytest.mark.gui,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Диалоги GUI'),
 ]
 

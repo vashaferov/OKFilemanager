@@ -131,13 +131,13 @@ jobs:
           pip install pyinstaller
 
       - name: Сборка onefile GUI-бинарника
-        run: pyinstaller --onefile --windowed --name ok-helper main.py
+        run: pyinstaller --onefile --windowed --name ok-filemanager --icon assets/ok-filemanager.ico main.py
 
       - name: Проверка, что бинарник существует
         shell: bash
         run: |
           ls -la dist/
-          test -f "dist/ok-helper.exe"
+          test -f "dist/ok-filemanager.exe"
 
       # Формируем портативный ZIP: exe + README с инструкцией по
       # разблокировке. Именно этот файл пользователь скачивает —
@@ -146,31 +146,31 @@ jobs:
         shell: bash
         run: |
           mkdir -p portable
-          cp dist/ok-helper.exe portable/
+          cp dist/ok-filemanager.exe portable/
           cat > portable/README.txt <<'EOF'
-          ok-helper — портативная сборка для Windows
+          ok-filemanager — портативная сборка для Windows
           =========================================
 
           Как запустить
           -------------
-          1. Распакуйте архив в любую папку (например, C:\Tools\ok-helper).
+          1. Распакуйте архив в любую папку (например, C:\Tools\ok-filemanager).
           2. При первом запуске Windows может показать окно
              «Windows защитила ваш компьютер» (SmartScreen) — это
              стандартная защита для неподписанных .exe. Нажмите:
                  Подробнее → Выполнить в любом случае.
           3. Приложение запустится. Конфиг создастся автоматически в
-             %APPDATA%\ok-helper\config.toml.
+             %APPDATA%\ok-filemanager\config.toml.
 
           Альтернативный способ разблокировки (если SmartScreen не
           показывает кнопку «Выполнить в любом случае»)
           ------------------------------------------------------
-          • Правый клик по ok-helper.exe → Свойства.
+          • Правый клик по ok-filemanager.exe → Свойства.
           • Внизу вкладки «Общие» поставьте галочку «Разблокировать»
             (Unblock) → ОК.
           • Запустите файл обычным двойным кликом.
 
           Или одной командой в PowerShell (в папке с exe):
-              Unblock-File .\ok-helper.exe
+              Unblock-File .\ok-filemanager.exe
 
           Требования
           ----------
@@ -182,9 +182,9 @@ jobs:
         shell: bash
         run: |
           cd portable
-          7z a -tzip ../ok-helper-windows-portable.zip ./*
+          7z a -tzip ../ok-filemanager-windows-portable.zip ./*
           cd ..
-          ls -la ok-helper-windows-portable.zip
+          ls -la ok-filemanager-windows-portable.zip
 
       # ─────────────────────────────────────────────────────────────
       # Основной канал распространения: GitHub Release.
@@ -197,7 +197,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ok-helper-windows-portable.zip
+          files: ok-filemanager-windows-portable.zip
           generate_release_notes: true
           fail_on_unmatched_files: true
         env:
@@ -211,7 +211,7 @@ jobs:
       - name: Сохранить ZIP как артефакт (для внутреннего использования)
         uses: actions/upload-artifact@v4
         with:
-          name: ok-helper-windows-portable
-          path: ok-helper-windows-portable.zip
+          name: ok-filemanager-windows-portable
+          path: ok-filemanager-windows-portable.zip
           if-no-files-found: error
           retention-days: 30

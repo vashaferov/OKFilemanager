@@ -6,7 +6,7 @@
 GUI подменяется: run_gui только фиксирует вызов.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Точка входа
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -24,7 +24,7 @@ import ok_helper.gui as gui
 
 pytestmark = [
     pytest.mark.main,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Точка входа'),
 ]
 
@@ -75,7 +75,7 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(module, 'load_config',
                         lambda: loaded.append(True) or cfg)
     monkeypatch.setattr(module, 'config_path',
-                        lambda: tmp_path / 'ok-helper-tui' / 'config.toml')
+                        lambda: tmp_path / 'ok-filemanager' / 'config.toml')
     monkeypatch.setattr(gui, 'run_gui',
                         lambda directory, config: calls.append(
                             (directory, config)))
@@ -246,7 +246,7 @@ class TestCli:
             run(app, '--help')
 
         assert exc.value.code == 0
-        assert 'ok-helper' in capsys.readouterr().out
+        assert 'ok-filemanager' in capsys.readouterr().out
 
     def test_help_describes_directory_argument(self, app, capsys):
         with pytest.raises(SystemExit):

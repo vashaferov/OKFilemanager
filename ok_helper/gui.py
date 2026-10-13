@@ -1,4 +1,4 @@
-"""GUI-версия ok-helper на PySide6 (Qt 6).
+"""GUI-версия ok-filemanager на PySide6 (Qt 6).
 
 Полностью заменяет tkinter-версию. Логика анализа имён и FTP берётся
 из существующих модулей ok_helper.*.
@@ -25,8 +25,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import (
-    QEvent, QModelIndex, QObject, QPointF, QSize, Qt, QTimer, QUrl,
-    Signal, Slot,
+    QEvent, QModelIndex, QObject, QPoint, QPointF, QRect, QSize, Qt,
+    QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QFontMetrics, QIcon, QImage,
@@ -36,8 +36,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDockWidget, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSplitter,
+    QHeaderView, QInputDialog, QLabel, QLayout, QLineEdit, QMainWindow,
+    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSplitter,
     QStyle, QToolButton, QStatusBar, QTabWidget, QToolBar, QTreeView,
     QVBoxLayout, QWidget,
 )
@@ -47,6 +47,7 @@ from ok_helper.analyzer import (
     analyze_file, human_size, normalize_callsign, sanitize_callsign,
     validate_new_folder_name,
 )
+from ok_helper.appicon import app_icon
 from ok_helper.clipboard import copy_to_clipboard
 from ok_helper.ftp import (
     delete_file, find_target_folder, is_uploadable, list_folder,
@@ -141,7 +142,7 @@ _qss_icon_dir: Optional[Path] = None
 def _icon_candidates() -> List[Path]:
     """Куда можно положить сгенерированные иконки, по порядку."""
     base = config_path().parent / 'icons'
-    temp = Path(tempfile.gettempdir()) / 'ok-helper-icons'
+    temp = Path(tempfile.gettempdir()) / 'ok-filemanager-icons'
     return [base, temp]
 
 
@@ -629,6 +630,30 @@ def build_stylesheet(name: str) -> str:
             background: {c['sel_bg']};
             border-color: {c['accent']};
             color: {c['sel_fg']};
+        }}
+        #MainToolBar {{
+            background: {c['bg_alt']};
+            border-bottom: 1px solid {c['border']};
+        }}
+        #MainToolBar QToolButton {{
+            background: transparent;
+            color: {c['text']};
+            border: 1px solid transparent;
+            border-radius: 7px;
+            padding: 6px 11px;
+        }}
+        #MainToolBar QToolButton:hover {{
+            background: {c['hover']};
+            border-color: {c['border']};
+        }}
+        #MainToolBar QToolButton:pressed, #MainToolBar QToolButton:checked {{
+            background: {c['sel_bg']};
+            border-color: {c['accent']};
+            color: {c['sel_fg']};
+        }}
+        #MainToolBar QFrame#ToolBarSep {{
+            background: {c['border']};
+            border: none;
         }}
         QTabWidget::pane {{
             border: 1px solid {c['border']};
@@ -1215,6 +1240,189 @@ class FtpDeleteTask(QObject):
             self.finished.emit(folder, filename, str(e))
 
 
+# ====================== панель действий с переносом ======================
+
+class FlowLayout(QLayout):
+    """Раскладка в строку с переносом на следующую при нехватке ширины.
+
+    Используется панелью действий вместо QToolBar: тот при сужении окна
+    прячет «не влезшие» кнопки в меню «>>», из-за чего часть шапки
+    пропадала. Поток же переносит кнопки вниз — они всегда на виду.
+    """
+
+    def __init__(self, parent=None, margin: int = 0, spacing: int = 4):
+        super().__init__(parent)
+        self._items: List[object] = []
+        self._spacing = spacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    # --- обязательный интерфейс QLayout ---
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, apply=True)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize(0, 0)
+        for item in self._items:
+            widget = item.widget()
+            if widget is not None and widget.isHidden():
+                continue
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(),
+                            margins.top() + margins.bottom())
+
+    # --- раскладка ---
+    def _do_layout(self, rect: QRect, apply: bool) -> int:
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(),
+                             -margins.right(), -margins.bottom())
+        x = area.x()
+        y = area.y()
+        line_height = 0
+        for item in self._items:
+            widget = item.widget()
+            if widget is not None and widget.isHidden():
+                continue
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._spacing
+            if next_x - self._spacing > area.right() and line_height > 0:
+                x = area.x()
+                y = y + line_height + self._spacing
+                next_x = x + hint.width() + self._spacing
+                line_height = 0
+            if apply:
+                item.setGeometry(QRect(x, y, hint.width(), hint.height()))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + margins.bottom()
+
+
+class WrapToolBar(QWidget):
+    """Панель действий, переносящая кнопки на новые строки.
+
+    Действия — обычные QAction, поэтому доступность вкладок, горячие
+    клавиши и тесты работают так же, как с QToolBar. Видимость кнопок
+    следует за видимостью действий (переключение «Файлы» / «FTP»).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('MainToolBar')
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+        self._layout = FlowLayout(self, margin=6, spacing=4)
+        self._buttons: Dict[QAction, QToolButton] = {}
+        self._separators: Dict[QAction, QFrame] = {}
+        self._tool_style = Qt.ToolButtonTextBesideIcon
+        self._icon_size = QSize(16, 16)
+
+    def setToolButtonStyle(self, style):
+        self._tool_style = style
+        for button in self._buttons.values():
+            button.setToolButtonStyle(style)
+        self._relayout()
+
+    def setIconSize(self, size):
+        self._icon_size = size
+        for button in self._buttons.values():
+            button.setIconSize(size)
+        self._relayout()
+
+    def add_action(self, action: QAction) -> QToolButton:
+        button = QToolButton(self)
+        button.setDefaultAction(action)
+        button.setToolButtonStyle(self._tool_style)
+        button.setIconSize(self._icon_size)
+        button.setAutoRaise(True)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setHidden(not action.isVisible())
+        self._buttons[action] = button
+        self._layout.addWidget(button)
+        action.changed.connect(lambda a=action: self._sync_action(a))
+        self._relayout()
+        return button
+
+    def add_separator(self) -> QAction:
+        action = QAction(self)
+        action.setSeparator(True)
+        action.setVisible(True)
+
+        line = QFrame(self)
+        line.setObjectName('ToolBarSep')
+        line.setFixedWidth(1)
+        line.setMinimumHeight(18)
+        self._separators[action] = line
+        self._layout.addWidget(line)
+        action.changed.connect(lambda a=action: self._sync_separator(a))
+        self._relayout()
+        return action
+
+    def _sync_action(self, action: QAction):
+        button = self._buttons.get(action)
+        if button is None:
+            return
+        hidden = not action.isVisible()
+        if button.isHidden() != hidden:
+            button.setHidden(hidden)
+            self._relayout()
+
+    def _sync_separator(self, action: QAction):
+        line = self._separators.get(action)
+        if line is None:
+            return
+        hidden = not action.isVisible()
+        if line.isHidden() != hidden:
+            line.setHidden(hidden)
+            self._relayout()
+
+    def _relayout(self):
+        self._layout.invalidate()
+        self.updateGeometry()
+
+    def sizeHint(self):
+        return self._layout.sizeHint()
+
+    def minimumSizeHint(self):
+        return self._layout.minimumSize()
+
+    def heightForWidth(self, width: int) -> int:
+        return self._layout.heightForWidth(width)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+
 # ====================== главное окно ======================
 
 class MainWindow(QMainWindow):
@@ -1238,10 +1446,10 @@ class MainWindow(QMainWindow):
 
         self._refresh_pending = False
 
-        self.setWindowTitle('ok-helper')
+        self.setWindowTitle('ok-filemanager')
         # Иконка на самом окне: тесты и превью создают QApplication
         # сами, поэтому полагаться на run_gui нельзя.
-        self.setWindowIcon(_std_icon(QStyle.SP_FileDialogDetailedView))
+        self.setWindowIcon(app_icon())
         saved_geometry = _parse_ui_geometry(
             str(config.get('window_geometry', '')))
 
@@ -1410,6 +1618,7 @@ class MainWindow(QMainWindow):
             'Двойной клик по папке — раскрыть / свернуть, по файлу — меню '
             'действий; Enter — сделать корнем дерева; правый клик — меню.')
         hint.setObjectName('Dim')
+        hint.setWordWrap(True)
         layout.addWidget(hint)
 
         self.tabs.addTab(tab, 'Файлы')
@@ -1490,6 +1699,7 @@ class MainWindow(QMainWindow):
             'Двойной клик по папке — войти. '
             'Удаление доступно только при ftp_readonly = false.')
         hint.setObjectName('Dim')
+        hint.setWordWrap(True)
         layout.addWidget(hint)
 
         self.tabs.addTab(tab, 'FTP')
@@ -1740,7 +1950,7 @@ class MainWindow(QMainWindow):
             self.log('[ОШБ] Буфер обмена недоступен', 'error')
 
     def on_save_log(self):
-        default = str(Path.home() / 'ok-helper-log.txt')
+        default = str(Path.home() / 'ok-filemanager-log.txt')
         name, _ = QFileDialog.getSaveFileName(
             self, 'Сохранить журнал', default, 'Текстовые файлы (*.txt)')
         if not name:
@@ -1856,12 +2066,16 @@ class MainWindow(QMainWindow):
         return a
 
     def _build_toolbar(self):
-        tb = QToolBar('Основные')
-        tb.setMovable(False)
+        # Панель с переносом кнопок: QToolBar при сужении окна прятал
+        # часть действий в меню «>>».
+        tb = WrapToolBar(self)
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         tb.setIconSize(QSize(16, 16))
-        self.addToolBar(tb)
         self.toolbar = tb
+        # Панель ставим в самый верх центральной области, над плашкой и
+        # вкладками.
+        central = self.centralWidget()
+        central.layout().insertWidget(0, tb)
 
         # Кнопки шапки зависят от активной вкладки: у «Файлов» и «FTP»
         # свои действия. Держим их группами и прячем ненужную.
@@ -1876,12 +2090,12 @@ class MainWindow(QMainWindow):
             a.triggered.connect(slot)
             if tooltip:
                 a.setToolTip(tooltip)
-            tb.addAction(a)
+            tb.add_action(a)
             self._toolbar_groups[group].append(a)
             return a
 
         def sep(group):
-            self._toolbar_groups[group].append(tb.addSeparator())
+            self._toolbar_groups[group].append(tb.add_separator())
 
         # --- вкладка «Файлы» ---
         add('files', 'Вверх', self.on_up, 'Перейти в родительскую папку',
@@ -1942,7 +2156,7 @@ class MainWindow(QMainWindow):
         self.log_action.setToolTip('Показать или скрыть панель журнала (Ctrl+L)')
         self.log_action.setShortcut(QKeySequence('Ctrl+L'))
         self.log_action.toggled.connect(self.on_toggle_log)
-        tb.addAction(self.log_action)
+        tb.add_action(self.log_action)
         self.addAction(self.log_action)
 
         self._update_toolbar_for_tab(self.tabs.currentIndex())
@@ -2565,6 +2779,7 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction('Переименовать…', self.on_rename)
             menu.addAction('Переместить…', self.on_move)
+            menu.addAction('На FTP', self.on_upload_selected)
             menu.addAction('Открыть', self.on_open_selected)
         return menu
 
@@ -3241,7 +3456,8 @@ class MainWindow(QMainWindow):
     def open_about(self):
         QMessageBox.information(
             self, 'О программе',
-            'ok-helper (Qt GUI)\n\n'
+            'ok-filemanager\n'
+            'Файловый менеджер для ОК\n\n'
             'Транслит и умная проверка имён файлов; работа с FTP.\n'
             'Интерфейс на PySide6.\n\n'
             f'Конфиг: {config_path()}')
@@ -3835,13 +4051,12 @@ def run_gui(initial_dir: Path, config: dict):
     if app is None:
         app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    app.setApplicationName('ok-helper')
+    app.setApplicationName('ok-filemanager')
     # Кнопки модальных окон: QSS-овый min-width обрезал длинные
     # подписи, фильтр подгоняет ширину при показе окна.
     install_message_box_sizer(app)
-    # Своей иконки в проекте нет: берём системную, иначе в заголовке
-    # окна и на панели задач остаётся значок Python.
-    app.setWindowIcon(_std_icon(QStyle.SP_FileDialogDetailedView))
+    # Иконка приложения — папка с «OK»; та же, что зашита в .exe.
+    app.setWindowIcon(app_icon())
 
     window = MainWindow(config, initial_dir)
     window.show()

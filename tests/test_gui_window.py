@@ -9,7 +9,7 @@
 FTP-задачи, watchdog-наблюдатели и модальные окна подменяются.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Главное окно
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -27,7 +27,7 @@ from ok_helper import gui
 
 pytestmark = [
     pytest.mark.gui,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Главное окно'),
 ]
 
@@ -261,7 +261,7 @@ def select(win, path):
 @pytest.mark.story('Построение окна')
 class TestConstruction:
     def test_title(self, window):
-        assert window.windowTitle() == 'ok-helper'
+        assert window.windowTitle() == 'ok-filemanager'
 
     @pytest.mark.smoke
     def test_root_is_resolved(self, window, gui_config):
@@ -387,6 +387,60 @@ class TestTabToolbar:
 
         assert window.ftp_delete_action.isEnabled() is True
         assert window.btn_ftp_delete.isEnabled() is True
+
+
+# ─────────────────────────────────────────────────────────────────
+# 1c. Шапка переносит кнопки на новые строки вместо «>>»
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Перенос кнопок шапки')
+class TestWrappingToolbar:
+    def _file_buttons(self, window):
+        bar = window.toolbar
+        return [bar._buttons[a] for a in window._toolbar_groups['files']
+                if a.text()]
+
+    def test_window_uses_wrapping_toolbar(self, window):
+        from PySide6.QtWidgets import QToolButton
+
+        assert isinstance(window.toolbar, gui.WrapToolBar)
+        # QToolBar прятал бы кнопки в меню «>>»; у панели с переносом
+        # такого расширения нет вовсе.
+        assert window.toolbar.findChild(QToolButton,
+                                        'qt_toolbar_ext_button') is None
+
+    def test_narrow_toolbar_wraps_but_keeps_buttons(self, window):
+        """При узкой ширине кнопки переносятся, а не пропадают."""
+        from PySide6.QtCore import QRect
+
+        window._update_toolbar_for_tab(0)
+        window.toolbar._layout.setGeometry(QRect(0, 0, 240, 600))
+
+        buttons = self._file_buttons(window)
+        assert buttons
+        assert all(not b.isHidden() for b in buttons)
+        rows = {b.y() for b in buttons}
+        assert len(rows) > 1, 'кнопки должны переноситься на новую строку'
+
+    def test_wide_toolbar_keeps_one_row(self, window):
+        from PySide6.QtCore import QRect
+
+        window._update_toolbar_for_tab(0)
+        window.toolbar._layout.setGeometry(QRect(0, 0, 4000, 600))
+
+        rows = {b.y() for b in self._file_buttons(window)}
+        assert len(rows) == 1
+
+    def test_buttons_follow_action_visibility(self, window):
+        bar = window.toolbar
+        action = next(a for a in window._toolbar_groups['files']
+                      if a.text() == 'Папка')
+
+        action.setVisible(False)
+        assert bar._buttons[action].isHidden() is True
+
+        action.setVisible(True)
+        assert bar._buttons[action].isHidden() is False
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -564,7 +618,7 @@ class TestNavigation:
         assert menu.executed is True
         assert menu.items == ['Копировать имя', 'Копировать путь',
                               'Показать в проводнике', 'Переименовать…',
-                              'Переместить…', 'Открыть']
+                              'Переместить…', 'На FTP', 'Открыть']
         assert opened == []                 # сам файл не открывается
         assert window._selected_path() == target
 
@@ -798,7 +852,21 @@ class TestContextMenu:
 
         assert menu.items == ['Копировать имя', 'Копировать путь',
                               'Показать в проводнике', 'Переименовать…',
-                              'Переместить…', 'Открыть']
+                              'Переместить…', 'На FTP', 'Открыть']
+
+    def test_file_menu_ftp_action_upload(self, window, files, monkeypatch,
+                                         menus):
+        """Пункт «На FTP» из меню файла вызывает загрузку на сервер."""
+        called = []
+        monkeypatch.setattr(gui.MainWindow, 'on_upload_selected',
+                            lambda self: called.append(True))
+        menu = self.open_menu(window, monkeypatch, menus,
+                              files / 'track.plt')
+
+        assert 'На FTP' in menu.items
+        menu.signals['На FTP'].emit()
+
+        assert called == [True]
 
     def test_menu_without_item(self, window, monkeypatch, menus):
         monkeypatch.setattr(window.tree_view, 'indexAt',
@@ -2911,7 +2979,7 @@ class TestSettings:
         window.open_about()
 
         assert msgbox.kinds == ['information']
-        assert 'ok-helper' in msgbox.texts()[0]
+        assert 'ok-filemanager' in msgbox.texts()[0]
 
     def test_apply_theme_sets_stylesheet(self, window, qapp):
         window.config['theme'] = 'dark'

@@ -7,7 +7,7 @@
 не запускается.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Watchdog
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -22,7 +22,7 @@ from ok_helper.handlers import DirHandler, DownloadsHandler
 
 pytestmark = [
     pytest.mark.handlers,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Watchdog'),
 ]
 

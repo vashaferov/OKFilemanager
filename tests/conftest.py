@@ -34,7 +34,7 @@ def gui_config(tmp_path):
     """Конфиг в том виде, в каком его отдаёт config.load_config().
 
     Пути указывают внутрь tmp_path, чтобы ни один тест не тронул
-    настоящий %APPDATA%/ok-helper-tui/config.toml.
+    настоящий %APPDATA%/ok-filemanager/config.toml.
     """
     root = tmp_path / 'root'
     root.mkdir()

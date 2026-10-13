@@ -1,12 +1,13 @@
-"""Конфиг ok-helper-tui.
+"""Конфиг ok-filemanager.
 
 Файл config.toml лежит в системной папке конфигов:
-  Linux:   $XDG_CONFIG_HOME/ok-helper-tui/config.toml
-  macOS:   ~/Library/Application Support/ok-helper-tui/config.toml
-  Windows: %APPDATA%\\ok-helper-tui\\config.toml
+  Linux:   $XDG_CONFIG_HOME/ok-filemanager/config.toml
+  macOS:   ~/Library/Application Support/ok-filemanager/config.toml
+  Windows: %APPDATA%\\ok-filemanager\\config.toml
 """
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -69,7 +70,30 @@ def config_path() -> Path:
     else:
         xdg = os.environ.get('XDG_CONFIG_HOME')
         base = Path(xdg) if xdg else Path.home() / '.config'
-    return base / 'ok-helper-tui' / 'config.toml'
+    return base / 'ok-filemanager' / 'config.toml'
+
+
+def legacy_config_path() -> Path:
+    """Прежний путь конфига (приложение звалось ok-helper-tui).
+
+    Нужен только для одноразового переноса настроек после переименования.
+    Считается от config_path(), поэтому подмена пути в тестах не тянет
+    реальный конфиг из %APPDATA%.
+    """
+    p = config_path()
+    return p.parent.with_name('ok-helper-tui') / p.name
+
+
+def _migrate_legacy_config(target: Path):
+    """Копирует старый config.toml на новое место, если нового ещё нет."""
+    legacy = legacy_config_path()
+    if legacy == target or target.exists() or not legacy.exists():
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy, target)
+    except OSError as e:
+        print(f'[config] не перенести {legacy}: {e}', file=sys.stderr)
 
 
 def _as_path(value: str) -> Path:
@@ -145,6 +169,9 @@ def load_config() -> dict:
     p = config_path()
     cfg = dict(DEFAULT_CONFIG)
 
+    # Одноразовый перенос настроек из старого каталога ok-helper-tui.
+    _migrate_legacy_config(p)
+
     if p.exists():
         data = _read_toml(p)
         if data is not None:
@@ -217,7 +244,7 @@ def save_config(cfg: dict):
     tree_column_widths = str(cfg.get('tree_column_widths', ''))
 
     lines = [
-        '# Конфиг ok-helper-tui',
+        '# Конфиг ok-filemanager',
         '#',
         '# root_dir        — корневая директория, открывается при запуске',
         '# downloads_dir   — папка загрузок для мониторинга',

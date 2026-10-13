@@ -27,7 +27,7 @@ class DownloadsHandler(FileSystemEventHandler):
 
     Отфильтровывает временные файлы браузеров (Chrome/Edge создают
     *.crdownload, Firefox — *.part и т.п.) и пропускает только те
-    расширения, с которыми работает ok-helper.
+    расширения, с которыми работает ok-filemanager.
     """
 
     _TEMP_SUFFIXES = {

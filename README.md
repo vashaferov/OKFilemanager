@@ -1,8 +1,8 @@
-# ok-helper
+# ok-filemanager
 
-Кроссплатформенный (приоритет — Windows) помощник для работы с треками
-и путевыми точками (`.gpx`, `.plt`, `.wpt`). Интерфейс — **GUI на
-PySide6 (Qt 6)**.
+**Файловый менеджер для ОК** — кроссплатформенный (приоритет — Windows)
+помощник для работы с треками и путевыми точками (`.gpx`, `.plt`,
+`.wpt`). Интерфейс — **GUI на PySide6 (Qt 6)**.
 
 Умеет:
 
@@ -38,6 +38,8 @@ PySide6 (Qt 6)**.
     Загрузить сюда…, Удалить.
   Кнопка «Журнал» общая для обеих вкладок. Иконки — системные глифы
   Qt, дополнительных файлов ресурсов проект не требует.
+- При сужении окна кнопки шапки переносятся на следующую строку, а не
+  прячутся в меню «>>», — все действия остаются на виду.
 - Меню (Файл / Правка / FTP / Вид / Справка) с горячими клавишами и
   иконками.
 - Панель журнала — **сворачиваемый док внизу окна**; журнал можно
@@ -64,7 +66,7 @@ PySide6 (Qt 6)**.
 - Рекурсивное дерево с ленивой подгрузкой.
 - Двойной клик по папке — раскрыть / свернуть.
 - Двойной клик по файлу — контекстное меню с доступными действиями
-  (Открыть, Переименовать…, Переместить…, Копировать имя),
+  (Открыть, Переименовать…, Переместить…, На FTP, Копировать имя),
   «Копировать путь» и «Показать в проводнике»; файл открывается
   системным приложением пунктом «Открыть».
 - Enter на папке — сделать её корнем дерева.
@@ -233,7 +235,7 @@ PySide6 (Qt 6)**.
 | `Ctrl+T` (в диалогах) | Транслит в поле ввода |
 | `Enter` (на папке) | Сделать корнем дерева |
 | `Двойной клик` (на папке) | Раскрыть / скрыть |
-| `Двойной клик` (на файле) | Меню действий (Копировать имя / Копировать путь / Показать в проводнике / Переименовать / Переместить / Открыть) |
+| `Двойной клик` (на файле) | Меню действий (Копировать имя / Копировать путь / Показать в проводнике / Переименовать / Переместить / На FTP / Открыть) |
 | `Правый клик` | Контекстное меню |
 
 Команды с пометкой «вкладка «Файлы»» работают только на этой вкладке:
@@ -247,8 +249,8 @@ PySide6 (Qt 6)**.
 Требуется **Python 3.11+** и **PySide6**.
 
 ```bash
-git clone https://github.com/<ваш-логин>/ok-helper.git
-cd ok-helper
+git clone https://github.com/<ваш-логин>/ok-filemanager.git
+cd ok-filemanager
 python -m venv .venv
 
 # Windows (PowerShell):
@@ -272,9 +274,9 @@ python main.py /path/to/tracks
 
 | ОС | Путь |
 |---|---|
-| Windows | `%APPDATA%\ok-helper\config.toml` |
-| Linux | `~/.config/ok-helper/config.toml` |
-| macOS | `~/Library/Application Support/ok-helper/config.toml` |
+| Windows | `%APPDATA%\ok-filemanager\config.toml` |
+| Linux | `~/.config/ok-filemanager/config.toml` |
+| macOS | `~/Library/Application Support/ok-filemanager/config.toml` |
 
 Правятся через **F10** или вручную:
 
@@ -337,14 +339,18 @@ watchdog-наблюдатели в тестах подменяются. FTP-кл
 ### Структура проекта
 
 ```
-ok-helper/
+ok-filemanager/
 ├── main.py
 ├── config.py
 ├── pytest.ini
 ├── requirements.txt
 ├── requirements-dev.txt
+├── assets/
+│   ├── ok-filemanager.ico — иконка .exe
+│   └── ok-filemanager.png — иконка для README / окна
 ├── ok_helper/
 │   ├── analyzer.py       — валидация и нормализация имён
+│   ├── appicon.py        — отрисовка иконки (папка с «OK»)
 │   ├── ftp.py            — FTP-операции
 │   ├── translit.py       — транслитерация
 │   ├── clipboard.py      — копирование в буфер обмена
@@ -363,8 +369,9 @@ ok-helper/
 │   ├── test_gui_theme.py     — темы auto / light / dark
 │   ├── test_gui_models.py    — модели дерева файлов и FTP-листинга
 │   ├── test_gui_dialogs.py   — диалоги F2 / Ctrl+N / Ctrl+X / F10 / F1
-│   └── test_gui_window.py    — главное окно, вкладка FTP, watchdog,
-│                               состояние интерфейса, журнал
+│   ├── test_gui_window.py    — главное окно, вкладка FTP, watchdog,
+│   │                           состояние интерфейса, журнал
+│   └── test_appicon.py       — отрисовка иконки приложения
 └── .github/workflows/ci.yml
 ```
 
@@ -374,8 +381,9 @@ ok-helper/
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name ok-helper main.py
+pyinstaller --onefile --windowed --name ok-filemanager \
+    --icon assets/ok-filemanager.ico main.py
 ```
 
-Готовый `.exe` появится в `dist/`. Артефакт `ok-helper-windows` из
+Готовый `.exe` появится в `dist/`. Артефакт `ok-filemanager-windows` из
 GitHub Actions содержит ту же сборку.

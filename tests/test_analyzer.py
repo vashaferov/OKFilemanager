@@ -5,7 +5,7 @@ normalize_callsign(), extract_date_from_gpx(), is_m_gpx(),
 validate_new_folder_name(), human_size().
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Валидация имён файлов
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -27,7 +27,7 @@ from ok_helper.analyzer import (
 
 pytestmark = [
     pytest.mark.analyzer,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Валидация имён файлов'),
 ]
 

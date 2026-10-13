@@ -7,7 +7,7 @@ _toml_value(), _soft_parse(), _read_toml(), _as_path().
 не перезаписывается.
 
 Группировка в Allure:
-  epic    = ok-helper-tui
+  epic    = ok-filemanager
   feature = Конфигурация
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
@@ -25,6 +25,7 @@ from config import (
     _soft_parse,
     _toml_value,
     config_path,
+    legacy_config_path,
     load_config,
     save_config,
 )
@@ -32,7 +33,7 @@ from config import (
 
 pytestmark = [
     pytest.mark.config,
-    pytest.mark.epic('ok-helper-tui'),
+    pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Конфигурация'),
 ]
 
@@ -40,7 +41,7 @@ pytestmark = [
 @pytest.fixture
 def cfg_file(tmp_path, monkeypatch):
     """Перенаправляет config_path() в tmp_path."""
-    path = tmp_path / 'ok-helper-tui' / 'config.toml'
+    path = tmp_path / 'ok-filemanager' / 'config.toml'
     monkeypatch.setattr(cfg_mod, 'config_path', lambda: path)
     return path
 
@@ -57,14 +58,14 @@ class TestConfigPath:
         monkeypatch.setenv('APPDATA', str(tmp_path / 'AppData'))
 
         assert config_path() == \
-            tmp_path / 'AppData' / 'ok-helper-tui' / 'config.toml'
+            tmp_path / 'AppData' / 'ok-filemanager' / 'config.toml'
 
     def test_windows_without_appdata_falls_back_to_home(self, monkeypatch):
         monkeypatch.setattr(cfg_mod.sys, 'platform', 'win32')
         monkeypatch.delenv('APPDATA', raising=False)
 
         assert config_path() == \
-            Path.home() / 'ok-helper-tui' / 'config.toml'
+            Path.home() / 'ok-filemanager' / 'config.toml'
 
     @pytest.mark.smoke
     def test_macos_application_support(self, monkeypatch):
@@ -72,27 +73,27 @@ class TestConfigPath:
 
         assert config_path() == (Path.home() / 'Library'
                                  / 'Application Support'
-                                 / 'ok-helper-tui' / 'config.toml')
+                                 / 'ok-filemanager' / 'config.toml')
 
     def test_linux_uses_xdg_config_home(self, monkeypatch, tmp_path):
         monkeypatch.setattr(cfg_mod.sys, 'platform', 'linux')
         monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
 
         assert config_path() == \
-            tmp_path / 'xdg' / 'ok-helper-tui' / 'config.toml'
+            tmp_path / 'xdg' / 'ok-filemanager' / 'config.toml'
 
     def test_linux_without_xdg_uses_dot_config(self, monkeypatch):
         monkeypatch.setattr(cfg_mod.sys, 'platform', 'linux')
         monkeypatch.delenv('XDG_CONFIG_HOME', raising=False)
 
         assert config_path() == \
-            Path.home() / '.config' / 'ok-helper-tui' / 'config.toml'
+            Path.home() / '.config' / 'ok-filemanager' / 'config.toml'
 
     def test_ends_with_toml(self):
         assert config_path().name == 'config.toml'
 
     def test_parent_directory_name(self):
-        assert config_path().parent.name == 'ok-helper-tui'
+        assert config_path().parent.name == 'ok-filemanager'
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -350,6 +351,35 @@ class TestLoadConfig:
     def test_path_of_config_is_exposed(self, cfg_file):
         assert load_config()['_path'] == cfg_file
 
+    def test_legacy_config_path(self, cfg_file):
+        assert legacy_config_path() == \
+            cfg_file.parent.with_name('ok-helper-tui') / 'config.toml'
+
+    def test_migrates_legacy_config(self, cfg_file):
+        """Настройки старого ok-helper-tui переезжают в новый каталог."""
+        legacy = legacy_config_path()
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text("theme = 'dark'\nftp_port = 2121\n",
+                          encoding='utf-8')
+
+        cfg = load_config()
+
+        assert cfg['theme'] == 'dark'
+        assert cfg['ftp_port'] == 2121
+        assert cfg_file.exists()
+        assert legacy.exists()          # старый файл не трогаем
+
+    def test_new_config_wins_over_legacy(self, cfg_file):
+        legacy = legacy_config_path()
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text("theme = 'dark'\n", encoding='utf-8')
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg_file.write_text("theme = 'light'\n", encoding='utf-8')
+
+        cfg = load_config()
+
+        assert cfg['theme'] == 'light'
+
     @pytest.mark.smoke
     def test_reads_existing_values(self, cfg_file):
         cfg_file.parent.mkdir(parents=True, exist_ok=True)
@@ -544,7 +574,7 @@ class TestSaveConfig:
         save_config({'_path': cfg_file})
 
         text = cfg_file.read_text(encoding='utf-8')
-        assert text.startswith('# Конфиг ok-helper-tui')
+        assert text.startswith('# Конфиг ok-filemanager')
         assert '# --- FTP ---' in text
         assert '# --- Окна при старте ---' in text
 

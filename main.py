@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Точка входа ok-helper.
+"""Точка входа ok-filemanager.
 
 GUI-версия на PySide6 (Qt 6). Только Windows.
 
@@ -15,7 +15,7 @@ from config import load_config, config_path
 
 def main():
     parser = argparse.ArgumentParser(
-        description='ok-helper: транслит и умная проверка имён файлов.')
+        description='ok-filemanager: транслит и умная проверка имён файлов.')
     parser.add_argument(
         'directory', nargs='?', default=None,
         help='Начальная директория. Если не задана — берётся из конфига.',
