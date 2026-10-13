@@ -1,0 +1,1 @@
+[config] не создать C:\Users\runneradmin\AppData\Local\Temp\pytest-of-runneradmin\pytest-0\test_mkdir_error_logged0: нет прав
