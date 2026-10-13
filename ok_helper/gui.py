@@ -2779,7 +2779,10 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction('Переименовать…', self.on_rename)
             menu.addAction('Переместить…', self.on_move)
-            menu.addAction('На FTP', self.on_upload_selected)
+            # «На FTP» — только для файлов, прошедших валидацию: те
+            # же, что помечены в дереве как «можно на FTP».
+            if is_uploadable(path):
+                menu.addAction('На FTP', self.on_upload_selected)
             menu.addAction('Открыть', self.on_open_selected)
         return menu
 

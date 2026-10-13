@@ -618,7 +618,7 @@ class TestNavigation:
         assert menu.executed is True
         assert menu.items == ['Копировать имя', 'Копировать путь',
                               'Показать в проводнике', 'Переименовать…',
-                              'Переместить…', 'На FTP', 'Открыть']
+                              'Переместить…', 'Открыть']
         assert opened == []                 # сам файл не открывается
         assert window._selected_path() == target
 
@@ -852,7 +852,24 @@ class TestContextMenu:
 
         assert menu.items == ['Копировать имя', 'Копировать путь',
                               'Показать в проводнике', 'Переименовать…',
-                              'Переместить…', 'На FTP', 'Открыть']
+                              'Переместить…', 'Открыть']
+
+    def test_file_menu_shows_ftp_for_uploadable(self, window, files,
+                                                monkeypatch, menus):
+        """«На FTP» есть только у прошедших валидацию файлов."""
+        target = files / '2026-09-23_Moscow' / '100m.gpx'
+        assert gui.is_uploadable(target) is True
+
+        menu = self.open_menu(window, monkeypatch, menus, target)
+
+        assert 'На FTP' in menu.items
+
+    def test_file_menu_hides_ftp_for_invalid(self, window, files,
+                                             monkeypatch, menus):
+        menu = self.open_menu(window, monkeypatch, menus,
+                              files / '2026-09-17_11-55_бабушка.gpx')
+
+        assert 'На FTP' not in menu.items
 
     def test_file_menu_ftp_action_upload(self, window, files, monkeypatch,
                                          menus):
@@ -860,8 +877,8 @@ class TestContextMenu:
         called = []
         monkeypatch.setattr(gui.MainWindow, 'on_upload_selected',
                             lambda self: called.append(True))
-        menu = self.open_menu(window, monkeypatch, menus,
-                              files / 'track.plt')
+        target = files / '2026-09-23_Moscow' / '100m.gpx'
+        menu = self.open_menu(window, monkeypatch, menus, target)
 
         assert 'На FTP' in menu.items
         menu.signals['На FTP'].emit()
