@@ -1499,16 +1499,18 @@ class MainWindow(QMainWindow):
         """Согласует доступность кнопок FTP с режимом эмуляции.
 
         В read-only удаление всё равно запрещено, поэтому кнопка честно
-        выключена, а не выдаёт отказ по нажатию.
+        выключена, а не выдаёт отказ по нажатию. Синхронизируем и кнопку
+        в самой вкладке, и одноимённую кнопку в шапке.
         """
-        button = getattr(self, 'btn_ftp_delete', None)
-        if button is None:
-            return
         readonly = self._cfg_bool(self.config, 'ftp_readonly', False)
-        button.setEnabled(not readonly)
-        button.setToolTip(
-            'Удаление недоступно: ftp_readonly = true' if readonly
-            else 'Удалить выделенный файл на сервере (Del)')
+        tooltip = ('Удаление недоступно: ftp_readonly = true' if readonly
+                   else 'Удалить выделенный файл на сервере (Del)')
+        for button in (getattr(self, 'btn_ftp_delete', None),
+                       getattr(self, 'ftp_delete_action', None)):
+            if button is None:
+                continue
+            button.setEnabled(not readonly)
+            button.setToolTip(tooltip)
 
     def _sync_downloads_actions(self):
         """Согласует меню «Загрузки» с настройками слежения."""
@@ -1861,7 +1863,13 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
         self.toolbar = tb
 
-        def add(text, slot, tooltip=None, icon=None):
+        # Кнопки шапки зависят от активной вкладки: у «Файлов» и «FTP»
+        # свои действия. Держим их группами и прячем ненужную.
+        self._toolbar_groups: Dict[str, List[QAction]] = {
+            'files': [], 'ftp': [],
+        }
+
+        def add(group, text, slot, tooltip=None, icon=None):
             a = QAction(text, self)
             if icon is not None:
                 a.setIcon(_std_icon(icon))
@@ -1869,40 +1877,66 @@ class MainWindow(QMainWindow):
             if tooltip:
                 a.setToolTip(tooltip)
             tb.addAction(a)
+            self._toolbar_groups[group].append(a)
             return a
 
-        add('Вверх', self.on_up, 'Перейти в родительскую папку',
+        def sep(group):
+            self._toolbar_groups[group].append(tb.addSeparator())
+
+        # --- вкладка «Файлы» ---
+        add('files', 'Вверх', self.on_up, 'Перейти в родительскую папку',
             QStyle.SP_ArrowUp)
-        tb.addSeparator()
-        add('Обновить', self.on_refresh, 'Перечитать содержимое (F5)',
+        sep('files')
+        add('files', 'Обновить', self.on_refresh, 'Перечитать содержимое (F5)',
             QStyle.SP_BrowserReload)
-        add('Исправить все', self.on_fix_all,
+        add('files', 'Исправить все', self.on_fix_all,
             'Переименовать все уверенные случаи (Ctrl+F5)',
             QStyle.SP_DialogApplyButton)
-        tb.addSeparator()
-        add('Папка', self.on_new_folder, 'Создать папку (Ctrl+N)',
+        sep('files')
+        add('files', 'Папка', self.on_new_folder, 'Создать папку (Ctrl+N)',
             QStyle.SP_FileDialogNewFolder)
-        add('Переименовать', self.on_rename, 'Переименовать файл (F2)',
+        add('files', 'Переименовать', self.on_rename, 'Переименовать файл (F2)',
             QStyle.SP_FileDialogDetailedView)
-        add('Переместить', self.on_move, 'Переместить в другую папку (Ctrl+X)',
+        add('files', 'Переместить', self.on_move,
+            'Переместить в другую папку (Ctrl+X)',
             QStyle.SP_FileDialogToParent)
-        add('Копировать имя', self.on_copy_name,
+        add('files', 'Копировать имя', self.on_copy_name,
             'Скопировать имя в буфер обмена (Ctrl+Y)',
             QStyle.SP_FileIcon)
-        tb.addSeparator()
-        add('На FTP', self.on_upload_selected,
+        sep('files')
+        add('files', 'На FTP', self.on_upload_selected,
             'Загрузить выделенный файл на FTP (F12)',
             QStyle.SP_ArrowUp)
-        add('В проводнике', self.on_reveal_selected,
+        add('files', 'В проводнике', self.on_reveal_selected,
             'Открыть папку с выделением файла (Ctrl+E)',
             QStyle.SP_DirOpenIcon)
-        tb.addSeparator()
-        add('Проверить загрузки', self.on_check_downloads,
+        sep('files')
+        add('files', 'Проверить загрузки', self.on_check_downloads,
             'Проверить папку загрузок и предложить перенос (Ctrl+D)',
             QStyle.SP_DialogOpenButton)
-        tb.addSeparator()
+        sep('files')
 
-        # Переключатель панели журнала: состояние сохраняется в конфиге.
+        # --- вкладка «FTP» ---
+        add('ftp', 'Подключиться', self.on_ftp_connect,
+            'Прочитать листинг папки на сервере',
+            QStyle.SP_DialogOpenButton)
+        add('ftp', 'Обновить', self.on_ftp_refresh,
+            'Обновить листинг FTP', QStyle.SP_BrowserReload)
+        sep('ftp')
+        add('ftp', 'Копировать имя', self.on_copy_name,
+            'Скопировать имя объекта на сервере (Ctrl+Y)',
+            QStyle.SP_FileIcon)
+        add('ftp', 'Загрузить сюда…', self.on_ftp_upload_here,
+            'Загрузить локальный файл в текущую папку FTP',
+            QStyle.SP_ArrowUp)
+        self.ftp_delete_action = add(
+            'ftp', 'Удалить', self.on_ftp_delete_selected,
+            'Удалить выделенный файл на сервере (Del)',
+            QStyle.SP_TrashIcon)
+        sep('ftp')
+
+        # Переключатель панели журнала — общий для обеих вкладок;
+        # состояние сохраняется в конфиге.
         self.log_action = QAction('Журнал', self)
         self.log_action.setCheckable(True)
         self.log_action.setToolTip('Показать или скрыть панель журнала (Ctrl+L)')
@@ -1910,6 +1944,24 @@ class MainWindow(QMainWindow):
         self.log_action.toggled.connect(self.on_toggle_log)
         tb.addAction(self.log_action)
         self.addAction(self.log_action)
+
+        self._update_toolbar_for_tab(self.tabs.currentIndex())
+        self._sync_ftp_actions()
+
+    def _update_toolbar_for_tab(self, idx: int):
+        """Показывает в шапке действия активной вкладки.
+
+        «Файлы» и «FTP» работают с разными объектами, поэтому набор
+        кнопок переключается: общим остаётся только «Журнал».
+        """
+        groups = getattr(self, '_toolbar_groups', None)
+        if not groups:
+            return
+        current = 'ftp' if idx == 1 else 'files'
+        for name, actions in groups.items():
+            visible = name == current
+            for action in actions:
+                action.setVisible(visible)
 
     def _build_statusbar(self):
         sb = QStatusBar()
@@ -2295,21 +2347,42 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1200,
                           lambda: self._offer_move_download(path))
 
+    def _download_move_dir(self) -> Optional[Path]:
+        """Куда предлагать перенос нового файла из загрузок.
+
+        Если в открытой сейчас папке (корне дерева) есть дочерняя папка
+        ``10-Tracks`` ровно на один уровень вложенности, предлагаем её:
+        скачанные треки обычно складывают именно туда. Иначе — как
+        раньше, сам корень дерева. Вложенность строго один уровень, то
+        есть ``папка_а/10-Tracks`` — да, ``папка_а/папка_б/10-Tracks`` —
+        нет.
+        """
+        ten_tracks = self.tree_root / '10-Tracks'
+        if ten_tracks.is_dir():
+            return ten_tracks
+        return None
+
     def _offer_move_download(self, path: Path):
         if not path.exists() or not path.is_file():
             return
 
         self.log(f'[ЗАГРУЗКИ] Новый файл: {path.name}', 'info')
 
+        ten_tracks = self._download_move_dir()
+        if ten_tracks is not None:
+            move_dir = ten_tracks
+            move_label = 'Переместить в 10-Tracks'
+        else:
+            move_dir = self.tree_root
+            move_label = 'Переместить в корень'
+
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Question)
         msg.setWindowTitle('Новый файл в загрузках')
         msg.setText(f'Обнаружен новый файл:\n{path.name}')
-        msg.setInformativeText(
-            f'Перенести его в дерево?\n{self.tree_root}')
+        msg.setInformativeText(f'Перенести его в дерево?\n{move_dir}')
 
-        btn_move = msg.addButton('Переместить в корень',
-                                 QMessageBox.AcceptRole)
+        btn_move = msg.addButton(move_label, QMessageBox.AcceptRole)
         btn_choose = msg.addButton('Выбрать папку…',
                                    QMessageBox.ActionRole)
         btn_skip = msg.addButton('Игнорировать', QMessageBox.RejectRole)
@@ -2322,7 +2395,7 @@ class MainWindow(QMainWindow):
             return
 
         if clicked is btn_move:
-            target_dir = self.tree_root
+            target_dir = move_dir
         else:
             dlg = MoveDialog(self, path, self.tree_root)
             if dlg.exec() != QDialog.Accepted or dlg.result is None:
@@ -2528,6 +2601,16 @@ class MainWindow(QMainWindow):
             delete_later()
 
     def set_tree_root(self, p: Path, save: bool = True):
+        """Делает папку корнем дерева — только для отображения.
+
+        «Корневая папка» из настроек (``root_dir``) при навигации НЕ
+        переписывается: её меняют лишь в настройках (F10). Иначе
+        переключение папок незаметно подменяло конфиг, и при
+        следующем запуске окно открывалось не там, где ожидалось, а
+        подстановка даты в «Новой папке» пропадала.
+
+        Параметр ``save`` оставлен для совместимости и не используется.
+        """
         try:
             p = p.resolve()
         except Exception:
@@ -2536,12 +2619,6 @@ class MainWindow(QMainWindow):
             return
         self.tree_root = p
         self.watch_dir = p
-        self.config['root_dir'] = str(p)
-        if save:
-            try:
-                save_config(self.config)
-            except Exception:
-                pass
         self._start_watch()
         self.tree_model.set_root(p)
         self._restore_expansion()
@@ -2658,6 +2735,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_tab_changed(self, idx: int):
+        self._update_toolbar_for_tab(idx)
         if idx != 1:
             return
         if not self.follow_checkbox.isChecked():

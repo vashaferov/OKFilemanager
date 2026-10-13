@@ -1,8 +1,12 @@
 """Кроссплатформенное копирование текста в системный буфер обмена.
 
 Порядок попыток:
-  1. pyperclip, если он установлен (опциональная зависимость).
-  2. Системные утилиты:
+  1. Буфер обмена Qt, если запущено GUI-приложение PySide6. Это
+       штатный путь для приложения: не зависит от PATH, не падает,
+       когда буфер на мгновение занят другим процессом, и корректно
+       сохраняет кириллицу.
+  2. pyperclip, если он установлен (опциональная зависимость).
+  3. Системные утилиты:
        • Windows — clip.exe (передаём UTF-16-LE, иначе кириллица
          превратится в кракозябры);
        • macOS   — pbcopy;
@@ -16,6 +20,28 @@ import shutil
 import subprocess
 import sys
 from typing import List
+
+
+def _qt_clipboard_copy(text: str) -> bool:
+    """Копирует текст через буфер обмена Qt, если есть GUI-приложение.
+
+    В обычном запуске ok-helper приложение на PySide6 уже создано,
+    поэтому этот способ надёжнее внешних утилит: не нужен PATH и
+    отдельный процесс ``clip.exe``, который иногда завершается
+    ошибкой, если буфер занят другим приложением.
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+    except Exception:
+        return False
+    app = QGuiApplication.instance()
+    if app is None:
+        return False
+    try:
+        app.clipboard().setText(text)
+        return True
+    except Exception:
+        return False
 
 
 def _try_run(cmd: List[str], data: bytes) -> bool:
@@ -34,7 +60,11 @@ def copy_to_clipboard(text: str) -> bool:
     if not text:
         return False
 
-    # 1) pyperclip (если установлен)
+    # 1) Буфер обмена Qt — надёжнее внешних утилит в GUI-приложении.
+    if _qt_clipboard_copy(text):
+        return True
+
+    # 2) pyperclip (если установлен)
     try:
         import pyperclip  # type: ignore
         pyperclip.copy(text)
@@ -42,7 +72,7 @@ def copy_to_clipboard(text: str) -> bool:
     except Exception:
         pass
 
-    # 2) системные утилиты
+    # 3) системные утилиты
     if sys.platform == 'darwin':
         return _try_run(['pbcopy'], text.encode('utf-8'))
 

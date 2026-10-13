@@ -52,6 +52,17 @@ def runner(monkeypatch):
     return rec
 
 
+@pytest.fixture(autouse=True)
+def _no_qt_clipboard(monkeypatch):
+    """Проверяем системные утилиты, а не буфер обмена Qt.
+
+    Если в процессе уже создано QApplication (например, GUI-тесты шли
+    раньше), реальный copy_to_clipboard ушёл бы в Qt и тесты утилит
+    ничего бы не проверили.
+    """
+    monkeypatch.setattr(clipboard, '_qt_clipboard_copy', lambda text: False)
+
+
 # ─────────────────────────────────────────────────────────────────
 # 1. Ранние выходы
 # ─────────────────────────────────────────────────────────────────
@@ -112,6 +123,38 @@ class TestPyperclip:
         monkeypatch.setattr(clipboard.sys, 'platform', 'win32')
         assert clipboard.copy_to_clipboard('текст') is True
         assert [c[0] for c in runner.calls] == [['clip']]
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2b. Буфер обмена Qt — приоритетный путь в GUI-приложении
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Буфер обмена Qt')
+class TestQtClipboard:
+    @pytest.mark.smoke
+    def test_qt_path_wins_over_system_tools(self, monkeypatch):
+        """Если Qt-буфер доступен, внешние утилиты не запускаются."""
+        monkeypatch.setattr(clipboard, '_qt_clipboard_copy',
+                            lambda text: True)
+        rec = Recorder()
+        monkeypatch.setattr(clipboard.subprocess, 'run', rec)
+
+        assert clipboard.copy_to_clipboard('Иванов') is True
+        assert rec.calls == [], 'утилиты не должны вызываться при Qt-пути'
+
+    def test_qt_miss_falls_back_to_tools(self, runner, monkeypatch):
+        monkeypatch.setattr(clipboard.sys, 'platform', 'win32')
+
+        assert clipboard.copy_to_clipboard('текст') is True
+        assert [c[0] for c in runner.calls] == [['clip']]
+
+    def test_empty_text_skips_qt(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(clipboard, '_qt_clipboard_copy',
+                            lambda text: called.append(text) or True)
+
+        assert clipboard.copy_to_clipboard('') is False
+        assert called == []
 
 
 # ─────────────────────────────────────────────────────────────────

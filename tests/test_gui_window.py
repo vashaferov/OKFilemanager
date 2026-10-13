@@ -323,6 +323,73 @@ class TestConstruction:
 
 
 # ─────────────────────────────────────────────────────────────────
+# 1b. Кнопки действия в шапке зависят от активной вкладки
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Кнопки шапки по вкладке')
+class TestTabToolbar:
+    @staticmethod
+    def _visible(window, group):
+        return [a.text() for a in window._toolbar_groups[group]
+                if a.isVisible() and a.text()]
+
+    def test_files_tab_shows_file_actions(self, window):
+        window._update_toolbar_for_tab(0)
+
+        visible = self._visible(window, 'files')
+        for label in ('Вверх', 'Обновить', 'Исправить все', 'Папка',
+                      'Переименовать', 'Переместить', 'Копировать имя',
+                      'На FTP', 'В проводнике', 'Проверить загрузки'):
+            assert label in visible
+        assert self._visible(window, 'ftp') == []
+
+    def test_ftp_tab_shows_ftp_actions(self, window):
+        window._update_toolbar_for_tab(1)
+
+        visible = self._visible(window, 'ftp')
+        for label in ('Подключиться', 'Обновить', 'Копировать имя',
+                      'Загрузить сюда…', 'Удалить'):
+            assert label in visible
+        assert self._visible(window, 'files') == []
+
+    def test_log_action_is_common(self, window):
+        window._update_toolbar_for_tab(0)
+        assert window.log_action.isVisible() is True
+
+        window._update_toolbar_for_tab(1)
+        assert window.log_action.isVisible() is True
+
+    def test_switching_tab_switches_toolbar(self, window, monkeypatch):
+        monkeypatch.setattr(gui.MainWindow, 'ftp_load',
+                            lambda self, folder: None)
+
+        window.tabs.setCurrentIndex(1)
+        assert self._visible(window, 'files') == []
+        assert 'Удалить' in self._visible(window, 'ftp')
+
+        window.tabs.setCurrentIndex(0)
+        assert self._visible(window, 'ftp') == []
+        assert 'Папка' in self._visible(window, 'files')
+
+    def test_delete_action_follows_readonly(self, window):
+        # Кнопка видна только на вкладке FTP; у скрытого QAction
+        # isEnabled() всегда false, поэтому сначала показываем группу.
+        window._update_toolbar_for_tab(1)
+
+        window.config['ftp_readonly'] = True
+        window._sync_ftp_actions()
+
+        assert window.ftp_delete_action.isEnabled() is False
+        assert window.btn_ftp_delete.isEnabled() is False
+
+        window.config['ftp_readonly'] = False
+        window._sync_ftp_actions()
+
+        assert window.ftp_delete_action.isEnabled() is True
+        assert window.btn_ftp_delete.isEnabled() is True
+
+
+# ─────────────────────────────────────────────────────────────────
 # 2. Выделение и навигация
 # ─────────────────────────────────────────────────────────────────
 
@@ -348,12 +415,14 @@ class TestNavigation:
     @pytest.mark.smoke
     def test_set_tree_root_changes_root(self, window, files):
         sub = files / '2026-09-23_Moscow'
+        before = window.config['root_dir']
         window.set_tree_root(sub)
 
         assert window.tree_root == sub
         assert window.watch_dir == sub
         assert window.path_edit.text() == str(sub)
-        assert window.config['root_dir'] == str(sub)
+        # «Корневая папка» из настроек при навигации не меняется.
+        assert window.config['root_dir'] == before
 
     def test_set_tree_root_ignores_files(self, window, files):
         target = files / 'track.plt'
@@ -363,26 +432,23 @@ class TestNavigation:
 
         assert window.tree_root == before
 
-    def test_set_tree_root_saves_config(self, window, files, monkeypatch):
+    def test_set_tree_root_does_not_save_config(self, window, files,
+                                                monkeypatch):
+        """Навигация не переписывает конфиг (ошибка: подменяла root_dir)."""
         saved = []
         monkeypatch.setattr(gui, 'save_config',
                             lambda cfg: saved.append(dict(cfg)))
 
         window.set_tree_root(files / '2026-09-23_Moscow')
 
-        assert saved and saved[0]['root_dir'] == \
-            str(files / '2026-09-23_Moscow')
+        assert saved == []
+        assert window.config['root_dir'] == str(files)
 
-    def test_set_tree_root_survives_save_error(self, window, files,
-                                               monkeypatch):
-        def boom(cfg):
-            raise OSError('нет доступа')
-
-        monkeypatch.setattr(gui, 'save_config', boom)
-
+    def test_set_tree_root_does_not_write_config_file(self, window, files,
+                                                      gui_config):
         window.set_tree_root(files / '2026-09-23_Moscow')
 
-        assert window.tree_root == files / '2026-09-23_Moscow'
+        assert not Path(gui_config['_path']).exists()
 
     def test_set_tree_root_restarts_watcher(self, window, files, observers):
         before = len(observers.instances)
@@ -1063,6 +1129,19 @@ class TestUiState:
 
         assert copied == []
 
+    def test_real_copy_to_clipboard_uses_qt(self, window):
+        """В GUI реальный copy_to_clipboard идёт через буфер Qt.
+
+        Проверяет, что копирование имени папки/файла не зависит от
+        внешнего процесса clip.exe и корректно сохраняет кириллицу.
+        """
+        from PySide6.QtGui import QGuiApplication
+        from ok_helper import clipboard
+
+        assert clipboard.copy_to_clipboard('Ёжик_тест') is True
+        assert QGuiApplication.instance().clipboard().text() == \
+            'Ёжик_тест'
+
     def test_save_log_writes_file(self, window, tmp_path, monkeypatch):
         target = tmp_path / 'log.txt'
         window.log('важная строка')
@@ -1300,6 +1379,35 @@ class TestNewFolder:
         window.on_new_folder()
 
         assert '[ОШБ] Не создать 10-Tracks' in log_text(window)
+
+    def test_new_folder_date_at_configured_root_only(self, window, tmp_path):
+        """Дата и 10-Tracks — в корне из настроек, а не в любой папке.
+
+        Регрессия: навигация переписывала ``config['root_dir']`` и
+        ``root_dir_resolved``, из-за чего предзаполнение даты
+        пропадало, а конфиг незаметно менял корневой путь.
+        """
+        from datetime import datetime
+
+        configured = window.config['root_dir_resolved']
+
+        dlg = gui.NewFolderDialog(window, window.config, window.tree_root)
+        assert dlg.is_root is True
+        assert dlg.edit.text() == datetime.now().strftime('%Y-%m-%d_')
+        assert dlg.tracks_cb is not None
+
+        other = tmp_path / 'other_root'
+        other.mkdir()
+        window.set_tree_root(other)
+
+        # Навигация не трогает корень из настроек...
+        assert window.config['root_dir_resolved'] == configured
+        assert Path(window.config['root_dir']).resolve() == configured
+        # ...поэтому чужая папка — вложенная: без даты и чек-бокса.
+        nested = gui.NewFolderDialog(window, window.config, window.tree_root)
+        assert nested.is_root is False
+        assert nested.edit.text() == ''
+        assert nested.tracks_cb is None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2418,6 +2526,45 @@ class TestWatchdog:
         assert not p.exists()
         assert (window.tree_root / 'track.gpx').is_file()
         assert '[ЗАГРУЗКИ] track.gpx' in log_text(window)
+
+    def test_download_move_dir_none_without_ten_tracks(self, window):
+        """Прямой дочерней 10-Tracks нет — прежняя логика."""
+        assert window._download_move_dir() is None
+
+    def test_download_move_dir_for_direct_child(self, window):
+        ten = window.tree_root / '10-Tracks'
+        ten.mkdir()
+
+        assert window._download_move_dir() == ten
+
+    def test_offer_move_prefers_ten_tracks_child(self, window, tmp_path,
+                                                 msgbox):
+        """Есть дочерняя 10-Tracks — переносим новый файл именно туда."""
+        ten = window.tree_root / '10-Tracks'
+        ten.mkdir()
+        p = tmp_path / 'track.gpx'
+        p.write_text('')
+        msgbox.click_text = 'Переместить в 10-Tracks'
+
+        window._offer_move_download(p)
+
+        assert not p.exists()
+        assert (ten / 'track.gpx').is_file()
+        assert not (window.tree_root / 'track.gpx').exists()
+
+    def test_offer_move_ignores_deeper_ten_tracks(self, window, tmp_path,
+                                                  msgbox):
+        """10-Tracks глубже одного уровня — прежняя логика (в корень)."""
+        deep = window.tree_root / '2026-09-23_Moscow' / '10-Tracks'
+        assert deep.is_dir()          # создаётся фикстурой files
+        p = tmp_path / 'deep.gpx'
+        p.write_text('')
+        msgbox.click_text = 'Переместить в корень'
+
+        window._offer_move_download(p)
+
+        assert (window.tree_root / 'deep.gpx').is_file()
+        assert not (deep / 'deep.gpx').exists()
 
     def test_offer_move_existing_target(self, window, tmp_path, msgbox):
         (window.tree_root / 'track.gpx').write_text('уже есть')
