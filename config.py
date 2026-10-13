@@ -28,6 +28,8 @@ DEFAULT_CONFIG = {
     'ftp_password': '',
     'ftp_path': '/',
     'ftp_readonly': False,
+    # Базовый URL для ссылки на папку FTP: base_url/имя_папки.
+    'base_url': 'https://tracks.lizaalert.ru',
     # Показывать ли окно подсказок (F1) при каждом запуске.
     # Управляется чек-боксом в самом окне подсказок.
     'help_visible_at_start': True,
@@ -196,7 +198,7 @@ def load_config() -> dict:
         cfg[key] = bool(cfg.get(key, DEFAULT_CONFIG[key]))
 
     for k in ('root_dir', 'downloads_dir', 'ftp_host', 'ftp_user',
-              'ftp_password', 'ftp_path', 'window_geometry',
+              'ftp_password', 'ftp_path', 'base_url', 'window_geometry',
               'splitter_state', 'tree_column_widths'):
         cfg[k] = str(cfg.get(k, DEFAULT_CONFIG[k]))
 
@@ -268,6 +270,8 @@ def save_config(cfg: dict):
         '# ftp_path      — базовый путь на сервере',
         '# ftp_readonly  — true: режим эмуляции (чтение реальное,',
         '#                 изменения — только в журнал, без записи)',
+        '# base_url      — базовый URL для ссылки на папку FTP',
+        '#                 (ссылка = base_url/имя_папки)',
         '',
         f'ftp_host        = {_toml_value("ftp_host", cfg.get("ftp_host", ""))}',
         f'ftp_port        = {_toml_value("ftp_port", port)}',
@@ -275,6 +279,7 @@ def save_config(cfg: dict):
         f'ftp_password    = {_toml_value("ftp_password", cfg.get("ftp_password", ""))}',
         f'ftp_path        = {_toml_value("ftp_path", cfg.get("ftp_path", "/"))}',
         f'ftp_readonly    = {_toml_value("ftp_readonly", readonly)}',
+        f'base_url        = {_toml_value("base_url", cfg.get("base_url", ""))}',
         '',
         '# --- Окна при старте ---',
         '# help_visible_at_start — показывать окно подсказок (F1)',

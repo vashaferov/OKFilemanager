@@ -298,6 +298,7 @@ class TestLoadConfig:
         assert cfg['ftp_port'] == 21
         assert cfg['ftp_path'] == '/'
         assert cfg['ftp_readonly'] is False
+        assert cfg['base_url'] == ''
         assert cfg['watch_downloads'] is False
         assert cfg['help_visible_at_start'] is True
         assert cfg['first_run'] is True
@@ -394,6 +395,7 @@ class TestLoadConfig:
             "ftp_password = 'secret'\n"
             "ftp_path = '/upload'\n"
             "ftp_readonly = true\n"
+            "base_url = 'https://example.com/ftp'\n"
             "help_visible_at_start = false\n"
             "first_run = false\n",
             encoding='utf-8',
@@ -406,6 +408,7 @@ class TestLoadConfig:
         assert cfg['ftp_port'] == 2121
         assert cfg['ftp_password'] == 'secret'
         assert cfg['ftp_readonly'] is True
+        assert cfg['base_url'] == 'https://example.com/ftp'
         assert cfg['watch_downloads'] is True
         assert cfg['help_visible_at_start'] is False
         assert cfg['first_run'] is False
@@ -447,7 +450,7 @@ class TestLoadConfig:
 
     @pytest.mark.parametrize('key', [
         'root_dir', 'downloads_dir',
-        'ftp_host', 'ftp_user', 'ftp_password', 'ftp_path',
+        'ftp_host', 'ftp_user', 'ftp_password', 'ftp_path', 'base_url',
     ])
     def test_string_keys_are_strings(self, cfg_file, key):
         assert isinstance(load_config()[key], str)
@@ -511,6 +514,7 @@ class TestSaveConfig:
             'ftp_password': 'p@ss "word"',
             'ftp_path': '/upload',
             'ftp_readonly': True,
+            'base_url': 'https://example.com/ftp',
             'help_visible_at_start': False,
             'first_run': False,
         })
@@ -520,8 +524,8 @@ class TestSaveConfig:
 
         for key in ('root_dir', 'downloads_dir', 'watch_downloads', 'theme',
                     'ftp_host', 'ftp_port', 'ftp_user', 'ftp_password',
-                    'ftp_path', 'ftp_readonly', 'help_visible_at_start',
-                    'first_run'):
+                    'ftp_path', 'ftp_readonly', 'base_url',
+                    'help_visible_at_start', 'first_run'):
             assert again[key] == cfg[key], key
 
     def test_ui_state_round_trip(self, cfg_file):

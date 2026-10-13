@@ -2009,6 +2009,59 @@ class TestFtpListing:
         assert calls == []
 
 
+@pytest.mark.story('Ссылка на папку FTP')
+class TestFtpLink:
+    def test_placeholder_without_folder(self, window):
+        assert window.ftp_link_label.text() == '—'
+
+    def test_link_empty_without_base_url(self, window, gui_config,
+                                         monkeypatch):
+        gui_config['base_url'] = ''
+        monkeypatch.setattr(window, 'rebuild_tree', lambda: None)
+
+        window._on_ftp_result([], '', '2026-09-23_Moscow')
+
+        assert window.ftp_link_label.text() == '—'
+
+    @pytest.mark.smoke
+    def test_link_uses_base_and_root_folder(self, window, monkeypatch):
+        monkeypatch.setattr(window, 'rebuild_tree', lambda: None)
+
+        window._on_ftp_result([], '', '2026-09-23_Moscow')
+
+        assert 'https://example.com/ftp/2026-09-23_Moscow' in \
+            window.ftp_link_label.text()
+        assert window.ftp_link_label.openExternalLinks() is True
+
+    def test_link_uses_root_folder_for_nested_path(self, window, monkeypatch):
+        monkeypatch.setattr(window, 'rebuild_tree', lambda: None)
+
+        window._on_ftp_result([], '', '2026-09-23_Moscow/sub')
+
+        text = window.ftp_link_label.text()
+        assert 'https://example.com/ftp/2026-09-23_Moscow' in text
+        assert '/sub' not in text
+
+    def test_link_normalizes_base_slash(self, window, gui_config,
+                                        monkeypatch):
+        gui_config['base_url'] = 'https://example.com/ftp/'
+        monkeypatch.setattr(window, 'rebuild_tree', lambda: None)
+
+        window._on_ftp_result([], '', '2026-09-23_Moscow')
+
+        text = window.ftp_link_label.text()
+        assert 'https://example.com/ftp/2026-09-23_Moscow' in text
+        assert 'ftp//2026' not in text
+
+    def test_link_cleared_on_error(self, window, monkeypatch):
+        monkeypatch.setattr(window, 'rebuild_tree', lambda: None)
+        window.ftp_link_label.setText('была ссылка')
+
+        window._on_ftp_result([], 'нет связи', '2026-09-23_Moscow')
+
+        assert window.ftp_link_label.text() == '—'
+
+
 @pytest.mark.story('Автоподстановка пути FTP')
 class TestFtpAutofill:
     def test_other_tab_does_nothing(self, window, monkeypatch):

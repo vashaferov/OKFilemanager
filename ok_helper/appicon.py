@@ -14,7 +14,7 @@ from PySide6.QtGui import (
 # Размеры, которые кладём в .ico (Windows выбирает под масштаб/DPI).
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
-_INK = '#000000'
+_INK = '#FD8400'
 _PAPER = '#ffffff'
 
 

@@ -53,6 +53,7 @@ def gui_config(tmp_path):
         'ftp_password': 'secret',
         'ftp_path': '/upload',
         'ftp_readonly': False,
+        'base_url': 'https://example.com/ftp',
         'help_visible_at_start': False,
         'first_run': False,
         '_path': tmp_path / 'config.toml',

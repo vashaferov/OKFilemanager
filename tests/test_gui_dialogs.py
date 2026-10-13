@@ -436,6 +436,7 @@ class TestSettingsDialog:
         assert dlg.fields['ftp_user'].text() == 'user'
         assert dlg.fields['ftp_password'].text() == 'secret'
         assert dlg.fields['ftp_path'].text() == '/upload'
+        assert dlg.fields['base_url'].text() == gui_config['base_url']
 
     def test_password_is_masked(self, qapp, gui_config):
         dlg = SettingsDialog(None, gui_config)
@@ -538,6 +539,7 @@ class TestSettingsDialog:
         dlg.fields['ftp_user'].setText('bob')
         dlg.fields['ftp_password'].setText('p@ss')
         dlg.fields['ftp_path'].setText('/upload/sub')
+        dlg.fields['base_url'].setText('  https://new.example.com/ftp  ')
         dlg.theme_combo.setCurrentText('dark')
         dlg.watch_cb.setChecked(True)
         dlg.help_cb.setChecked(True)
@@ -555,6 +557,7 @@ class TestSettingsDialog:
         assert gui_config['ftp_user'] == 'bob'
         assert gui_config['ftp_password'] == 'p@ss'
         assert gui_config['ftp_path'] == '/upload/sub'
+        assert gui_config['base_url'] == 'https://new.example.com/ftp'
         assert gui_config['theme'] == 'dark'
         assert gui_config['watch_downloads'] is True
         assert gui_config['help_visible_at_start'] is True
@@ -634,7 +637,7 @@ class TestHelpDialog:
     @pytest.mark.parametrize('fragment', [
         'ГГГГММДД', 'Waypoints_', '10-Tracks', 'ftp_readonly',
         'auto', 'light', 'dark', '✓', 'Ctrl+Shift+C',
-        'скрыть панель журнала',
+        'скрыть панель журнала', 'base_url',
     ])
     def test_help_covers_documented_rules(self, fragment):
         assert fragment in HelpDialog.HELP_TEXT

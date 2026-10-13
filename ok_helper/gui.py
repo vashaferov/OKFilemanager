@@ -1662,6 +1662,20 @@ class MainWindow(QMainWindow):
         follow_row.addStretch(1)
         layout.addLayout(follow_row)
 
+        link_row = QHBoxLayout()
+        link_row.setSpacing(6)
+        link_row.addWidget(QLabel('Ссылка:'))
+        self.ftp_link_label = QLabel('—')
+        self.ftp_link_label.setObjectName('Dim')
+        self.ftp_link_label.setOpenExternalLinks(True)
+        self.ftp_link_label.setTextInteractionFlags(
+            Qt.TextBrowserInteraction)
+        self.ftp_link_label.setToolTip(
+            'Ссылка на корневую папку FTP: base_url/имя_папки. '
+            'Клик открывает её в браузере.')
+        link_row.addWidget(self.ftp_link_label, 1)
+        layout.addLayout(link_row)
+
         self.ftp_model = FtpListModel(self)
         self.ftp_model.set_theme(resolve_theme(self.config.get('theme', 'auto')))
 
@@ -3184,6 +3198,32 @@ class MainWindow(QMainWindow):
         self._select_path(last_renamed)
 
     # ---------- FTP ----------
+    def _make_ftp_link(self, folder: str) -> str:
+        """Ссылка на корневую папку FTP: base_url/имя_папки.
+
+        Имя папки — первый компонент пути (корневая папка на сервере).
+        Пустой base_url — пустая ссылка.
+        """
+        base = str(self.config.get('base_url', '') or '').strip()
+        if not base:
+            return ''
+        root = folder.strip().strip('/').split('/')[0]
+        if not root:
+            return ''
+        return f'{base.rstrip("/")}/{root}'
+
+    def _set_ftp_link(self, folder: str):
+        """Показывает ссылку на корневую папку FTP или прочерк."""
+        url = self._make_ftp_link(folder)
+        if url:
+            self.ftp_link_label.setText(f'<a href="{url}">{url}</a>')
+            self.ftp_link_label.setToolTip(url)
+        else:
+            self.ftp_link_label.setText('—')
+            self.ftp_link_label.setToolTip(
+                'Ссылка на корневую папку FTP: base_url/имя_папки. '
+                'Задайте base_url в настройках (F10).')
+
     def on_ftp_connect(self):
         folder = self.ftp_path_edit.text().strip()
         if not folder:
@@ -3236,11 +3276,13 @@ class MainWindow(QMainWindow):
             self.ftp_connected = False
             self.tree_model.clear_ftp_sync()
             self.ftp_model.set_entries([])
+            self._set_ftp_link('')
             self.rebuild_tree()
             return
 
         self.ftp_connected = True
         self.ftp_folder = folder
+        self._set_ftp_link(folder)
 
         self.ftp_model.set_entries(entries)
 
@@ -3569,6 +3611,9 @@ class SettingsDialog(QDialog):
         add_field(ftp_form, 'Логин', 'ftp_user')
         add_field(ftp_form, 'Пароль', 'ftp_password', password=True)
         add_field(ftp_form, 'Базовый путь', 'ftp_path')
+        add_field(ftp_form, 'Базовый URL', 'base_url')
+        self.fields['base_url'].setToolTip(
+            'Основа ссылки на папку FTP: base_url/имя_папки')
         ftp.addLayout(ftp_form)
 
         self.ftp_readonly_cb = QCheckBox('Режим эмуляции (read-only)')
@@ -3627,6 +3672,7 @@ class SettingsDialog(QDialog):
         c['ftp_user'] = self.fields['ftp_user'].text().strip()
         c['ftp_password'] = self.fields['ftp_password'].text()
         c['ftp_path'] = self.fields['ftp_path'].text().strip() or '/'
+        c['base_url'] = self.fields['base_url'].text().strip()
         c['ftp_readonly'] = bool(self.ftp_readonly_cb.isChecked())
         c['root_dir_resolved'] = Path(root).expanduser().resolve()
         c['downloads_dir_resolved'] = Path(dl).expanduser().resolve()
@@ -3702,6 +3748,12 @@ FTP — автоподстановка пути:
   дереву папку вида ГГГГ-ММ-ДД_Место от выделенного элемента (или от
   корня, если ничего не выделено). Если находит — подставляет её в
   путь FTP и грузит листинг.
+
+FTP — ссылка на папку:
+  На вкладке FTP под путём показывается ссылка на корневую папку:
+  base_url/имя_папки. base_url задаётся в F10 (например,
+  https://example.com/ftp). Клик по ссылке открывает её в браузере.
+  Пока base_url пуст, показывается прочерк.
 
 Правила именования:
   .gpx / .plt — формат ГГГГММДД_Позывной.
