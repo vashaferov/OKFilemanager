@@ -298,7 +298,7 @@ class TestLoadConfig:
         assert cfg['ftp_port'] == 21
         assert cfg['ftp_path'] == '/'
         assert cfg['ftp_readonly'] is False
-        assert cfg['base_url'] == ''
+        assert cfg['base_url'] == 'https://tracks.lizaalert.ru'
         assert cfg['watch_downloads'] is False
         assert cfg['help_visible_at_start'] is True
         assert cfg['first_run'] is True
