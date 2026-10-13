@@ -1,0 +1,2 @@
+usage: main.py [-h] [directory]
+main.py: error: unrecognized arguments: --нет-такого
