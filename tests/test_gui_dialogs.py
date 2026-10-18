@@ -453,6 +453,37 @@ class TestSettingsDialog:
 
         assert opened == [gui.OZI_API_DOWNLOAD_URL]
 
+    def test_ozi_extract_button_extracts_and_fills_field(
+            self, qapp, gui_config, msgbox, monkeypatch, tmp_path):
+        dll = tmp_path / 'OziAPI.dll'
+        calls = []
+        monkeypatch.setattr(gui, 'extract_bundled_api',
+                            lambda: calls.append(True) or dll)
+        dlg = SettingsDialog(None, gui_config)
+
+        assert 'Распаковать' in dlg.ozi_extract_btn.text()
+        dlg.ozi_extract_btn.click()
+
+        assert calls == [True]
+        assert dlg.fields['ozi_api_dll'].text() == str(dll)
+        assert msgbox.kinds == ['information']
+        assert str(dll) in msgbox.texts()[0]
+
+    def test_ozi_extract_button_without_archive_warns(
+            self, qapp, gui_config, msgbox, monkeypatch):
+        def boom():
+            raise OSError('комплектный архив с OziAPI.dll не найден')
+
+        monkeypatch.setattr(gui, 'extract_bundled_api', boom)
+        dlg = SettingsDialog(None, gui_config)
+        dlg.fields['ozi_api_dll'].setText('')
+
+        dlg.ozi_extract_btn.click()
+
+        assert msgbox.kinds == ['warning']
+        assert 'не найден' in msgbox.texts()[0]
+        assert dlg.fields['ozi_api_dll'].text() == ''   # поле не меняем
+
     def test_password_is_masked(self, qapp, gui_config):
         dlg = SettingsDialog(None, gui_config)
 

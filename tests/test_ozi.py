@@ -27,7 +27,7 @@ from ok_helper.ozi import (
     OZI_API_DOWNLOAD_URL,
     OZI_FILE_SUFFIXES,
     OziApiBridge,
-    ensure_ozi_api,
+    extract_bundled_api,
     find_ozi_api,
     find_oziexplorer,
     open_in_oziexplorer,
@@ -48,6 +48,16 @@ def no_auto(monkeypatch):
     monkeypatch.setattr(ozi, '_CANDIDATE_EXES', [])
     monkeypatch.setattr(ozi, '_registry_exe_candidates', lambda: [])
     return None
+
+
+@pytest.fixture(autouse=True)
+def isolated_api_cache(tmp_path, monkeypatch):
+    """Уводит распакованную DLL из %LOCALAPPDATA% в песочницу теста.
+
+    Иначе тесты нашли бы реальную копию, распакованную на машине.
+    """
+    monkeypatch.setattr(ozi, '_api_cache_dir',
+                        lambda: tmp_path / 'api-cache')
 
 
 def make_file(path: Path, text: str = '') -> Path:
@@ -355,50 +365,101 @@ class TestBundledZip:
         assert dll.read_bytes() == b'12345678'
 
 
-@pytest.mark.story('ensure_ozi_api')
-class TestEnsureOziApi:
-    def test_configured_file_wins(self, tmp_path):
-        dll = make_file(tmp_path / 'OziAPI.dll')
-
-        assert ensure_ozi_api(str(dll)) == dll
-
-    def test_extracts_from_bundled_zip(self, tmp_path, monkeypatch):
-        zp = make_zip(tmp_path / 'assets' / 'oziapi_dll.zip',
-                      {'OziAPI.dll': b'DLL'})
-        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
-        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
-        monkeypatch.setattr(ozi, '_api_cache_dir',
-                            lambda: tmp_path / 'cache')
-
-        dll = ensure_ozi_api()
-
-        assert dll == tmp_path / 'cache' / 'OziAPI.dll'
-        assert dll.is_file()
-
-    def test_nothing_available(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+@pytest.mark.story('Распаковка OziAPI.dll')
+class TestExtractBundledApi:
+    def test_bundled_zip_none_when_absent(self, tmp_path, monkeypatch):
         monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [])
 
-        assert ensure_ozi_api() is None
+        assert ozi.bundled_api_zip() is None
 
-    def test_broken_zip_is_ignored(self, tmp_path, monkeypatch):
-        zp = make_file(tmp_path / 'assets' / 'oziapi_dll.zip', 'не zip')
-        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+    def test_bundled_zip_found(self, tmp_path, monkeypatch):
+        zp = make_file(tmp_path / 'assets' / 'oziapi_dll.zip', 'zip')
+        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
+
+        assert ozi.bundled_api_zip() == zp
+
+    def test_extract_bundled_without_zip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [])
+
+        with pytest.raises(OSError, match='не найден'):
+            extract_bundled_api()
+
+    def test_extract_bundled_into_cache(self, tmp_path, monkeypatch):
+        zp = make_zip(tmp_path / 'assets' / 'oziapi_dll.zip',
+                      {'OziAPI.dll': b'DLL'})
         monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
         monkeypatch.setattr(ozi, '_api_cache_dir',
                             lambda: tmp_path / 'cache')
 
-        assert ensure_ozi_api() is None
+        dll = extract_bundled_api()
 
-    def test_zip_without_dll_is_ignored(self, tmp_path, monkeypatch):
+        assert dll == tmp_path / 'cache' / 'OziAPI.dll'
+        assert dll.read_bytes() == b'DLL'
+
+    def test_extract_bundled_respects_cache_dir(self, tmp_path, monkeypatch):
+        zp = make_zip(tmp_path / 'assets' / 'oziapi_dll.zip',
+                      {'OziAPI.dll': b'DLL'})
+        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
+
+        dll = extract_bundled_api(dest_dir=tmp_path / 'other')
+
+        assert dll == tmp_path / 'other' / 'OziAPI.dll'
+
+    def test_extract_bundled_zip_without_dll_raises(self, tmp_path,
+                                                    monkeypatch):
         zp = make_zip(tmp_path / 'assets' / 'oziapi_dll.zip',
                       {'readme.txt': b'hi'})
-        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
         monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
-        monkeypatch.setattr(ozi, '_api_cache_dir',
-                            lambda: tmp_path / 'cache')
 
-        assert ensure_ozi_api() is None
+        with pytest.raises(OSError, match='OziAPI'):
+            extract_bundled_api(dest_dir=tmp_path / 'cache')
+
+    def test_extracted_copy_is_found_by_find_ozi_api(self, tmp_path,
+                                                     monkeypatch):
+        """После распаковки DLL находится обычным поиском."""
+        zp = make_zip(tmp_path / 'assets' / 'oziapi_dll.zip',
+                      {'OziAPI.dll': b'DLL'})
+        cache = tmp_path / 'cache'
+        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
+        monkeypatch.setattr(ozi, '_api_cache_dir', lambda: cache)
+        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+        assert find_ozi_api() is None      # до распаковки DLL недоступна
+
+        dll = extract_bundled_api()
+
+        assert find_ozi_api() == dll
+        assert find_ozi_api('', tmp_path / 'oziexp.exe') == dll
+
+    def test_configured_path_wins_over_extracted(self, tmp_path, monkeypatch):
+        cache = tmp_path / 'cache'
+        make_file(cache / 'OziAPI.dll')
+        own = make_file(tmp_path / 'own' / 'OziAPI.dll')
+        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+        monkeypatch.setattr(ozi, '_api_cache_dir', lambda: cache)
+
+        assert find_ozi_api(str(own)) == own
+
+    def test_app_dir_wins_over_extracted(self, tmp_path, monkeypatch):
+        cache = tmp_path / 'cache'
+        make_file(cache / 'OziAPI.dll')
+        near_app = make_file(tmp_path / 'app' / 'OziAPI.dll')
+        monkeypatch.setattr(ozi, '_bundled_api_candidates',
+                            lambda: [near_app])
+        monkeypatch.setattr(ozi, '_api_cache_dir', lambda: cache)
+
+        assert find_ozi_api() == near_app
+
+    def test_extracted_wins_over_exe_dir(self, tmp_path, monkeypatch):
+        cache = tmp_path / 'cache'
+        extracted = make_file(cache / 'OziAPI.dll')
+        exe_dir = tmp_path / 'ozi'
+        exe_dir.mkdir()
+        exe = make_file(exe_dir / 'oziexp.exe')
+        make_file(exe_dir / 'OziAPI.dll')
+        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+        monkeypatch.setattr(ozi, '_api_cache_dir', lambda: cache)
+
+        assert find_ozi_api('', exe) == extracted
 
 
 @pytest.mark.story('Ссылка на загрузку OziAPI.dll')
@@ -830,7 +891,7 @@ class TestOpenInOziExplorer:
         exe = tmp_path / 'oziexp.exe'
         launched = []
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: None)
         monkeypatch.setattr(ozi.subprocess, 'Popen',
                             lambda args: launched.append(args))
@@ -844,7 +905,7 @@ class TestOpenInOziExplorer:
     def test_exe_not_found(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'track.gpx')
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': None)
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: None)
 
         ok, msg = open_in_oziexplorer(src)
@@ -858,7 +919,7 @@ class TestOpenInOziExplorer:
         bridge = FakeBridge()
         monkeypatch.setattr(ozi, 'find_oziexplorer',
                             lambda cfg='': tmp_path / 'oziexp.exe')
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
         monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
         monkeypatch.setattr(ozi, 'get_bridge', lambda dll: bridge)
@@ -877,7 +938,7 @@ class TestOpenInOziExplorer:
         bridge = FakeBridge()
         monkeypatch.setattr(ozi, 'find_oziexplorer',
                             lambda cfg='': tmp_path / 'oziexp.exe')
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
         monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
         monkeypatch.setattr(ozi, 'get_bridge', lambda dll: bridge)
@@ -892,7 +953,7 @@ class TestOpenInOziExplorer:
         exe = tmp_path / 'oziexp.exe'
         launched = []
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
         monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
         monkeypatch.setattr(ozi, 'get_bridge',
@@ -915,7 +976,7 @@ class TestOpenInOziExplorer:
             raise AssertionError('мост не нужен, OziExplorer не запущен')
 
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
         monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: False)
         monkeypatch.setattr(ozi, 'get_bridge', no_bridge)
@@ -932,7 +993,7 @@ class TestOpenInOziExplorer:
         exe = tmp_path / 'oziexp.exe'
         launched = []
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: None)
         monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
         monkeypatch.setattr(ozi.subprocess, 'Popen',
@@ -949,7 +1010,7 @@ class TestOpenInOziExplorer:
         exe = tmp_path / 'oziexp.exe'
         launched = []
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
         monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
         monkeypatch.setattr(ozi, 'get_bridge',
@@ -966,7 +1027,7 @@ class TestOpenInOziExplorer:
         src = make_file(tmp_path / 'track.gpx')
         monkeypatch.setattr(ozi, 'find_oziexplorer',
                             lambda cfg='': tmp_path / 'oziexp.exe')
-        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+        monkeypatch.setattr(ozi, 'find_ozi_api',
                             lambda cfg='', exe=None: None)
 
         def boom(args):

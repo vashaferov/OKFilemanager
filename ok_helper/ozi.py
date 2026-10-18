@@ -13,9 +13,15 @@ OziExplorer многовконный: ``oziexp.exe <файл>`` всегда п�
 
 Алгоритм:
 
-1. OziExplorer запущен, есть DLL и мост — файл грузится в текущее окно
-   (``oziLoadWPfile``, ``oziLoadTrackFile``, ``oziLoadMap``);
+1. OziExplorer запущен и найдена OziAPI.dll — файл грузится в текущее
+   окно (``oziLoadWPfile``, ``oziLoadTrackFile``, ``oziLoadMap``);
 2. иначе — запуск ``oziexp.exe`` с файлом (откроется новое окно).
+
+DLL ищется как готовый файл (заданный путь, папка нашей программы,
+распакованная копия, папка ``oziexp.exe``). Комплектный архив
+``assets/oziapi_dll.zip`` автоматически **не** распаковывается: это
+делает пользователь кнопкой «Распаковать OziAPI» в настройках
+(``extract_bundled_api``), пока её не нажали — DLL считается недоступной.
 
 Формат файла определяет действие: ``.wpt`` — набор точек, ``.plt`` —
 трек, ``.map`` — карта. Для ``.gpx`` загрузчика в API нет, поэтому такой
@@ -235,9 +241,12 @@ def find_ozi_api(configured: str = '',
                  exe: Optional[Path] = None) -> Optional[Path]:
     """Ищет OziAPI.dll.
 
-    Порядок: заданный путь → рядом с нашей программой → рядом с
-    ``oziexp.exe``. Комплектный архив здесь не распаковывается — за это
-    отвечает :func:`ensure_ozi_api`.
+    Порядок: заданный путь → рядом с нашей программой → распакованная
+    кнопкой «Распаковать OziAPI» → рядом с ``oziexp.exe``.
+
+    Комплектный архив сам по себе DLL не заменяет: пока пользователь не
+    распаковал его (F10 → OziExplorer) или не указал путь, DLL считается
+    недоступной и файл открывается запуском ``oziexp.exe``.
     """
     if configured:
         p = Path(str(configured)).expanduser()
@@ -245,6 +254,7 @@ def find_ozi_api(configured: str = '',
             return p
 
     candidates: List[Path] = list(_bundled_api_candidates())
+    candidates.append(extracted_api_path())
     if exe is not None:
         candidates.append(exe.with_name('OziAPI.dll'))
     for p in candidates:
@@ -254,10 +264,23 @@ def find_ozi_api(configured: str = '',
 
 
 def _api_cache_dir() -> Path:
-    """Каталог, куда распаковывается DLL из комплектного архива."""
+    """Каталог, куда кнопкой распаковывается DLL из комплектного архива."""
     base = os.environ.get('LOCALAPPDATA')
     root = Path(base) if base else Path(tempfile.gettempdir())
     return root / 'ok-filemanager'
+
+
+def extracted_api_path() -> Path:
+    """Путь, по которому лежит распакованная кнопкой DLL."""
+    return _api_cache_dir() / 'OziAPI.dll'
+
+
+def bundled_api_zip() -> Optional[Path]:
+    """Первый найденный комплектный архив с OziAPI.dll."""
+    for zp in _bundled_zip_candidates():
+        if zp.is_file():
+            return zp
+    return None
 
 
 def extract_api_zip(zip_path, dest_dir) -> Path:
@@ -285,20 +308,19 @@ def extract_api_zip(zip_path, dest_dir) -> Path:
     return target
 
 
-def ensure_ozi_api(configured: str = '',
-                   exe: Optional[Path] = None) -> Optional[Path]:
-    """Возвращает OziAPI.dll: готовый файл или распакованный из архива."""
-    found = find_ozi_api(configured, exe)
-    if found is not None:
-        return found
-    for zp in _bundled_zip_candidates():
-        if not zp.is_file():
-            continue
-        try:
-            return extract_api_zip(zp, _api_cache_dir())
-        except (OSError, zipfile.BadZipFile):
-            continue
-    return None
+def extract_bundled_api(zip_path=None, dest_dir=None) -> Path:
+    """Распаковывает OziAPI.dll из комплектного архива.
+
+    Вызывается кнопкой «Распаковать OziAPI» в настройках, а не
+    автоматически. Возвращает путь к распакованной DLL.
+
+    :raises OSError: если архива нет или в нём нет DLL.
+    """
+    zp = Path(zip_path) if zip_path is not None else bundled_api_zip()
+    if zp is None:
+        raise OSError('комплектный архив с OziAPI.dll не найден')
+    target = Path(dest_dir) if dest_dir is not None else _api_cache_dir()
+    return extract_api_zip(zp, target)
 
 
 def find_ozi_powershell() -> Optional[Path]:
@@ -584,7 +606,7 @@ def open_in_oziexplorer(path, exe: str = '', dll: str = '',
         return False, f'файл не найден: {path.name}'
 
     exe_path = find_oziexplorer(exe)
-    dll_path = ensure_ozi_api(dll, exe_path)
+    dll_path = find_ozi_api(dll, exe_path)
 
     if (dll_path is not None
             and path.suffix.lower() in _API_ACTIONS

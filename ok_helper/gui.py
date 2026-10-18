@@ -57,7 +57,8 @@ from ok_helper.ftp import (
 from ok_helper.handlers import DirHandler, DownloadsHandler
 from ok_helper.kmz import KmzError, kmz_to_kml
 from ok_helper.ozi import (
-    OZI_API_DOWNLOAD_URL, OZI_FILE_SUFFIXES, open_in_oziexplorer)
+    OZI_API_DOWNLOAD_URL, OZI_FILE_SUFFIXES, extract_bundled_api,
+    open_in_oziexplorer)
 from ok_helper.translit import transliterate
 
 from watchdog.observers import Observer
@@ -3728,31 +3729,40 @@ class SettingsDialog(QDialog):
             'Пусто — искать oziexp.exe автоматически '
             '(PATH, типовые папки установки, реестр Windows)')
         self.fields['ozi_api_dll'].setToolTip(
-            'Пусто — искать OziAPI.dll сначала рядом с нашей программой '
-            '(OziAPI.dll, lib/OziAPI.dll, assets/ozi/OziAPI.dll), затем в '
-            'комплектном архиве assets/oziapi_dll.zip, затем рядом с '
-            'oziexp.exe')
+            'Пусто — искать OziAPI.dll рядом с нашей программой '
+            '(OziAPI.dll, lib/OziAPI.dll, assets/ozi/OziAPI.dll), затем '
+            'среди распакованных кнопкой «Распаковать OziAPI», затем '
+            'рядом с oziexp.exe. Сам архив DLL здесь не считается: пока '
+            'не распаковали, DLL недоступна')
         ozi.addLayout(ozi_form)
 
         ozi_hint = QLabel(
-            'OziAPI.dll поставляется вместе с программой '
-            '(assets/oziapi_dll.zip), поэтому файл по возможности грузится '
-            'в уже открытое окно OziExplorer. Чтобы это работало, включите '
-            'API в самом OziExplorer (Configuration → OziAPI). '
-            'Если OziExplorer не запущен или DLL нет, файл откроется '
-            'в новом окне запуском oziexp.exe. Форматы .wpt, .plt и .map '
-            'грузятся в текущее окно, .gpx — всегда в новом окне.')
+            'OziAPI.dll лежит в комплектном архиве assets/oziapi_dll.zip, '
+            'но сама по себе не распаковывается — нажмите «Распаковать '
+            'OziAPI», и файл по возможности будет грузиться в уже '
+            'открытое окно OziExplorer. Чтобы это работало, включите API '
+            'в самом OziExplorer (Configuration → OziAPI). Если DLL нет '
+            'или OziExplorer не запущен, файл откроется в новом окне '
+            'запуском oziexp.exe. Форматы .wpt, .plt и .map грузятся '
+            'в текущее окно, .gpx — всегда в новом окне.')
         ozi_hint.setObjectName('Dim')
         ozi_hint.setWordWrap(True)
         ozi.addWidget(ozi_hint)
 
         ozi_dl_row = QHBoxLayout()
-        self.ozi_download_btn = QPushButton('Скачать OziAPI…')
+        self.ozi_download_btn = QPushButton('Скачать OziAPI')
         self.ozi_download_btn.setToolTip(
             'Откроется страница загрузки OziAPI.dll:\n'
             + OZI_API_DOWNLOAD_URL)
         self.ozi_download_btn.clicked.connect(self._open_ozi_api_download)
         ozi_dl_row.addWidget(self.ozi_download_btn)
+
+        self.ozi_extract_btn = QPushButton('Распаковать OziAPI')
+        self.ozi_extract_btn.setToolTip(
+            'Распаковать OziAPI.dll из комплектного архива в '
+            '%LOCALAPPDATA%\\ok-filemanager и подставить путь в поле выше')
+        self.ozi_extract_btn.clicked.connect(self._extract_ozi_api)
+        ozi_dl_row.addWidget(self.ozi_extract_btn)
         ozi_dl_row.addStretch(1)
         ozi.addLayout(ozi_dl_row)
 
@@ -3785,6 +3795,28 @@ class SettingsDialog(QDialog):
     def _open_ozi_api_download(self):
         """Открывает в браузере страницу загрузки OziAPI.dll."""
         QDesktopServices.openUrl(QUrl(OZI_API_DOWNLOAD_URL))
+
+    def _extract_ozi_api(self):
+        """Распаковывает OziAPI.dll из комплектного архива.
+
+        Автоматически этого не делается: пока кнопку не нажали, DLL
+        считается недоступной и файл открывается в новом окне.
+        """
+        try:
+            dll = extract_bundled_api()
+        except OSError as e:
+            QMessageBox.warning(
+                self, 'OziAPI',
+                f'Не удалось распаковать OziAPI.dll: {e}.\n\n'
+                'Скачайте DLL кнопкой «Скачать OziAPI» и укажите путь '
+                'в поле «Путь к OziAPI.dll».')
+            return
+        self.fields['ozi_api_dll'].setText(str(dll))
+        QMessageBox.information(
+            self, 'OziAPI',
+            f'OziAPI.dll распакована:\n{dll}\n\n'
+            'Путь подставлен в поле выше. Осталось включить API в самом '
+            'OziExplorer (Configuration → OziAPI).')
 
     def _save(self):
         root = self.fields['root_dir'].text().strip()
@@ -3878,16 +3910,17 @@ OziExplorer:
   «Открыть в OziExplorer» в контекстном меню файла форматов
   .gpx, .plt, .wpt, .map.
   OziExplorer открывает каждую команду в новом окне — чтобы файл
-  грузился в уже открытое окно, используется OziAPI.dll, которая
-  поставляется вместе с программой (assets/oziapi_dll.zip) и
-  распаковывается автоматически. Достаточно включить API в самом
-  OziExplorer (Configuration → OziAPI). Форматы .wpt, .plt и .map
-  грузятся в текущее окно; .gpx в новом окне запуском oziexp.exe.
-  Если OziExplorer не запущен или DLL нет, файл тоже откроется
-  в новом окне.
+  грузился в уже открытое окно, используется OziAPI.dll. Она лежит
+  в комплектном архиве assets/oziapi_dll.zip, но сама не
+  распаковывается: нажмите «Распаковать OziAPI» в настройках
+  (F10 → OziExplorer) — DLL распакуется в %LOCALAPPDATA% и путь
+  подставится в поле. Осталось включить API в самом OziExplorer
+  (Configuration → OziAPI). Форматы .wpt, .plt и .map грузятся
+  в текущее окно; .gpx в новом окне запуском oziexp.exe. Если DLL
+  нет или OziExplorer не запущен, файл тоже откроется в новом окне.
   Пути к oziexp.exe и OziAPI.dll задаются в настройках
   (F10 → OziExplorer); пусто — искать автоматически. Кнопка
-  «Скачать OziAPI…» открывает страницу загрузки DLL на случай,
+  «Скачать OziAPI» открывает страницу загрузки DLL на случай,
   если комплектный архив не подошёл.
 
 Настройки (F10):
