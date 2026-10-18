@@ -1,31 +1,41 @@
 """Интеграция с OziExplorer 3.95: открытие файла в программе.
 
-Поддерживаются два способа (гибрид):
+OziExplorer многовконный: ``oziexp.exe <файл>`` всегда поднимает новое
+окно. Чтобы файл попал в **уже открытое** окно, нужен ``OziAPI.dll``,
+который управляет OziExplorer через оконные сообщения.
 
-  1. **OziAPI.dll** — если DLL доступна и OziExplorer уже запущен, файл
-     грузится в текущее окно через API (``oziLoadWPfile``,
-     ``oziLoadTrackFile``, ``oziLoadMap``). Так не открывается второе
-     окно. Требует включённого OziAPI в OziExplorer (Configuration →
-     OziAPI) и версии ≥ 3.90.4g.
-  2. **Запуск oziexp.exe с файлом** — запасной, универсальный путь:
-     ``oziexp.exe <файл>``. Работает без OziAPI, но OziExplorer
-     многовконный: каждая команда поднимает **новое** окно (проверено
-     на 3.95.6f — три запуска дали три процесса). Способы попасть в уже
-     открытое окно без DLL нет: OziExplorer не поддерживает ни
-     single-instance, ни DDE, а официальная справка допускает в
-     командной строке только имя **карты**.
+``OziAPI.dll`` — 32-битная (как и сам OziExplorer), а программа работает
+на 64-битном Python, который такую DLL загрузить не может
+(``WinError 193``). Поэтому DLL загружает поставляемый с Windows
+32-битный PowerShell (``%SystemRoot%\\SysWOW64\\WindowsPowerShell``), а
+программа общается с ним через stdin/stdout; скрипт-мост —
+``ok_helper/ozi_api_bridge.ps1``.
+
+Алгоритм:
+
+1. OziExplorer запущен, есть DLL и мост — файл грузится в текущее окно
+   (``oziLoadWPfile``, ``oziLoadTrackFile``, ``oziLoadMap``);
+2. иначе — запуск ``oziexp.exe`` с файлом (откроется новое окно).
 
 Формат файла определяет действие: ``.wpt`` — набор точек, ``.plt`` —
-трек, ``.map`` — карта. Для ``.gpx`` API-загрузчика нет, поэтому такой
+трек, ``.map`` — карта. Для ``.gpx`` загрузчика в API нет, поэтому такой
 файл всегда открывается запуском exe.
 """
 
+import atexit
 import ctypes
+import os
+import queue
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+import time
+import zipfile
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 
 # Форматы, которые имеет смысл открывать в OziExplorer.
@@ -33,6 +43,20 @@ OZI_FILE_SUFFIXES = {'.gpx', '.plt', '.wpt', '.map'}
 
 # Страница загрузки OziAPI.dll (DLL не входит в комплект OziExplorer).
 OZI_API_DOWNLOAD_URL = 'https://www.oziexplorer4.com/oziapi/oziapi.html'
+
+# Имена процессов OziExplorer.
+OZI_PROCESS_NAMES = ('oziexp.exe', 'oziexplorer.exe')
+
+# Что умеет грузить API: расширение -> действие моста.
+_API_ACTIONS = {'.wpt': 'wp', '.plt': 'track', '.map': 'map'}
+
+# Скрипт-мост рядом с этим модулем.
+_BRIDGE_SCRIPT = Path(__file__).resolve().with_name('ozi_api_bridge.ps1')
+
+# Сколько ждать готовности и ответа моста, секунд.
+_BRIDGE_TIMEOUT = 20.0
+
+_RESULT_RE = re.compile(r'^OZI_RESULT found=(-?\d+) rc=(-?\d+)$')
 
 # Типичные места установки oziexp.exe.
 _CANDIDATE_EXES: List[str] = [
@@ -42,25 +66,6 @@ _CANDIDATE_EXES: List[str] = [
     r'C:\OziExplorer3\oziexp.exe',
     r'C:\OziExplorer4\oziexp.exe',
 ]
-
-# Что и как грузить через OziAPI: расширение → (описание, метод).
-_API_LOADERS = {
-    '.wpt': ('набор точек', 'load_waypoints'),
-    '.plt': ('трек',        'load_track'),
-    '.map': ('карта',       'load_map'),
-}
-
-
-def _encode_path(path) -> bytes:
-    """ANSI-строка для pansichar-параметров OziAPI.
-
-    На Windows используется системная кодировка (mbcs); вне Windows
-    такого кодека нет, поэтому подстраховываемся UTF-8.
-    """
-    try:
-        return str(path).encode('mbcs')
-    except (LookupError, UnicodeEncodeError):
-        return str(path).encode('utf-8')
 
 
 def _registry_exe_candidates() -> List[Path]:
@@ -170,15 +175,8 @@ def find_oziexplorer(configured: str = '') -> Optional[Path]:
     return None
 
 
-def _bundled_api_candidates() -> List[Path]:
-    """Где искать OziAPI.dll, поставляемый вместе с нашей программой.
-
-    OziAPI.dll загружает НАША программа, а не OziExplorer (в документации
-    API: DLL должна лежать в папке программы, которая её использует, или
-    на пути поиска Windows). Поэтому DLL можно положить рядом с нашим
-    exe или в ``lib/`` / ``assets/ozi/`` — тогда конечному пользователю не
-    нужно ничего скачивать самостоятельно.
-    """
+def _app_dirs() -> List[Path]:
+    """Каталоги нашей программы, где ищем комплектные файлы."""
     bases: List[Path] = []
     if getattr(sys, 'frozen', False):
         bases.append(Path(sys.executable).resolve().parent)
@@ -194,9 +192,39 @@ def _bundled_api_candidates() -> List[Path]:
     result: List[Path] = []
     seen = set()
     for base in bases:
+        if base not in seen:
+            seen.add(base)
+            result.append(base)
+    return result
+
+
+def _bundled_api_candidates() -> List[Path]:
+    """Где искать готовый OziAPI.dll рядом с нашей программой.
+
+    OziAPI.dll загружает НАША программа, а не OziExplorer (в документации
+    API: DLL должна лежать в папке программы, которая её использует, или
+    на пути поиска Windows).
+    """
+    result: List[Path] = []
+    seen = set()
+    for base in _app_dirs():
         for cand in (base / 'OziAPI.dll',
                      base / 'lib' / 'OziAPI.dll',
                      base / 'assets' / 'ozi' / 'OziAPI.dll'):
+            if cand not in seen:
+                seen.add(cand)
+                result.append(cand)
+    return result
+
+
+def _bundled_zip_candidates() -> List[Path]:
+    """Где искать комплектный архив с OziAPI.dll."""
+    result: List[Path] = []
+    seen = set()
+    for base in _app_dirs():
+        for cand in (base / 'assets' / 'oziapi_dll.zip',
+                     base / 'oziapi_dll.zip',
+                     base / 'lib' / 'oziapi_dll.zip'):
             if cand not in seen:
                 seen.add(cand)
                 result.append(cand)
@@ -207,8 +235,9 @@ def find_ozi_api(configured: str = '',
                  exe: Optional[Path] = None) -> Optional[Path]:
     """Ищет OziAPI.dll.
 
-    Порядок: заданный путь → поставляемая с программой DLL → рядом с
-    ``oziexp.exe``.
+    Порядок: заданный путь → рядом с нашей программой → рядом с
+    ``oziexp.exe``. Комплектный архив здесь не распаковывается — за это
+    отвечает :func:`ensure_ozi_api`.
     """
     if configured:
         p = Path(str(configured)).expanduser()
@@ -224,99 +253,312 @@ def find_ozi_api(configured: str = '',
     return None
 
 
-class OziApi:
-    """Тонкая обёртка над OziAPI.dll (stdcall-функции)."""
+def _api_cache_dir() -> Path:
+    """Каталог, куда распаковывается DLL из комплектного архива."""
+    base = os.environ.get('LOCALAPPDATA')
+    root = Path(base) if base else Path(tempfile.gettempdir())
+    return root / 'ok-filemanager'
 
-    _SIGNATURES = {
-        'oziFindOzi':      ([], ctypes.c_int),
-        'oziAPIsetTimeout': ([ctypes.c_int], ctypes.c_int),
-        'oziLoadWPfile':   ([ctypes.c_char_p], ctypes.c_int),
-        'oziLoadTrackFile': ([ctypes.c_int, ctypes.c_char_p], ctypes.c_int),
-        'oziLoadMap':      ([ctypes.c_char_p], ctypes.c_int),
-        'oziCloseApi':     ([], ctypes.c_int),
-    }
 
-    def __init__(self, dll_path):
-        win_dll = getattr(ctypes, 'WinDLL', None)
-        if win_dll is None:
-            raise OSError('OziAPI.dll доступен только в Windows')
+def extract_api_zip(zip_path, dest_dir) -> Path:
+    """Распаковывает ``OziAPI.dll`` из архива в ``dest_dir``.
+
+    Возвращает путь к распакованному файлу. Если он уже на месте и того
+    же размера, распаковка не повторяется.
+    """
+    zip_path = Path(zip_path)
+    dest_dir = Path(dest_dir)
+    target = dest_dir / 'OziAPI.dll'
+    with zipfile.ZipFile(zip_path) as zf:
+        member = None
+        for info in zf.infolist():
+            if Path(info.filename).name.lower() == 'oziapi.dll':
+                member = info
+                break
+        if member is None:
+            raise OSError(f'в {zip_path.name} нет OziAPI.dll')
+        if target.is_file() and target.stat().st_size == member.file_size:
+            return target
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        with zf.open(member) as src, open(target, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+    return target
+
+
+def ensure_ozi_api(configured: str = '',
+                   exe: Optional[Path] = None) -> Optional[Path]:
+    """Возвращает OziAPI.dll: готовый файл или распакованный из архива."""
+    found = find_ozi_api(configured, exe)
+    if found is not None:
+        return found
+    for zp in _bundled_zip_candidates():
+        if not zp.is_file():
+            continue
         try:
-            self._dll = win_dll(str(dll_path))
-        except OSError as e:
-            raise OSError(f'не загрузить OziAPI.dll: {e}')
-        self._fn = {}
-        for name, (argtypes, restype) in self._SIGNATURES.items():
-            fn = getattr(self._dll, name)
-            fn.argtypes = argtypes
-            fn.restype = restype
-            self._fn[name] = fn
+            return extract_api_zip(zp, _api_cache_dir())
+        except (OSError, zipfile.BadZipFile):
+            continue
+    return None
+
+
+def find_ozi_powershell() -> Optional[Path]:
+    """32-битный PowerShell из Windows — он умеет грузить 32-битные DLL."""
+    if sys.platform != 'win32':
+        return None
+    root = os.environ.get('SystemRoot') or r'C:\Windows'
+    p = (Path(root) / 'SysWOW64' / 'WindowsPowerShell' / 'v1.0'
+         / 'powershell.exe')
+    return p if p.is_file() else None
+
+
+class _ProcessEntry32W(ctypes.Structure):
+    """Структура PROCESSENTRY32W (toolhelp32)."""
+
+    _fields_ = [
+        ('dwSize', ctypes.c_ulong),
+        ('cntUsage', ctypes.c_ulong),
+        ('th32ProcessID', ctypes.c_ulong),
+        ('th32DefaultHeapID', ctypes.POINTER(ctypes.c_ulong)),
+        ('th32ModuleID', ctypes.c_ulong),
+        ('cntThreads', ctypes.c_ulong),
+        ('th32ParentProcessID', ctypes.c_ulong),
+        ('pcPriClassBase', ctypes.c_long),
+        ('dwFlags', ctypes.c_ulong),
+        ('szExeFile', ctypes.c_wchar * 260),
+    ]
+
+
+def _iter_process_names() -> Iterator[str]:
+    """Имена запущенных процессов (через toolhelp32).
+
+    Быстрее и надёжнее, чем ``tasklist``: не зависит от локали и не
+    запускает лишний процесс.
+    """
+    if sys.platform != 'win32':
+        return
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong,
+                                                  ctypes.c_ulong]
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p,
+                                         ctypes.POINTER(_ProcessEntry32W)]
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p,
+                                        ctypes.POINTER(_ProcessEntry32W)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    th32cs_snapprocess = 0x00000002
+    snap = kernel32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return
+    try:
+        entry = _ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            yield entry.szExeFile
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+
+
+def is_oziexplorer_running() -> bool:
+    """Запущен ли OziExplorer (по именам процессов)."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        return any(name.lower() in OZI_PROCESS_NAMES
+                   for name in _iter_process_names())
+    except OSError:  # pragma: no cover - сбой WinAPI
+        return False
+
+
+_EOF = object()
+
+
+class OziApiBridge:
+    """Мост к 32-битной OziAPI.dll через 32-битный PowerShell.
+
+    Процесс держится живым: запуск стоит ~3 секунды (``Add-Type``
+    компилирует P/Invoke-обёртку), а каждая команда после этого —
+    доли секунды. Протокол описан в ``ozi_api_bridge.ps1``.
+
+    Если процесс умер (например, OziExplorer перезапускали), следующая
+    команда поднимет его заново.
+    """
+
+    def __init__(self, dll, powershell, script=_BRIDGE_SCRIPT,
+                 timeout: float = _BRIDGE_TIMEOUT):
+        self.dll = Path(dll)
+        self.powershell = Path(powershell)
+        self.script = Path(script)
+        self.timeout = timeout
+        self.version = ''
+        self._proc: Optional[subprocess.Popen] = None
+        self._lines: queue.Queue = queue.Queue()
+        self._pump_thread: Optional[threading.Thread] = None
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self) -> bool:
+        """Запускает мост. True, если он ответил и готов."""
+        if self.alive():
+            return True
+        self._lines = queue.Queue()
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        try:
+            self._proc = subprocess.Popen(
+                [str(self.powershell), '-NoProfile', '-NonInteractive',
+                 '-ExecutionPolicy', 'Bypass', '-File', str(self.script),
+                 '-Dll', str(self.dll)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, encoding='utf-8',
+                errors='replace', creationflags=flags)
+        except OSError:
+            self._proc = None
+            return False
+
+        self._pump_thread = threading.Thread(target=self._pump, daemon=True)
+        self._pump_thread.start()
+
+        ready = self._next_line(self.timeout)
+        if not isinstance(ready, str) or \
+                not ready.startswith('OZI_BRIDGE_READY='):
+            self.stop()
+            return False
+        self.version = ready.split('=', 1)[1].strip()
+        return True
+
+    def _pump(self):
+        """Читает stdout моста в очередь (в фоне, чтобы был таймаут)."""
+        proc = self._proc
+        try:
+            if proc is not None and proc.stdout is not None:
+                for line in proc.stdout:
+                    self._lines.put(line.rstrip('\r\n'))
+        except (OSError, ValueError):  # pragma: no cover - поток закрыли
+            pass
+        finally:
+            self._lines.put(_EOF)
+
+    def _next_line(self, timeout: float):
+        """Следующая строка, _EOF на закрытии, None на таймауте."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                return self._lines.get(timeout=remaining)
+            except queue.Empty:
+                return None
+
+    def _request(self, command: str,
+                 timeout: Optional[float] = None) -> Optional[str]:
+        """Отправляет команду и ждёт строку протокола (``OZI_...``)."""
+        if not self.start():
+            return None
+        proc = self._proc
+        try:
+            if proc is None or proc.stdin is None:
+                return None
+            proc.stdin.write(command + '\n')
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            self.stop()
+            return None
+
+        deadline = time.monotonic() + (timeout or self.timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            line = self._next_line(remaining)
+            if line is _EOF:
+                self.stop()
+                return None
+            if line is None:
+                return None
+            if line == 'OZI_PONG' or line.startswith('OZI_RESULT'):
+                return line
+            # прочие строки (предупреждения) пропускаем
+
+    def _found_and_rc(self, command: str) -> Optional[Tuple[int, int]]:
+        line = self._request(command)
+        if line is None:
+            return None
+        m = _RESULT_RE.match(line)
+        if m is None:
+            return None
+        return int(m.group(1)), int(m.group(2))
 
     def is_running(self) -> bool:
-        try:
-            return self._fn['oziFindOzi']() == 0
-        except Exception:
+        """Найден ли запущенный OziExplorer (``oziFindOzi``)."""
+        res = self._found_and_rc('find')
+        return res is not None and res[0] == 0
+
+    def load(self, path, track_num: int = 1) -> bool:
+        """Грузит файл в открытое окно. True при rc=0."""
+        path = Path(path)
+        action = _API_ACTIONS.get(path.suffix.lower())
+        if action is None:
             return False
+        res = self._found_and_rc(f'{action}\t{path}\t{int(track_num)}')
+        return res == (0, 0)
 
-    def _call(self, name: str, *args) -> bool:
+    def stop(self):
+        """Останавливает мост (``quit``, при необходимости — kill)."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
         try:
-            self._fn['oziAPIsetTimeout'](1000)
-        except Exception:
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.write('quit\n')
+                proc.stdin.flush()
+                proc.wait(timeout=3)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
-        try:
-            return self._fn[name](*args) == 0
-        except Exception:
-            return False
-
-    def load_waypoints(self, path) -> bool:
-        return self._call('oziLoadWPfile', _encode_path(path))
-
-    def load_track(self, track_num: int, path) -> bool:
-        return self._call('oziLoadTrackFile', int(track_num),
-                          _encode_path(path))
-
-    def load_map(self, path) -> bool:
-        return self._call('oziLoadMap', _encode_path(path))
-
-    def close(self):
-        try:
-            self._fn['oziCloseApi']()
-        except Exception:
-            pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:  # pragma: no cover
+                pass
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:  # pragma: no cover
+                pass
 
 
-def _try_api_load(dll_path: Path, path: Path, track_num: int,
-                  api_factory: Callable = OziApi) -> Optional[str]:
-    """Пробует загрузить файл в запущенный OziExplorer через OziAPI.
+_bridge: Optional[OziApiBridge] = None
 
-    Возвращает текст успеха или None, если API неприменим: OziExplorer
-    не запущен, формату нет загрузчика, загрузка не удалась.
-    """
-    rule = _API_LOADERS.get(path.suffix.lower())
-    if rule is None:
+
+def get_bridge(dll=None) -> Optional[OziApiBridge]:
+    """Общий мост к OziAPI.dll (запускается при первом обращении)."""
+    global _bridge
+    if _bridge is not None and _bridge.alive():
+        return _bridge
+    powershell = find_ozi_powershell()
+    if dll is None or powershell is None:
         return None
-    try:
-        api = api_factory(dll_path)
-    except OSError:
+    bridge = OziApiBridge(dll, powershell)
+    if not bridge.start():
+        bridge.stop()
         return None
+    _bridge = bridge
+    return _bridge
 
-    if not api.is_running():
-        return None
-    try:
-        what, method = rule
-        if method == 'load_track':
-            ok = api.load_track(track_num, path)
-        else:
-            ok = getattr(api, method)(path)
-    except Exception:
-        ok = False
-    finally:
-        try:
-            api.close()
-        except Exception:
-            pass
-    if not ok:
-        return None
-    return f'загружено через OziAPI ({what}): {path.name}'
+
+def close_bridge():
+    """Останавливает общий мост (вызывается при выходе программы)."""
+    global _bridge
+    if _bridge is not None:
+        _bridge.stop()
+        _bridge = None
+
+
+atexit.register(close_bridge)
 
 
 def _launch(exe_path: Optional[Path], path: Path) -> Tuple[bool, str]:
@@ -334,19 +576,22 @@ def open_in_oziexplorer(path, exe: str = '', dll: str = '',
                         track_num: int = 1) -> Tuple[bool, str]:
     """Открывает файл в OziExplorer. Возвращает (успех, сообщение).
 
-    Сначала пробует OziAPI (в уже запущенное окно), иначе запускает
-    oziexp.exe с путём к файлу.
+    Если OziExplorer уже запущен и доступна OziAPI.dll, файл грузится в
+    текущее окно; иначе запускается ``oziexp.exe`` (новое окно).
     """
     path = Path(path)
     if not path.is_file():
         return False, f'файл не найден: {path.name}'
 
     exe_path = find_oziexplorer(exe)
-    dll_path = find_ozi_api(dll, exe_path)
+    dll_path = ensure_ozi_api(dll, exe_path)
 
-    if dll_path is not None:
-        loaded = _try_api_load(dll_path, path, track_num)
-        if loaded is not None:
-            return True, loaded
+    if (dll_path is not None
+            and path.suffix.lower() in _API_ACTIONS
+            and is_oziexplorer_running()):
+        bridge = get_bridge(dll_path)
+        if bridge is not None and bridge.load(path, track_num):
+            return True, (f'{path.name} — загружено в открытое окно '
+                          f'OziExplorer')
 
     return _launch(exe_path, path)

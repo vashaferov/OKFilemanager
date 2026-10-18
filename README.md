@@ -151,14 +151,15 @@
 `.gpx` / `.plt` / `.wpt` / `.map` открывают выделенный файл в
 OziExplorer 3.95. Работает гибридно:
 
-1. если найден `OziAPI.dll` **и** OziExplorer уже запущен — файл
-   грузится в текущее окно через API (`oziLoadWPfile`,
-   `oziLoadTrackFile`, `oziLoadMap`), без второго окна;
-2. иначе запускается `oziexp.exe` с путём к файлу.
+1. если OziExplorer уже запущен и доступна `OziAPI.dll` — файл грузится
+   в текущее окно через API (`oziLoadWPfile`, `oziLoadTrackFile`,
+   `oziLoadMap`), без второго окна;
+2. иначе запускается `oziexp.exe` с путём к файлу (новое окно).
 
-Для формата `.gpx` загрузчика в API нет, поэтому он всегда открывается
-запуском exe. Требования для API-режима: OziExplorer ≥ 3.95.2 и
-включённый OziAPI (Configuration → OziAPI в самой программе).
+Форматы `.wpt` (точки), `.plt` (трек) и `.map` (карта) умеет грузить API
+в текущее окно. Для `.gpx` загрузчика в API нет, поэтому он всегда
+открывается запуском exe. Требования для API-режима: OziExplorer ≥ 3.95.2
+и включённый OziAPI (Configuration → OziAPI в самой программе).
 
 **OziExplorer многовконный.** Проверено на 3.95.6f: каждый запуск
 `oziexp.exe` с файлом поднимает **новое** окно (три запуска — три
@@ -168,27 +169,36 @@ OziExplorer 3.95. Работает гибридно:
 уже открытое окно **без `OziAPI.dll` невозможно** — файл откроется в
 новом окне.
 
-**Важно.** `OziAPI.dll` **не входит** в установщик OziExplorer — это
-отдельная загрузка (страница «OziAPI» на `oziexplorer4.com`, архив
-`oziapi_dll.zip`). Но загружает DLL **наша** программа, а не
-OziExplorer (так написано в документации API: DLL должна лежать в
-папке использующей её программы или на пути поиска Windows). Поэтому
-DLL достаточно положить рядом с нашей программой — например,
-`OziAPI.dll`, `lib/OziAPI.dll` или `assets/ozi/OziAPI.dll`, — и файл
-будет грузиться в уже открытое окно. От пользователя требуется только
-запущенный OziExplorer (в новых сборках — с включённым API,
-**Configuration → OziAPI**).
+**DLL поставляется вместе с программой.** `OziAPI.dll` не входит в
+установщик OziExplorer, но её разрешено распространять с программой,
+которая её использует (документация API: DLL должна лежать в папке
+использующей её программы или на пути поиска Windows). Поэтому архив
+`assets/oziapi_dll.zip` лежит в комплекте, а рабочая копия DLL
+распаковывается автоматически в
+`%LOCALAPPDATA%\ok-filemanager\OziAPI.dll`. Порядок поиска DLL:
+заданный путь → рядом с нашей программой (`OziAPI.dll`,
+`lib/OziAPI.dll`, `assets/ozi/OziAPI.dll`) → комплектный архив → папка
+`oziexp.exe`.
+
+**Почему нужен отдельный процесс.** `OziAPI.dll` — 32-битная (как и сам
+OziExplorer), а программа работает на 64-битном Python, который такую
+DLL загрузить не может (`WinError 193`). Поэтому DLL загружает
+поставляемый с Windows 32-битный PowerShell
+(`%SystemRoot%\SysWOW64\WindowsPowerShell`), а программа общается с ним
+через stdin/stdout; скрипт-мост — `ok_helper/ozi_api_bridge.ps1`.
+Процесс-мост держится живым: первый вызов ~2–3 с (компиляция P/Invoke),
+дальше — доли секунды.
 
 Кнопка **«Скачать OziAPI…»** в настройках (**F10 → OziExplorer**)
-открывает страницу загрузки DLL в браузере.
+открывает страницу загрузки DLL — на случай, если комплектный архив не
+подошёл.
 
 Если DLL нет вовсе, интеграция всё равно запустит `oziexp.exe` с
 файлом, но это открывает новое окно на каждый файл.
 
 Путь к `oziexp.exe` и `OziAPI.dll` задаётся в **F10 → OziExplorer**.
 Пустое поле означает автоматический поиск: `PATH`, типовые папки
-установки и реестр Windows для exe; для DLL — заданный путь, затем
-папка нашей программы, затем папка `oziexp.exe`.
+установки и реестр Windows для exe; для DLL — см. порядок выше.
 
 ### Папка загрузок
 
@@ -424,7 +434,8 @@ ok-filemanager/
 ├── requirements-dev.txt
 ├── assets/
 │   ├── ok-filemanager.ico — иконка .exe
-│   └── ok-filemanager.png — иконка для README / окна
+│   ├── ok-filemanager.png — иконка для README / окна
+│   └── oziapi_dll.zip    — комплектная 32-битная OziAPI.dll
 ├── ok_helper/
 │   ├── analyzer.py       — валидация и нормализация имён
 │   ├── appicon.py        — отрисовка иконки (папка с «OK»)
@@ -434,6 +445,7 @@ ok-filemanager/
 │   ├── handlers.py       — watchdog-обработчик
 │   ├── kmz.py            — распаковка KMZ в KML
 │   ├── ozi.py            — интеграция с OziExplorer
+│   ├── ozi_api_bridge.ps1 — мост к 32-битной OziAPI.dll
 │   └── gui.py            — GUI на PySide6
 ├── tests/
 │   ├── conftest.py           — фикстуры: QApplication, конфиг, QMessageBox
@@ -463,8 +475,15 @@ ok-filemanager/
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name ok-filemanager \
-    --icon assets/ok-filemanager.ico main.py
+    --icon assets/ok-filemanager.ico \
+    --add-data "ok_helper/ozi_api_bridge.ps1;ok_helper" \
+    --add-data "assets/oziapi_dll.zip;assets" \
+    main.py
 ```
+
+`--add-data` кладёт в сборку мост к OziAPI и комплектный архив с DLL —
+без них интеграция с OziExplorer в собранном `.exe` будет работать
+только в режиме «новое окно».
 
 Готовый `.exe` появится в `dist/`. Артефакт `ok-filemanager-windows` из
 GitHub Actions содержит ту же сборку.

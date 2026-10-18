@@ -131,7 +131,8 @@ jobs:
           pip install pyinstaller
 
       - name: Сборка onefile GUI-бинарника
-        run: pyinstaller --onefile --windowed --name ok-filemanager --icon assets/ok-filemanager.ico main.py
+        run: |
+          pyinstaller --onefile --windowed --name ok-filemanager --icon assets/ok-filemanager.ico --add-data "ok_helper/ozi_api_bridge.ps1;ok_helper" --add-data "assets/oziapi_dll.zip;assets" main.py
 
       - name: Проверка, что бинарник существует
         shell: bash

@@ -3188,8 +3188,8 @@ class MainWindow(QMainWindow):
         """Открывает выделенный файл в OziExplorer.
 
         Гибрид: если найден OziAPI.dll и OziExplorer уже запущен, файл
-        грузится в текущее окно через API; иначе запускается oziexp.exe
-        с путём к файлу.
+        грузится в текущее окно через API (см. ok_helper.ozi); иначе
+        запускается oziexp.exe с путём к файлу.
         """
         if self._warn_wrong_tab('Открыть в OziExplorer'):
             return
@@ -3729,16 +3729,19 @@ class SettingsDialog(QDialog):
             '(PATH, типовые папки установки, реестр Windows)')
         self.fields['ozi_api_dll'].setToolTip(
             'Пусто — искать OziAPI.dll сначала рядом с нашей программой '
-            '(OziAPI.dll, lib/OziAPI.dll, assets/ozi/OziAPI.dll), '
-            'затем рядом с oziexp.exe')
+            '(OziAPI.dll, lib/OziAPI.dll, assets/ozi/OziAPI.dll), затем в '
+            'комплектном архиве assets/oziapi_dll.zip, затем рядом с '
+            'oziexp.exe')
         ozi.addLayout(ozi_form)
 
         ozi_hint = QLabel(
-            'OziExplorer открывает каждую команду в новом окне. Чтобы '
-            'файл грузился в уже открытое окно, положите OziAPI.dll '
-            'рядом с нашей программой (или укажите путь выше) и включите '
-            'API в самом OziExplorer (Configuration → OziAPI). Без DLL '
-            'файл откроется в новом окне OziExplorer.')
+            'OziAPI.dll поставляется вместе с программой '
+            '(assets/oziapi_dll.zip), поэтому файл по возможности грузится '
+            'в уже открытое окно OziExplorer. Чтобы это работало, включите '
+            'API в самом OziExplorer (Configuration → OziAPI). '
+            'Если OziExplorer не запущен или DLL нет, файл откроется '
+            'в новом окне запуском oziexp.exe. Форматы .wpt, .plt и .map '
+            'грузятся в текущее окно, .gpx — всегда в новом окне.')
         ozi_hint.setObjectName('Dim')
         ozi_hint.setWordWrap(True)
         ozi.addWidget(ozi_hint)
@@ -3875,14 +3878,17 @@ OziExplorer:
   «Открыть в OziExplorer» в контекстном меню файла форматов
   .gpx, .plt, .wpt, .map.
   OziExplorer открывает каждую команду в новом окне — чтобы файл
-  грузился в уже открытое окно, нужен OziAPI.dll. Кнопка
-  «Скачать OziAPI…» в настройках (F10 → OziExplorer) открывает
-  страницу загрузки; файл достаточно положить рядом с нашей
-  программой (или указать путь в настройках) и включить API в самом
-  OziExplorer (Configuration → OziAPI). Без DLL файл откроется
-  в новом окне OziExplorer.
+  грузился в уже открытое окно, используется OziAPI.dll, которая
+  поставляется вместе с программой (assets/oziapi_dll.zip) и
+  распаковывается автоматически. Достаточно включить API в самом
+  OziExplorer (Configuration → OziAPI). Форматы .wpt, .plt и .map
+  грузятся в текущее окно; .gpx в новом окне запуском oziexp.exe.
+  Если OziExplorer не запущен или DLL нет, файл тоже откроется
+  в новом окне.
   Пути к oziexp.exe и OziAPI.dll задаются в настройках
-  (F10 → OziExplorer); пусто — искать автоматически.
+  (F10 → OziExplorer); пусто — искать автоматически. Кнопка
+  «Скачать OziAPI…» открывает страницу загрузки DLL на случай,
+  если комплектный архив не подошёл.
 
 Настройки (F10):
   У полей-путей (корневая папка, папка загрузок, oziexp.exe,

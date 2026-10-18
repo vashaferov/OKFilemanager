@@ -1,10 +1,12 @@
 """Тесты интеграции с OziExplorer (ok_helper.ozi).
 
-Функциональность: поиск oziexp.exe и OziAPI.dll, обёртка над
-OziAPI.dll (ctypes) и open_in_oziexplorer() — гибрид «API или запуск».
+Функциональность: поиск oziexp.exe и OziAPI.dll, распаковка комплектного
+архива с DLL, поиск 32-битного PowerShell, определение запущенного
+OziExplorer, мост к OziAPI.dll и open_in_oziexplorer() — гибрид
+«API или запуск».
 
-Реальный OziExplorer и сеть не используются: subprocess и WinDLL
-подменяются, реестр и PATH изолируются.
+Реальный OziExplorer, PowerShell и сеть не используются: subprocess и
+WinAPI подменяются, реестр и PATH изолируются.
 
 Группировка в Allure:
   epic    = ok-filemanager
@@ -12,7 +14,9 @@ OziAPI.dll (ctypes) и open_in_oziexplorer() — гибрид «API или за�
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
 
+import queue
 import sys
+import zipfile
 from pathlib import Path
 
 import allure
@@ -22,7 +26,8 @@ from ok_helper import ozi
 from ok_helper.ozi import (
     OZI_API_DOWNLOAD_URL,
     OZI_FILE_SUFFIXES,
-    OziApi,
+    OziApiBridge,
+    ensure_ozi_api,
     find_ozi_api,
     find_oziexplorer,
     open_in_oziexplorer,
@@ -48,6 +53,15 @@ def no_auto(monkeypatch):
 def make_file(path: Path, text: str = '') -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding='utf-8')
+    return path
+
+
+def make_zip(path: Path, members) -> Path:
+    """Создаёт zip с заданными элементами (имя -> байты)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, 'w') as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
     return path
 
 
@@ -261,6 +275,132 @@ class TestFindApi:
         assert any('ozi' in p.parts for p in cands)
 
 
+# ─────────────────────────────────────────────────────────────────
+# 3. Комплектный архив с OziAPI.dll
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Комплектный архив OziAPI.dll')
+class TestBundledZip:
+    def test_zip_candidates_include_assets(self):
+        cands = ozi._bundled_zip_candidates()
+
+        assert cands
+        assert all(p.name == 'oziapi_dll.zip' for p in cands)
+        assert any('assets' in p.parts for p in cands)
+
+    def test_real_project_zip_exists(self):
+        """В комплекте проекта архив с DLL действительно есть."""
+        found = [p for p in ozi._bundled_zip_candidates() if p.is_file()]
+        assert found, 'assets/oziapi_dll.zip не найден'
+        with zipfile.ZipFile(found[0]) as zf:
+            names = [Path(n).name.lower() for n in zf.namelist()]
+        assert 'oziapi.dll' in names
+
+    def test_extract_real_zip(self, tmp_path):
+        zp = make_zip(tmp_path / 'oziapi_dll.zip',
+                      {'OziAPI.dll': b'MZ' + b'x' * 100})
+        out = tmp_path / 'cache'
+
+        dll = ozi.extract_api_zip(zp, out)
+
+        assert dll == out / 'OziAPI.dll'
+        assert dll.read_bytes() == b'MZ' + b'x' * 100
+
+    def test_extract_from_subfolder(self, tmp_path):
+        zp = make_zip(tmp_path / 'oziapi_dll.zip',
+                      {'ozi/readme.txt': b'hi',
+                       'ozi/OziAPI.dll': b'DLL'})
+        out = tmp_path / 'cache'
+
+        dll = ozi.extract_api_zip(zp, out)
+
+        assert dll.read_bytes() == b'DLL'
+
+    def test_extract_missing_dll_raises(self, tmp_path):
+        zp = make_zip(tmp_path / 'oziapi_dll.zip', {'readme.txt': b'hi'})
+
+        with pytest.raises(OSError, match='OziAPI'):
+            ozi.extract_api_zip(zp, tmp_path / 'cache')
+
+    def test_extract_skips_when_same_size(self, tmp_path, monkeypatch):
+        zp = make_zip(tmp_path / 'oziapi_dll.zip', {'OziAPI.dll': b'1234'})
+        out = tmp_path / 'cache'
+        out.mkdir()
+        target = out / 'OziAPI.dll'
+        target.write_bytes(b'1234')
+        called = []
+
+        real_open = zipfile.ZipFile
+
+        class Watcher(real_open):
+            def open(self, *a, **kw):
+                called.append(a)
+                return super().open(*a, **kw)
+
+        monkeypatch.setattr(ozi.zipfile, 'ZipFile', Watcher)
+
+        dll = ozi.extract_api_zip(zp, out)
+
+        assert dll == target
+        assert called == []
+
+    def test_extract_rewrites_when_size_differs(self, tmp_path):
+        zp = make_zip(tmp_path / 'oziapi_dll.zip', {'OziAPI.dll': b'12345678'})
+        out = tmp_path / 'cache'
+        out.mkdir()
+        (out / 'OziAPI.dll').write_bytes(b'old')
+
+        dll = ozi.extract_api_zip(zp, out)
+
+        assert dll.read_bytes() == b'12345678'
+
+
+@pytest.mark.story('ensure_ozi_api')
+class TestEnsureOziApi:
+    def test_configured_file_wins(self, tmp_path):
+        dll = make_file(tmp_path / 'OziAPI.dll')
+
+        assert ensure_ozi_api(str(dll)) == dll
+
+    def test_extracts_from_bundled_zip(self, tmp_path, monkeypatch):
+        zp = make_zip(tmp_path / 'assets' / 'oziapi_dll.zip',
+                      {'OziAPI.dll': b'DLL'})
+        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
+        monkeypatch.setattr(ozi, '_api_cache_dir',
+                            lambda: tmp_path / 'cache')
+
+        dll = ensure_ozi_api()
+
+        assert dll == tmp_path / 'cache' / 'OziAPI.dll'
+        assert dll.is_file()
+
+    def test_nothing_available(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [])
+
+        assert ensure_ozi_api() is None
+
+    def test_broken_zip_is_ignored(self, tmp_path, monkeypatch):
+        zp = make_file(tmp_path / 'assets' / 'oziapi_dll.zip', 'не zip')
+        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
+        monkeypatch.setattr(ozi, '_api_cache_dir',
+                            lambda: tmp_path / 'cache')
+
+        assert ensure_ozi_api() is None
+
+    def test_zip_without_dll_is_ignored(self, tmp_path, monkeypatch):
+        zp = make_zip(tmp_path / 'assets' / 'oziapi_dll.zip',
+                      {'readme.txt': b'hi'})
+        monkeypatch.setattr(ozi, '_bundled_api_candidates', lambda: [])
+        monkeypatch.setattr(ozi, '_bundled_zip_candidates', lambda: [zp])
+        monkeypatch.setattr(ozi, '_api_cache_dir',
+                            lambda: tmp_path / 'cache')
+
+        assert ensure_ozi_api() is None
+
+
 @pytest.mark.story('Ссылка на загрузку OziAPI.dll')
 class TestDownloadUrl:
     def test_is_https_oziexplorer(self):
@@ -270,226 +410,412 @@ class TestDownloadUrl:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 3. Обёртка OziAPI.dll (ctypes)
+# 4. 32-битный PowerShell и поиск запущенного OziExplorer
 # ─────────────────────────────────────────────────────────────────
 
-class FakeFunc:
-    """Подмена функции DLL: помнит argtypes/restype, пишет вызовы."""
+@pytest.mark.story('32-битный PowerShell')
+class TestFindPowershell:
+    def test_found_on_windows(self):
+        p = ozi.find_ozi_powershell()
 
-    def __init__(self, result, calls, name):
-        self.result = result
-        self.calls = calls
-        self.name = name
-        self.argtypes = None
-        self.restype = None
+        if sys.platform == 'win32':
+            assert p is not None
+            assert p.is_file()
+            assert 'SysWOW64' in p.parts
+        else:
+            assert p is None
 
-    def __call__(self, *args):
-        self.calls.append((self.name, args))
-        return self.result
+    def test_none_when_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ozi.sys, 'platform', 'win32')
+        monkeypatch.setenv('SystemRoot', str(tmp_path))
 
+        assert ozi.find_ozi_powershell() is None
 
-class FakeDll:
-    """Подмена OziAPI.dll: атрибуты-функции с заданным кодом возврата."""
+    def test_none_on_non_windows(self, monkeypatch):
+        monkeypatch.setattr(ozi.sys, 'platform', 'linux')
 
-    def __init__(self, results=None):
-        self._results = results or {}
-        self.calls = []
-        self.funcs = {}
-
-    def __getattr__(self, name):
-        funcs = self.__dict__.setdefault('funcs', {})
-        if name not in funcs:
-            funcs[name] = FakeFunc(self._results.get(name, 0),
-                                   self.calls, name)
-        return funcs[name]
+        assert ozi.find_ozi_powershell() is None
 
 
-@pytest.fixture
-def fake_dll(monkeypatch):
-    """Подменяет ctypes.WinDLL фабрикой FakeDll и отдаёт последний."""
-    holder = {}
+@pytest.mark.story('Поиск запущенного OziExplorer')
+class TestIsOziExplorerRunning:
+    def test_true_for_oziexp(self, monkeypatch):
+        monkeypatch.setattr(ozi, '_iter_process_names',
+                            lambda: iter(['explorer.exe', 'OziExp.exe']))
 
-    def factory(path, *a, **kw):
-        dll = FakeDll(holder.get('results'))
-        holder['dll'] = dll
-        return dll
+        assert ozi.is_oziexplorer_running() is True
 
-    def configure(results):
-        holder['results'] = results
+    def test_true_for_oziexplorer_name(self, monkeypatch):
+        monkeypatch.setattr(ozi, '_iter_process_names',
+                            lambda: iter(['OziExplorer.exe']))
 
-    monkeypatch.setattr(ozi.ctypes, 'WinDLL', factory, raising=False)
-    holder['configure'] = configure
-    return holder
+        assert ozi.is_oziexplorer_running() is True
 
+    def test_false_when_absent(self, monkeypatch):
+        monkeypatch.setattr(ozi, '_iter_process_names',
+                            lambda: iter(['explorer.exe', 'python.exe']))
 
-@pytest.mark.story('Обёртка OziAPI.dll')
-class TestOziApi:
-    def test_is_running_true(self, tmp_path, fake_dll):
-        fake_dll['configure']({'oziFindOzi': 0})
-        api = OziApi(tmp_path / 'OziAPI.dll')
+        assert ozi.is_oziexplorer_running() is False
 
-        assert api.is_running() is True
+    def test_false_on_non_windows(self, monkeypatch):
+        monkeypatch.setattr(ozi.sys, 'platform', 'linux')
 
-    def test_is_running_false(self, tmp_path, fake_dll):
-        fake_dll['configure']({'oziFindOzi': -1})
-        api = OziApi(tmp_path / 'OziAPI.dll')
+        assert ozi.is_oziexplorer_running() is False
 
-        assert api.is_running() is False
+    def test_api_failure_is_not_an_exception(self, monkeypatch):
+        def boom():
+            raise OSError('WinAPI упал')
 
-    def test_load_waypoints_calls_wpfile(self, tmp_path, fake_dll):
-        fake_dll['configure']({'oziLoadWPfile': 0})
-        api = OziApi(tmp_path / 'OziAPI.dll')
+        monkeypatch.setattr(ozi, '_iter_process_names', boom)
 
-        ok = api.load_waypoints(tmp_path / 'points.wpt')
+        assert ozi.is_oziexplorer_running() is False
 
-        assert ok is True
-        names = [name for name, _ in fake_dll['dll'].calls]
-        assert 'oziLoadWPfile' in names
+    def test_iter_names_smoke(self):
+        """Перечисление процессов работает (только под Windows)."""
+        if sys.platform != 'win32':
+            pytest.skip('только Windows')
+        names = list(ozi._iter_process_names())
 
-    def test_load_track_passes_number(self, tmp_path, fake_dll):
-        fake_dll['configure']({'oziLoadTrackFile': 0})
-        api = OziApi(tmp_path / 'OziAPI.dll')
-
-        assert api.load_track(3, tmp_path / 't.plt') is True
-        calls = [c for c in fake_dll['dll'].calls
-                 if c[0] == 'oziLoadTrackFile']
-        assert calls[0][1][0] == 3
-
-    def test_load_failure_returns_false(self, tmp_path, fake_dll):
-        fake_dll['configure']({'oziLoadMap': 1})
-        api = OziApi(tmp_path / 'OziAPI.dll')
-
-        assert api.load_map(tmp_path / 'm.map') is False
-
-    def test_close_is_silent(self, tmp_path, fake_dll):
-        fake_dll['configure']({})
-        api = OziApi(tmp_path / 'OziAPI.dll')
-
-        api.close()  # не должно бросать
-
-
-def test_encode_path_is_bytes():
-    data = ozi._encode_path(Path('track.gpx'))
-
-    assert isinstance(data, bytes)
-    assert b'track.gpx' in data
+        assert names
+        assert any(n.lower().endswith('.exe') for n in names)
 
 
 # ─────────────────────────────────────────────────────────────────
-# 4. _try_api_load: загрузка в уже запущенный OziExplorer
+# 5. Мост к OziAPI.dll (OziApiBridge)
 # ─────────────────────────────────────────────────────────────────
 
-class FakeApi:
-    """Подмена OziApi для проверки логики _try_api_load."""
+class FakeStdout:
+    """Подмена stdout моста: строки отдаются итератору по мере появления."""
 
-    def __init__(self, running=True, results=None):
-        self.running = running
-        self.results = results or {}
-        self.calls = []
+    def __init__(self):
+        self.q: 'queue.Queue' = queue.Queue()
+
+    def push(self, line):
+        self.q.put(line + '\n')
+
+    def __iter__(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            yield item
+
+    def close(self):
+        self.q.put(None)
+
+
+class FakeStdin:
+    """Подмена stdin моста: каждый write получает ответ от «скрипта»."""
+
+    def __init__(self, proc):
+        self.proc = proc
         self.closed = False
 
-    def is_running(self):
-        return self.running
+    def write(self, text):
+        for line in text.splitlines():
+            self.proc.written.append(line)
+            proc = self.proc
+            answer = proc.answer(line)
+            if answer and not proc.stdout.closed:
+                proc.stdout.push(answer)
 
-    def load_waypoints(self, path):
-        self.calls.append(('load_waypoints', path))
-        return self.results.get('load_waypoints', True)
-
-    def load_track(self, num, path):
-        self.calls.append(('load_track', num, path))
-        return self.results.get('load_track', True)
-
-    def load_map(self, path):
-        self.calls.append(('load_map', path))
-        return self.results.get('load_map', True)
+    def flush(self):
+        pass
 
     def close(self):
         self.closed = True
 
 
-def api_factory_of(api):
-    return lambda dll_path: api
+class FakeProc:
+    """Подмена subprocess.Popen для моста."""
+
+    def __init__(self, ready='OZI_BRIDGE_READY=1.09', answer=None,
+                 ready_line=True):
+        self.stdout = FakeStdout()
+        self.stdout.closed = False
+        self.stdin = FakeStdin(self)
+        self.stderr = None
+        self.written = []
+        self.returncode = None
+        self.killed = False
+        self._answer = answer
+        if ready_line:
+            self.stdout.push(ready)
+
+    def answer(self, command):
+        if command == 'quit':
+            return None
+        if self._answer is not None:
+            return self._answer(command)
+        if command == 'find':
+            return 'OZI_RESULT found=0 rc=0'
+        if command == 'ping':
+            return 'OZI_PONG'
+        return 'OZI_RESULT found=0 rc=0'
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        self.stdout.closed = True
+        self.stdout.close()
+        return 0
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+        self.stdout.closed = True
+        self.stdout.close()
 
 
-@pytest.mark.story('Загрузка через OziAPI')
-class TestTryApiLoad:
-    def test_waypoints(self, tmp_path):
+@pytest.fixture
+def fake_popen(monkeypatch):
+    """Подменяет subprocess.Popen и отдаёт созданные «процессы»."""
+    holder = {}
+
+    def factory(args, **kwargs):
+        proc = FakeProc(answer=holder.get('answer'),
+                        ready=holder.get('ready', 'OZI_BRIDGE_READY=1.09'),
+                        ready_line=holder.get('ready_line', True))
+        holder['proc'] = proc
+        holder['args'] = args
+        holder['kwargs'] = kwargs
+        holder.setdefault('procs', []).append(proc)
+        return proc
+
+    monkeypatch.setattr(ozi.subprocess, 'Popen', factory)
+    return holder
+
+
+def make_bridge(tmp_path, **kw):
+    return OziApiBridge(tmp_path / 'OziAPI.dll',
+                        tmp_path / 'powershell.exe',
+                        tmp_path / 'bridge.ps1', **kw)
+
+
+@pytest.mark.story('Мост к OziAPI.dll')
+class TestOziApiBridge:
+    @pytest.mark.smoke
+    def test_start_reads_version(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge.start() is True
+        assert bridge.version == '1.09'
+        assert bridge.alive() is True
+
+    def test_start_command_line(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        bridge.start()
+
+        args = fake_popen['args']
+        assert args[0] == str(tmp_path / 'powershell.exe')
+        assert '-NoProfile' in args
+        assert '-ExecutionPolicy' in args
+        assert 'Bypass' in args
+        assert '-File' in args
+        assert str(tmp_path / 'bridge.ps1') in args
+        assert '-Dll' in args
+        assert str(tmp_path / 'OziAPI.dll') in args
+
+    def test_start_no_window(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        bridge.start()
+
+        assert fake_popen['kwargs'].get('creationflags') == \
+            getattr(ozi.subprocess, 'CREATE_NO_WINDOW', 0)
+
+    def test_start_without_ready_fails(self, tmp_path, fake_popen):
+        fake_popen['ready'] = 'OZI_BRIDGE_ERROR=1'
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge.start() is False
+        assert bridge.alive() is False
+
+    def test_start_popen_error(self, tmp_path, monkeypatch):
+        def boom(args, **kwargs):
+            raise OSError('нет прав')
+
+        monkeypatch.setattr(ozi.subprocess, 'Popen', boom)
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge.start() is False
+
+    def test_is_running_true(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge.is_running() is True
+        assert 'find' in fake_popen['proc'].written
+
+    def test_is_running_false(self, tmp_path, fake_popen):
+        fake_popen['answer'] = lambda cmd: 'OZI_RESULT found=-1 rc=-1'
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge.is_running() is False
+
+    def test_load_waypoints_command(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
         p = make_file(tmp_path / 'points.wpt')
-        api = FakeApi()
 
-        msg = ozi._try_api_load(Path('OziAPI.dll'), p, 1,
-                                api_factory=api_factory_of(api))
+        assert bridge.load(p) is True
+        assert fake_popen['proc'].written[-1] == f'wp\t{p}\t1'
 
-        assert msg is not None
-        assert 'набор точек' in msg
-        assert api.calls == [('load_waypoints', p)]
-        assert api.closed is True
+    def test_load_track_passes_number(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+        p = make_file(tmp_path / 'track.plt')
 
-    def test_track_uses_number(self, tmp_path):
-        p = make_file(tmp_path / 't.plt')
-        api = FakeApi()
+        assert bridge.load(p, 4) is True
+        assert fake_popen['proc'].written[-1] == f'track\t{p}\t4'
 
-        msg = ozi._try_api_load(Path('OziAPI.dll'), p, 4,
-                                api_factory=api_factory_of(api))
+    def test_load_map_command(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+        p = make_file(tmp_path / 'map.map')
 
-        assert msg is not None
-        assert api.calls == [('load_track', 4, p)]
+        assert bridge.load(p) is True
+        assert fake_popen['proc'].written[-1] == f'map\t{p}\t1'
 
-    def test_map(self, tmp_path):
-        p = make_file(tmp_path / 'm.map')
-        api = FakeApi()
-
-        msg = ozi._try_api_load(Path('OziAPI.dll'), p, 1,
-                                api_factory=api_factory_of(api))
-
-        assert msg is not None
-        assert api.calls == [('load_map', p)]
-
-    def test_not_running(self, tmp_path):
+    def test_load_failure_returns_false(self, tmp_path, fake_popen):
+        fake_popen['answer'] = lambda cmd: 'OZI_RESULT found=0 rc=1'
+        bridge = make_bridge(tmp_path, timeout=1.0)
         p = make_file(tmp_path / 'points.wpt')
-        api = FakeApi(running=False)
 
-        msg = ozi._try_api_load(Path('OziAPI.dll'), p, 1,
-                                api_factory=api_factory_of(api))
+        assert bridge.load(p) is False
 
-        assert msg is None
-        assert api.calls == []
-        assert api.closed is False
-
-    def test_load_failed(self, tmp_path):
-        p = make_file(tmp_path / 'points.wpt')
-        api = FakeApi(results={'load_waypoints': False})
-
-        msg = ozi._try_api_load(Path('OziAPI.dll'), p, 1,
-                                api_factory=api_factory_of(api))
-
-        assert msg is None
-        assert api.closed is True
-
-    def test_unsupported_suffix_not_loaded(self, tmp_path):
+    def test_load_unsupported_suffix(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
         p = make_file(tmp_path / 'track.gpx')
 
-        def boom(dll_path):
-            raise AssertionError('API для .gpx вызываться не должен')
+        assert bridge.load(p) is False
+        # мост даже не запускается: формат не поддержан API
+        assert 'proc' not in fake_popen
 
-        msg = ozi._try_api_load(Path('OziAPI.dll'), p, 1, api_factory=boom)
-
-        assert msg is None
-
-    def test_dll_load_error(self, tmp_path):
+    def test_request_timeout_returns_none(self, tmp_path, fake_popen):
+        fake_popen['answer'] = lambda cmd: None
+        bridge = make_bridge(tmp_path, timeout=0.2)
         p = make_file(tmp_path / 'points.wpt')
 
-        def boom(dll_path):
-            raise OSError('нет dll')
+        assert bridge.load(p) is False
 
-        msg = ozi._try_api_load(Path('OziAPI.dll'), p, 1, api_factory=boom)
+    def test_closed_bridge_restarts(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+        bridge.start()
+        first = fake_popen['proc']
+        first.wait()  # мост «умер»
+        p = make_file(tmp_path / 'points.wpt')
 
-        assert msg is None
+        assert bridge.load(p) is True
+        assert len(fake_popen['procs']) == 2
+
+    def test_stop_sends_quit(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+        bridge.start()
+
+        bridge.stop()
+
+        assert fake_popen['proc'].written[-1] == 'quit'
+        assert bridge.alive() is False
+
+    def test_stop_is_idempotent(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        bridge.stop()  # не должно бросать
+        bridge.stop()
+
+        assert bridge.alive() is False
+
+    def test_stop_kills_stuck_process(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+        bridge.start()
+        proc = fake_popen['proc']
+
+        def stuck(timeout=None):
+            raise ozi.subprocess.TimeoutExpired('powershell', timeout)
+
+        proc.wait = stuck
+        bridge.stop()
+
+        assert proc.killed is True
+
+    def test_alive_false_before_start(self, tmp_path):
+        assert make_bridge(tmp_path).alive() is False
+
+
+@pytest.mark.story('Общий мост')
+class TestGetBridge:
+    def test_returns_none_without_powershell(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ozi, 'find_ozi_powershell', lambda: None)
+
+        assert ozi.get_bridge(tmp_path / 'OziAPI.dll') is None
+
+    def test_returns_none_without_dll(self, monkeypatch):
+        monkeypatch.setattr(ozi, 'find_ozi_powershell',
+                            lambda: Path('ps.exe'))
+
+        assert ozi.get_bridge(None) is None
+
+    def test_starts_and_caches(self, tmp_path, monkeypatch, fake_popen):
+        monkeypatch.setattr(ozi, 'find_ozi_powershell',
+                            lambda: tmp_path / 'powershell.exe')
+        monkeypatch.setattr(ozi, '_bridge', None)
+        dll = make_file(tmp_path / 'OziAPI.dll')
+
+        first = ozi.get_bridge(dll)
+        second = ozi.get_bridge(dll)
+
+        assert first is not None
+        assert first is second
+        assert len(fake_popen['procs']) == 1
+
+    def test_dead_bridge_is_replaced(self, tmp_path, monkeypatch,
+                                    fake_popen):
+        monkeypatch.setattr(ozi, 'find_ozi_powershell',
+                            lambda: tmp_path / 'powershell.exe')
+        monkeypatch.setattr(ozi, '_bridge', None)
+        dll = make_file(tmp_path / 'OziAPI.dll')
+
+        first = ozi.get_bridge(dll)
+        fake_popen['proc'].wait()
+        second = ozi.get_bridge(dll)
+
+        assert second is not first
+        assert len(fake_popen['procs']) == 2
+
+    def test_close_bridge_stops_process(self, tmp_path, monkeypatch,
+                                        fake_popen):
+        monkeypatch.setattr(ozi, 'find_ozi_powershell',
+                            lambda: tmp_path / 'powershell.exe')
+        monkeypatch.setattr(ozi, '_bridge', None)
+        dll = make_file(tmp_path / 'OziAPI.dll')
+        ozi.get_bridge(dll)
+
+        ozi.close_bridge()
+
+        assert ozi._bridge is None
+        assert fake_popen['proc'].written[-1] == 'quit'
+
+    def test_close_bridge_without_bridge(self, monkeypatch):
+        monkeypatch.setattr(ozi, '_bridge', None)
+
+        ozi.close_bridge()  # не должно бросать
 
 
 # ─────────────────────────────────────────────────────────────────
-# 5. open_in_oziexplorer: гибрид «API или запуск»
+# 6. open_in_oziexplorer: гибрид «API или запуск»
 # ─────────────────────────────────────────────────────────────────
+
+class FakeBridge:
+    """Подмена OziApiBridge для проверки логики open_in_oziexplorer."""
+
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.loads = []
+
+    def load(self, path, track_num=1):
+        self.loads.append((Path(path), track_num))
+        return self.ok
+
 
 @pytest.mark.story('open_in_oziexplorer')
 class TestOpenInOziExplorer:
@@ -504,7 +830,7 @@ class TestOpenInOziExplorer:
         exe = tmp_path / 'oziexp.exe'
         launched = []
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
                             lambda cfg='', exe=None: None)
         monkeypatch.setattr(ozi.subprocess, 'Popen',
                             lambda args: launched.append(args))
@@ -518,7 +844,7 @@ class TestOpenInOziExplorer:
     def test_exe_not_found(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'track.gpx')
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': None)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
                             lambda cfg='', exe=None: None)
 
         ok, msg = open_in_oziexplorer(src)
@@ -529,29 +855,48 @@ class TestOpenInOziExplorer:
     def test_api_hit_skips_launch(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'points.wpt')
         launched = []
+        bridge = FakeBridge()
         monkeypatch.setattr(ozi, 'find_oziexplorer',
                             lambda cfg='': tmp_path / 'oziexp.exe')
-        monkeypatch.setattr(ozi, 'find_ozi_api',
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
                             lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
-        monkeypatch.setattr(ozi, '_try_api_load',
-                            lambda dll, p, t: 'загружено через OziAPI')
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
+        monkeypatch.setattr(ozi, 'get_bridge', lambda dll: bridge)
         monkeypatch.setattr(ozi.subprocess, 'Popen',
                             lambda args: launched.append(args))
 
         ok, msg = open_in_oziexplorer(src)
 
         assert ok is True
-        assert msg == 'загружено через OziAPI'
+        assert 'открытое окно' in msg
+        assert bridge.loads == [(src, 1)]
         assert launched == []
+
+    def test_track_number_is_passed(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'track.plt')
+        bridge = FakeBridge()
+        monkeypatch.setattr(ozi, 'find_oziexplorer',
+                            lambda cfg='': tmp_path / 'oziexp.exe')
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+                            lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
+        monkeypatch.setattr(ozi, 'get_bridge', lambda dll: bridge)
+
+        ok, _ = open_in_oziexplorer(src, track_num=7)
+
+        assert ok is True
+        assert bridge.loads == [(src, 7)]
 
     def test_api_miss_falls_back_to_launch(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'points.wpt')
         exe = tmp_path / 'oziexp.exe'
         launched = []
         monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
                             lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
-        monkeypatch.setattr(ozi, '_try_api_load', lambda dll, p, t: None)
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
+        monkeypatch.setattr(ozi, 'get_bridge',
+                            lambda dll: FakeBridge(ok=False))
         monkeypatch.setattr(ozi.subprocess, 'Popen',
                             lambda args: launched.append(args))
 
@@ -560,11 +905,68 @@ class TestOpenInOziExplorer:
         assert ok is True
         assert launched == [[str(exe), str(src)]]
 
+    def test_not_running_launches(self, tmp_path, monkeypatch):
+        """OziExplorer не запущен — мост даже не поднимается."""
+        src = make_file(tmp_path / 'points.wpt')
+        exe = tmp_path / 'oziexp.exe'
+        launched = []
+
+        def no_bridge(dll):
+            raise AssertionError('мост не нужен, OziExplorer не запущен')
+
+        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+                            lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: False)
+        monkeypatch.setattr(ozi, 'get_bridge', no_bridge)
+        monkeypatch.setattr(ozi.subprocess, 'Popen',
+                            lambda args: launched.append(args))
+
+        ok, _ = open_in_oziexplorer(src)
+
+        assert ok is True
+        assert launched == [[str(exe), str(src)]]
+
+    def test_no_dll_launches(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'points.wpt')
+        exe = tmp_path / 'oziexp.exe'
+        launched = []
+        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+                            lambda cfg='', exe=None: None)
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
+        monkeypatch.setattr(ozi.subprocess, 'Popen',
+                            lambda args: launched.append(args))
+
+        ok, _ = open_in_oziexplorer(src)
+
+        assert ok is True
+        assert launched == [[str(exe), str(src)]]
+
+    def test_gpx_always_launches(self, tmp_path, monkeypatch):
+        """Для .gpx загрузчика в API нет — только запуск exe."""
+        src = make_file(tmp_path / 'track.gpx')
+        exe = tmp_path / 'oziexp.exe'
+        launched = []
+        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
+                            lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
+        monkeypatch.setattr(ozi, 'get_bridge',
+                            lambda dll: pytest.fail('API для .gpx не нужен'))
+        monkeypatch.setattr(ozi.subprocess, 'Popen',
+                            lambda args: launched.append(args))
+
+        ok, _ = open_in_oziexplorer(src)
+
+        assert ok is True
+        assert launched == [[str(exe), str(src)]]
+
     def test_popen_error_reported(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'track.gpx')
         monkeypatch.setattr(ozi, 'find_oziexplorer',
                             lambda cfg='': tmp_path / 'oziexp.exe')
-        monkeypatch.setattr(ozi, 'find_ozi_api',
+        monkeypatch.setattr(ozi, 'ensure_ozi_api',
                             lambda cfg='', exe=None: None)
 
         def boom(args):
