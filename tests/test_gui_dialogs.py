@@ -437,6 +437,21 @@ class TestSettingsDialog:
         assert dlg.fields['ftp_password'].text() == 'secret'
         assert dlg.fields['ftp_path'].text() == '/upload'
         assert dlg.fields['base_url'].text() == gui_config['base_url']
+        assert dlg.fields['ozi_exe'].text() == gui_config.get('ozi_exe', '')
+        assert dlg.fields['ozi_api_dll'].text() == \
+            gui_config.get('ozi_api_dll', '')
+
+    def test_ozi_download_button_opens_page(self, qapp, gui_config,
+                                            monkeypatch):
+        opened = []
+        monkeypatch.setattr(gui.QDesktopServices, 'openUrl',
+                            lambda url: opened.append(url.toString()))
+        dlg = SettingsDialog(None, gui_config)
+
+        assert 'OziAPI' in dlg.ozi_download_btn.text()
+        dlg.ozi_download_btn.click()
+
+        assert opened == [gui.OZI_API_DOWNLOAD_URL]
 
     def test_password_is_masked(self, qapp, gui_config):
         dlg = SettingsDialog(None, gui_config)
@@ -540,6 +555,8 @@ class TestSettingsDialog:
         dlg.fields['ftp_password'].setText('p@ss')
         dlg.fields['ftp_path'].setText('/upload/sub')
         dlg.fields['base_url'].setText('  https://new.example.com/ftp  ')
+        dlg.fields['ozi_exe'].setText(r'  C:\Ozi\oziexp.exe  ')
+        dlg.fields['ozi_api_dll'].setText(r'  C:\Ozi\OziAPI.dll  ')
         dlg.theme_combo.setCurrentText('dark')
         dlg.watch_cb.setChecked(True)
         dlg.help_cb.setChecked(True)
@@ -558,6 +575,8 @@ class TestSettingsDialog:
         assert gui_config['ftp_password'] == 'p@ss'
         assert gui_config['ftp_path'] == '/upload/sub'
         assert gui_config['base_url'] == 'https://new.example.com/ftp'
+        assert gui_config['ozi_exe'] == r'C:\Ozi\oziexp.exe'
+        assert gui_config['ozi_api_dll'] == r'C:\Ozi\OziAPI.dll'
         assert gui_config['theme'] == 'dark'
         assert gui_config['watch_downloads'] is True
         assert gui_config['help_visible_at_start'] is True
@@ -599,6 +618,91 @@ class TestSettingsDialog:
         assert gui_config['theme'] == 'light'
 
 
+@pytest.mark.story('Выбор пути в настройках')
+class TestSettingsBrowse:
+    """Кнопки «…» справа от полей-путей (папки и файлы)."""
+
+    def test_buttons_only_on_path_fields(self, qapp, gui_config):
+        dlg = SettingsDialog(None, gui_config)
+
+        assert set(dlg.browse_buttons) == {
+            'root_dir', 'downloads_dir', 'ozi_exe', 'ozi_api_dll'}
+
+    def test_dir_button_fills_field(self, qapp, gui_config, monkeypatch,
+                                    tmp_path):
+        target = tmp_path / 'chosen'
+        target.mkdir()
+        monkeypatch.setattr(gui.QFileDialog, 'getExistingDirectory',
+                            lambda *a, **kw: str(target))
+        dlg = SettingsDialog(None, gui_config)
+
+        dlg.browse_buttons['root_dir'].click()
+
+        assert dlg.fields['root_dir'].text() == str(target)
+
+    def test_dir_button_uses_current_value(self, qapp, gui_config, monkeypatch,
+                                           tmp_path):
+        seen = []
+        monkeypatch.setattr(gui.QFileDialog, 'getExistingDirectory',
+                            lambda parent, caption, start: seen.append(start))
+        dlg = SettingsDialog(None, gui_config)
+        dlg.fields['downloads_dir'].setText(str(tmp_path))
+
+        dlg.browse_buttons['downloads_dir'].click()
+
+        assert seen == [str(tmp_path)]
+
+    def test_file_button_fills_field_with_filter(self, qapp, gui_config,
+                                                 monkeypatch, tmp_path):
+        exe = tmp_path / 'oziexp.exe'
+        exe.write_text('', encoding='utf-8')
+        seen = {}
+
+        def fake(parent, caption, base, flt):
+            seen['filter'] = flt
+            return str(exe), flt
+
+        monkeypatch.setattr(gui.QFileDialog, 'getOpenFileName', fake)
+        dlg = SettingsDialog(None, gui_config)
+
+        dlg.browse_buttons['ozi_exe'].click()
+
+        assert dlg.fields['ozi_exe'].text() == str(exe)
+        assert '*.exe' in seen['filter']
+
+    def test_dll_button_filter(self, qapp, gui_config, monkeypatch, tmp_path):
+        dll = tmp_path / 'OziAPI.dll'
+        dll.write_text('', encoding='utf-8')
+        seen = {}
+
+        def fake(parent, caption, base, flt):
+            seen['filter'] = flt
+            return str(dll), flt
+
+        monkeypatch.setattr(gui.QFileDialog, 'getOpenFileName', fake)
+        dlg = SettingsDialog(None, gui_config)
+
+        dlg.browse_buttons['ozi_api_dll'].click()
+
+        assert dlg.fields['ozi_api_dll'].text() == str(dll)
+        assert '*.dll' in seen['filter']
+
+    def test_cancel_keeps_text(self, qapp, gui_config, monkeypatch):
+        monkeypatch.setattr(gui.QFileDialog, 'getExistingDirectory',
+                            lambda *a, **kw: '')
+        monkeypatch.setattr(gui.QFileDialog, 'getOpenFileName',
+                            lambda *a, **kw: ('', ''))
+        dlg = SettingsDialog(None, gui_config)
+        dlg.fields['root_dir'].setText(r'C:\keep\me')
+        dlg.fields['ozi_exe'].setText(r'C:\keep\oziexp.exe')
+
+        dlg.browse_buttons['root_dir'].click()
+        dlg.browse_buttons['ozi_exe'].click()
+
+        assert dlg.fields['root_dir'].text() == r'C:\keep\me'
+        assert dlg.fields['ozi_exe'].text() == r'C:\keep\oziexp.exe'
+
+
 # ─────────────────────────────────────────────────────────────────
 # 5. HelpDialog (F1)
 # ─────────────────────────────────────────────────────────────────
@@ -628,7 +732,7 @@ class TestHelpDialog:
     @pytest.mark.parametrize('key', [
         'F1', 'F2', 'F5', 'Ctrl+F5', 'Ctrl+N', 'Ctrl+O', 'Ctrl+X',
         'Ctrl+Y', 'F10', 'F12', 'Delete', 'Ctrl+E', 'Ctrl+L',
-        'Ctrl+1', 'Ctrl+2', 'Ctrl+D',
+        'Ctrl+1', 'Ctrl+2', 'Ctrl+D', 'Ctrl+Shift+O',
     ])
     def test_help_lists_documented_hotkeys(self, key):
         """Справка должна перечислять клавиши из README."""
@@ -637,7 +741,8 @@ class TestHelpDialog:
     @pytest.mark.parametrize('fragment', [
         'ГГГГММДД', 'Waypoints_', '10-Tracks', 'ftp_readonly',
         'auto', 'light', 'dark', '✓', 'Ctrl+Shift+C',
-        'скрыть панель журнала', 'base_url',
+        'скрыть панель журнала', 'base_url', 'OziExplorer',
+        'кнопка «…»',
     ])
     def test_help_covers_documented_rules(self, fragment):
         assert fragment in HelpDialog.HELP_TEXT

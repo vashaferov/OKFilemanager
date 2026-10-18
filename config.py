@@ -50,6 +50,12 @@ DEFAULT_CONFIG = {
     # Показывать предсказуемые отказы (не тот формат, нет папки)
     # блокирующим окном вместо плашки над содержимым.
     'blocking_errors': False,
+    # --- интеграция с OziExplorer 3.95 ---
+    # Путь к oziexp.exe. Пусто — искать автоматически (PATH, типовые
+    # папки установки, реестр Windows).
+    'ozi_exe': '',
+    # Путь к OziAPI.dll. Пусто — искать рядом с oziexp.exe.
+    'ozi_api_dll': '',
 }
 
 
@@ -61,6 +67,7 @@ _BOOL_KEYS = ('watch_downloads', 'ftp_readonly', 'help_visible_at_start',
 _LITERAL_KEYS = {
     'root_dir', 'downloads_dir',
     'ftp_host', 'ftp_user', 'ftp_password', 'ftp_path',
+    'ozi_exe', 'ozi_api_dll',
 }
 
 
@@ -199,7 +206,8 @@ def load_config() -> dict:
 
     for k in ('root_dir', 'downloads_dir', 'ftp_host', 'ftp_user',
               'ftp_password', 'ftp_path', 'base_url', 'window_geometry',
-              'splitter_state', 'tree_column_widths'):
+              'splitter_state', 'tree_column_widths',
+              'ozi_exe', 'ozi_api_dll'):
         cfg[k] = str(cfg.get(k, DEFAULT_CONFIG[k]))
 
     cfg['root_dir_resolved'] = _as_path(cfg['root_dir'])
@@ -244,6 +252,8 @@ def save_config(cfg: dict):
     window_geometry = str(cfg.get('window_geometry', ''))
     splitter_state = str(cfg.get('splitter_state', ''))
     tree_column_widths = str(cfg.get('tree_column_widths', ''))
+    ozi_exe = str(cfg.get('ozi_exe', ''))
+    ozi_api_dll = str(cfg.get('ozi_api_dll', ''))
 
     lines = [
         '# Конфиг ok-filemanager',
@@ -280,6 +290,19 @@ def save_config(cfg: dict):
         f'ftp_path        = {_toml_value("ftp_path", cfg.get("ftp_path", "/"))}',
         f'ftp_readonly    = {_toml_value("ftp_readonly", readonly)}',
         f'base_url        = {_toml_value("base_url", cfg.get("base_url", ""))}',
+        '',
+        '# --- OziExplorer ---',
+        '# ozi_exe      — путь к oziexp.exe (пусто — искать автоматически:',
+        '#                PATH, типовые папки установки, реестр Windows)',
+        '# ozi_api_dll  — путь к OziAPI.dll (пусто — искать рядом с exe);',
+        '#                DLL скачивается отдельно (oziexplorer4.com →',
+        '#                OziAPI, архив oziapi_dll.zip), в установщик',
+        '#                OziExplorer не входит;',
+        '#                если найден и OziExplorer запущен, файл грузится',
+        '#                в текущее окно через API, иначе запускается exe.',
+        '',
+        f'ozi_exe         = {_toml_value("ozi_exe", ozi_exe)}',
+        f'ozi_api_dll     = {_toml_value("ozi_api_dll", ozi_api_dll)}',
         '',
         '# --- Окна при старте ---',
         '# help_visible_at_start — показывать окно подсказок (F1)',

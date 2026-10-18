@@ -16,6 +16,7 @@ FTP-задачи, watchdog-наблюдатели и модальные окна
 
 import threading
 import types
+import zipfile
 from pathlib import Path
 
 import allure
@@ -339,7 +340,8 @@ class TestTabToolbar:
         visible = self._visible(window, 'files')
         for label in ('Вверх', 'Обновить', 'Исправить все', 'Папка',
                       'Переименовать', 'Переместить', 'Копировать имя',
-                      'На FTP', 'В проводнике', 'Проверить загрузки'):
+                      'На FTP', 'В проводнике', 'В OziExplorer',
+                      'Проверить загрузки'):
             assert label in visible
         assert self._visible(window, 'ftp') == []
 
@@ -618,7 +620,8 @@ class TestNavigation:
         assert menu.executed is True
         assert menu.items == ['Копировать имя', 'Копировать путь',
                               'Показать в проводнике', 'Переименовать…',
-                              'Переместить…', 'Открыть']
+                              'Переместить…', 'Открыть в OziExplorer',
+                              'Открыть']
         assert opened == []                 # сам файл не открывается
         assert window._selected_path() == target
 
@@ -645,7 +648,7 @@ class TestNavigation:
         window.on_tree_double_click(window.tree_model.indexFromItem(item))
         menus.instances[-1].signals['Копировать имя'].emit()
 
-        assert copied == ['track.plt']
+        assert copied == ['track']
 
     def test_on_tree_double_click_directory_has_no_menu(self, window, files,
                                                         menus):
@@ -852,7 +855,54 @@ class TestContextMenu:
 
         assert menu.items == ['Копировать имя', 'Копировать путь',
                               'Показать в проводнике', 'Переименовать…',
-                              'Переместить…', 'Открыть']
+                              'Переместить…', 'Открыть в OziExplorer',
+                              'Открыть']
+
+    def test_kmz_file_menu_has_convert(self, window, files, monkeypatch,
+                                       menus):
+        src = files / 'route.kmz'
+        with zipfile.ZipFile(src, 'w') as zf:
+            zf.writestr('doc.kml', 'x')
+        window.rebuild_tree()
+
+        menu = self.open_menu(window, monkeypatch, menus, src)
+
+        assert 'KMZ → KML' in menu.items
+
+    def test_non_kmz_menu_has_no_convert(self, window, files, monkeypatch,
+                                         menus):
+        menu = self.open_menu(window, monkeypatch, menus,
+                              files / 'track.plt')
+
+        assert 'KMZ → KML' not in menu.items
+
+    def test_file_menu_shows_ozi_for_supported(self, window, files,
+                                               monkeypatch, menus):
+        menu = self.open_menu(window, monkeypatch, menus,
+                              files / '2026-09-23_Moscow' / '100m.gpx')
+
+        assert 'Открыть в OziExplorer' in menu.items
+
+    def test_file_menu_hides_ozi_for_other(self, window, files, monkeypatch,
+                                           menus):
+        (files / 'notes.txt').write_text('x', encoding='utf-8')
+        window.rebuild_tree()
+
+        menu = self.open_menu(window, monkeypatch, menus, files / 'notes.txt')
+
+        assert 'Открыть в OziExplorer' not in menu.items
+
+    def test_ozi_menu_action_opens(self, window, files, monkeypatch, menus):
+        called = []
+        monkeypatch.setattr(gui.MainWindow, 'on_open_in_ozi',
+                            lambda self: called.append(True))
+        target = files / '2026-09-23_Moscow' / '100m.gpx'
+        menu = self.open_menu(window, monkeypatch, menus, target)
+
+        assert 'Открыть в OziExplorer' in menu.items
+        menu.signals['Открыть в OziExplorer'].emit()
+
+        assert called == [True]
 
     def test_file_menu_shows_ftp_for_uploadable(self, window, files,
                                                 monkeypatch, menus):
@@ -916,7 +966,7 @@ class TestContextMenu:
 
         menu.signals['Копировать имя'].emit()
 
-        assert copied == ['track.plt']
+        assert copied == ['track']
 
     def test_open_action(self, window, files, monkeypatch, menus):
         opened = []
@@ -1768,8 +1818,8 @@ class TestCopyName:
 
         window.on_copy_name()
 
-        assert copied == ['track.plt']
-        assert '[БУФЕР] Скопировано: track.plt' in log_text(window)
+        assert copied == ['track']
+        assert '[БУФЕР] Скопировано: track' in log_text(window)
 
     def test_reports_clipboard_failure(self, window, files, monkeypatch):
         monkeypatch.setattr(gui, 'copy_to_clipboard', lambda text: False)
@@ -1790,7 +1840,18 @@ class TestCopyName:
 
         window.on_copy_name()
 
-        assert copied == ['100m.gpx']
+        assert copied == ['100m']
+
+    def test_ftp_directory_name_keeps_dots(self, window, monkeypatch):
+        copied = []
+        monkeypatch.setattr(gui, 'copy_to_clipboard',
+                            lambda text: copied.append(text) or True)
+        window.ftp_model.set_entries([('2026.09.23_tracks', True, 0)])
+        window.ftp_view.setCurrentIndex(window.ftp_model.index(0, 0))
+
+        window.on_copy_name()
+
+        assert copied == ['2026.09.23_tracks']
 
     def test_nothing_selected_is_noop(self, window, monkeypatch):
         copied = []
@@ -1820,6 +1881,146 @@ class TestCopyName:
         window.on_copy_name()
 
         assert copied == ['2026-09-23_Moscow']
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6b. KMZ → KML (контекстное меню файла .kmz)
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('KMZ → KML')
+class TestKmzToKml:
+    @staticmethod
+    def make_kmz(path, entries=(('doc.kml', '<kml/>'),)):
+        with zipfile.ZipFile(path, 'w') as zf:
+            for name, data in entries:
+                zf.writestr(name, data)
+        return path
+
+    def test_converts_and_removes_zip(self, window, files, monkeypatch):
+        src = self.make_kmz(files / 'route.kmz')
+        window.rebuild_tree()
+        select(window, src)
+
+        window.on_kmz_to_kml()
+
+        assert (files / 'route.kml').exists()
+        assert not (files / 'route.zip').exists()
+        assert '[KMZ] route.kmz -> route.kml' in log_text(window)
+
+    def test_kml_keeps_archive_content(self, window, files):
+        src = self.make_kmz(files / 'route.kmz', [('doc.kml', 'данные')])
+        window.rebuild_tree()
+        select(window, src)
+
+        window.on_kmz_to_kml()
+
+        assert (files / 'route.kml').read_text(encoding='utf-8') == 'данные'
+
+    def test_wrong_file_shows_information(self, window, files, msgbox):
+        select(window, files / 'track.plt')
+
+        window.on_kmz_to_kml()
+
+        assert msgbox.kinds == ['information']
+        assert 'Выберите файл .kmz' in msgbox.texts()[0]
+
+    def test_declined_overwrite_keeps_old(self, window, files, msgbox):
+        (files / 'route.kml').write_text('старое', encoding='utf-8')
+        src = self.make_kmz(files / 'route.kmz')
+        window.rebuild_tree()
+        select(window, src)
+        msgbox.answer = 'No'
+
+        window.on_kmz_to_kml()
+
+        assert (files / 'route.kml').read_text(encoding='utf-8') == 'старое'
+        assert not (files / 'route.zip').exists()
+
+    def test_confirmed_overwrite_replaces(self, window, files, msgbox):
+        (files / 'route.kml').write_text('старое', encoding='utf-8')
+        src = self.make_kmz(files / 'route.kmz', [('doc.kml', 'новое')])
+        window.rebuild_tree()
+        select(window, src)
+        msgbox.answer = 'Yes'
+
+        window.on_kmz_to_kml()
+
+        assert (files / 'route.kml').read_text(encoding='utf-8') == 'новое'
+        assert msgbox.kinds == ['question']
+
+    def test_bad_archive_logs_error(self, window, files):
+        (files / 'route.kmz').write_text('не архив', encoding='utf-8')
+        window.rebuild_tree()
+        select(window, files / 'route.kmz')
+
+        window.on_kmz_to_kml()
+
+        assert '[ОШБ] KMZ → KML' in log_text(window)
+
+    def test_selection_moves_to_kml(self, window, files):
+        src = self.make_kmz(files / 'route.kmz')
+        window.rebuild_tree()
+        select(window, src)
+
+        window.on_kmz_to_kml()
+
+        assert window._selected_path() == files / 'route.kml'
+
+
+@pytest.mark.story('Открытие в OziExplorer')
+class TestOpenInOzi:
+    def test_success_is_logged(self, window, files, monkeypatch):
+        monkeypatch.setattr(gui, 'open_in_oziexplorer',
+                            lambda *a, **kw: (True, 'открыто: track.plt'))
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert '[OZI] открыто: track.plt' in log_text(window)
+
+    def test_config_paths_are_passed(self, window, files, monkeypatch):
+        calls = []
+
+        def fake(path, exe='', dll='', **kw):
+            calls.append((path, exe, dll))
+            return True, 'ок'
+
+        monkeypatch.setattr(gui, 'open_in_oziexplorer', fake)
+        window.config['ozi_exe'] = r'C:\Ozi\oziexp.exe'
+        window.config['ozi_api_dll'] = r'C:\Ozi\OziAPI.dll'
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert calls == [(files / 'track.plt', r'C:\Ozi\oziexp.exe',
+                          r'C:\Ozi\OziAPI.dll')]
+
+    def test_failure_is_logged_and_shown(self, window, files, monkeypatch):
+        monkeypatch.setattr(gui, 'open_in_oziexplorer',
+                            lambda *a, **kw: (False, 'OziExplorer не найден'))
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert '[ОШБ] OZI' in log_text(window)
+        assert 'OziExplorer не найден' in window.notice_label.text()
+
+    def test_without_file_shows_information(self, window, files, msgbox):
+        # Папка не файл — команда просит выбрать файл.
+        select(window, files / '2026-09-23_Moscow')
+
+        window.on_open_in_ozi()
+
+        assert msgbox.kinds == ['information']
+        assert 'Выберите файл' in msgbox.texts()[0]
+
+    def test_on_ftp_tab_warns(self, window, files):
+        window.tabs.setCurrentIndex(1)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert 'вкладке «Файлы»' in window.notice_label.text()
 
 
 # ─────────────────────────────────────────────────────────────────

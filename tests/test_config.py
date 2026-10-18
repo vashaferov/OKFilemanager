@@ -123,6 +123,7 @@ class TestTomlValue:
     @pytest.mark.parametrize('key', [
         'root_dir', 'downloads_dir',
         'ftp_host', 'ftp_user', 'ftp_password', 'ftp_path',
+        'ozi_exe', 'ozi_api_dll',
     ])
     def test_all_literal_keys_use_single_quotes(self, key):
         assert _toml_value(key, r'a\b').startswith("'")
@@ -451,6 +452,7 @@ class TestLoadConfig:
     @pytest.mark.parametrize('key', [
         'root_dir', 'downloads_dir',
         'ftp_host', 'ftp_user', 'ftp_password', 'ftp_path', 'base_url',
+        'ozi_exe', 'ozi_api_dll',
     ])
     def test_string_keys_are_strings(self, cfg_file, key):
         assert isinstance(load_config()[key], str)
@@ -517,6 +519,8 @@ class TestSaveConfig:
             'base_url': 'https://example.com/ftp',
             'help_visible_at_start': False,
             'first_run': False,
+            'ozi_exe': r'C:\Ozi\oziexp.exe',
+            'ozi_api_dll': r'C:\Ozi\OziAPI.dll',
         })
 
         save_config(cfg)
@@ -525,7 +529,8 @@ class TestSaveConfig:
         for key in ('root_dir', 'downloads_dir', 'watch_downloads', 'theme',
                     'ftp_host', 'ftp_port', 'ftp_user', 'ftp_password',
                     'ftp_path', 'ftp_readonly', 'base_url',
-                    'help_visible_at_start', 'first_run'):
+                    'help_visible_at_start', 'first_run',
+                    'ozi_exe', 'ozi_api_dll'):
             assert again[key] == cfg[key], key
 
     def test_ui_state_round_trip(self, cfg_file):

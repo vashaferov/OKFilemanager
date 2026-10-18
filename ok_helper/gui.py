@@ -55,6 +55,9 @@ from ok_helper.ftp import (
     validate_folder_name, validate_upload_target,
 )
 from ok_helper.handlers import DirHandler, DownloadsHandler
+from ok_helper.kmz import KmzError, kmz_to_kml
+from ok_helper.ozi import (
+    OZI_API_DOWNLOAD_URL, OZI_FILE_SUFFIXES, open_in_oziexplorer)
 from ok_helper.translit import transliterate
 
 from watchdog.observers import Observer
@@ -2138,6 +2141,11 @@ class MainWindow(QMainWindow):
         add('files', 'В проводнике', self.on_reveal_selected,
             'Открыть папку с выделением файла (Ctrl+E)',
             QStyle.SP_DirOpenIcon)
+        ozi_action = add('files', 'В OziExplorer', self.on_open_in_ozi,
+                         'Открыть выделенный файл в OziExplorer '
+                         '(Ctrl+Shift+O)',
+                         QStyle.SP_FileDialogContentsView)
+        ozi_action.setShortcut(QKeySequence('Ctrl+Shift+O'))
         sep('files')
         add('files', 'Проверить загрузки', self.on_check_downloads,
             'Проверить папку загрузок и предложить перенос (Ctrl+D)',
@@ -2793,10 +2801,16 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction('Переименовать…', self.on_rename)
             menu.addAction('Переместить…', self.on_move)
+            # Распаковка KMZ в KML — только для файлов .kmz.
+            if path.suffix.lower() == '.kmz':
+                menu.addAction('KMZ → KML', self.on_kmz_to_kml)
             # «На FTP» — только для файлов, прошедших валидацию: те
             # же, что помечены в дереве как «можно на FTP».
             if is_uploadable(path):
                 menu.addAction('На FTP', self.on_upload_selected)
+            # Открытие в OziExplorer — для форматов, которые он понимает.
+            if path.suffix.lower() in OZI_FILE_SUFFIXES:
+                menu.addAction('Открыть в OziExplorer', self.on_open_in_ozi)
             menu.addAction('Открыть', self.on_open_selected)
         return menu
 
@@ -3079,6 +3093,34 @@ class MainWindow(QMainWindow):
             return
         self.rebuild_tree()
 
+    def on_kmz_to_kml(self):
+        """Распаковывает выбранный .kmz в одноимённый .kml.
+
+        KMZ — это ZIP-архив с KML внутри. Делаем копию с расширением
+        .zip, извлекаем .kml под именем исходного файла и удаляем
+        промежуточный .zip (остаются только .kmz и .kml).
+        """
+        if self._warn_wrong_tab('KMZ → KML'):
+            return
+        p = self._selected_path()
+        if p is None or not p.is_file() or p.suffix.lower() != '.kmz':
+            QMessageBox.information(self, 'KMZ → KML', 'Выберите файл .kmz')
+            return
+        kml_path = p.with_suffix('.kml')
+        if kml_path.exists() and QMessageBox.question(
+                self, 'KMZ → KML',
+                f'Файл {kml_path.name} уже существует. Перезаписать?'
+        ) != QMessageBox.Yes:
+            return
+        try:
+            result = kmz_to_kml(p)
+        except KmzError as e:
+            self.log(f'[ОШБ] KMZ → KML: {e}', 'error')
+            return
+        self.log(f'[KMZ] {p.name} -> {result.name}', 'ok')
+        self.rebuild_tree()
+        self._select_path(result)
+
     def on_copy_name(self):
         p = self._selected_path()
         if p is None:
@@ -3088,13 +3130,17 @@ class MainWindow(QMainWindow):
                 if item is not None:
                     name = (item.data(ROLE_FTP_NAME)
                             or item.text())
+                    entry = self.ftp_model.entry_for_name(name)
+                    if entry is None or not entry[1]:
+                        name = Path(name).stem
                     if copy_to_clipboard(name):
                         self.log(f'[БУФЕР] Скопировано: {name}', 'ok')
                     else:
                         self.log('[ОШБ] Буфер обмена недоступен', 'error')
             return
-        if copy_to_clipboard(p.name):
-            self.log(f'[БУФЕР] Скопировано: {p.name}', 'ok')
+        name = p.name if p.is_dir() else p.stem
+        if copy_to_clipboard(name):
+            self.log(f'[БУФЕР] Скопировано: {name}', 'ok')
         else:
             self.log('[ОШБ] Буфер обмена недоступен', 'error')
 
@@ -3137,6 +3183,30 @@ class MainWindow(QMainWindow):
         if p is None or not p.is_file():
             return
         self.open_path(p)
+
+    def on_open_in_ozi(self):
+        """Открывает выделенный файл в OziExplorer.
+
+        Гибрид: если найден OziAPI.dll и OziExplorer уже запущен, файл
+        грузится в текущее окно через API; иначе запускается oziexp.exe
+        с путём к файлу.
+        """
+        if self._warn_wrong_tab('Открыть в OziExplorer'):
+            return
+        p = self._selected_path()
+        if p is None or not p.is_file():
+            QMessageBox.information(self, 'OziExplorer', 'Выберите файл')
+            return
+        ok, msg = open_in_oziexplorer(
+            p,
+            exe=str(self.config.get('ozi_exe', '') or ''),
+            dll=str(self.config.get('ozi_api_dll', '') or ''),
+        )
+        if ok:
+            self.log(f'[OZI] {msg}', 'ok')
+        else:
+            self.log(f'[ОШБ] OZI: {msg}', 'error')
+            self._show_notice_or_box('OziExplorer', msg, 'error')
 
     def on_apply_fix(self):
         p = self._selected_path()
@@ -3530,14 +3600,34 @@ class SettingsDialog(QDialog):
         layout.setSpacing(12)
 
         self.fields: Dict[str, QLineEdit] = {}
+        self.browse_buttons: Dict[str, QPushButton] = {}
 
         def add_field(form: QFormLayout, label: str, key: str,
-                      password=False):
+                      password=False, browse: str = '',
+                      file_filter: str = ''):
+            """Поле ввода; browse — 'dir' или 'file' (кнопка «…» справа)."""
             e = QLineEdit(str(config.get(key, '')))
             if password:
                 e.setEchoMode(QLineEdit.Password)
             self.fields[key] = e
-            form.addRow(label, e)
+            if not browse:
+                form.addRow(label, e)
+                return
+            row = QWidget()
+            hbox = QHBoxLayout(row)
+            hbox.setContentsMargins(0, 0, 0, 0)
+            hbox.setSpacing(6)
+            hbox.addWidget(e, 1)
+            btn = QPushButton('…')
+            btn.setFixedWidth(32)
+            btn.setToolTip('Выбрать папку' if browse == 'dir'
+                           else 'Выбрать файл')
+            btn.clicked.connect(
+                lambda _=False, edit=e, mode=browse, flt=file_filter:
+                self._browse(edit, mode, flt))
+            hbox.addWidget(btn)
+            self.browse_buttons[key] = btn
+            form.addRow(label, row)
 
         def section(title: str) -> QVBoxLayout:
             """Заголовок раздела и карточка под ним."""
@@ -3557,8 +3647,9 @@ class SettingsDialog(QDialog):
         folders = section('Папки')
         folders_form = QFormLayout()
         folders_form.setSpacing(8)
-        add_field(folders_form, 'Корневая папка', 'root_dir')
-        add_field(folders_form, 'Папка загрузок', 'downloads_dir')
+        add_field(folders_form, 'Корневая папка', 'root_dir', browse='dir')
+        add_field(folders_form, 'Папка загрузок', 'downloads_dir',
+                  browse='dir')
         folders.addLayout(folders_form)
 
         self.watch_cb = QCheckBox('Следить за папкой загрузок')
@@ -3624,6 +3715,44 @@ class SettingsDialog(QDialog):
             'не загружать и не удалять файлы')
         ftp.addWidget(self.ftp_readonly_cb)
 
+        # --- OziExplorer ---
+        ozi = section('OziExplorer')
+        ozi_form = QFormLayout()
+        ozi_form.setSpacing(8)
+        add_field(ozi_form, 'Путь к oziexp.exe', 'ozi_exe', browse='file',
+                  file_filter='Программа (*.exe);;Все файлы (*)')
+        add_field(ozi_form, 'Путь к OziAPI.dll', 'ozi_api_dll',
+                  browse='file',
+                  file_filter='Библиотека (*.dll);;Все файлы (*)')
+        self.fields['ozi_exe'].setToolTip(
+            'Пусто — искать oziexp.exe автоматически '
+            '(PATH, типовые папки установки, реестр Windows)')
+        self.fields['ozi_api_dll'].setToolTip(
+            'Пусто — искать OziAPI.dll сначала рядом с нашей программой '
+            '(OziAPI.dll, lib/OziAPI.dll, assets/ozi/OziAPI.dll), '
+            'затем рядом с oziexp.exe')
+        ozi.addLayout(ozi_form)
+
+        ozi_hint = QLabel(
+            'OziExplorer открывает каждую команду в новом окне. Чтобы '
+            'файл грузился в уже открытое окно, положите OziAPI.dll '
+            'рядом с нашей программой (или укажите путь выше) и включите '
+            'API в самом OziExplorer (Configuration → OziAPI). Без DLL '
+            'файл откроется в новом окне OziExplorer.')
+        ozi_hint.setObjectName('Dim')
+        ozi_hint.setWordWrap(True)
+        ozi.addWidget(ozi_hint)
+
+        ozi_dl_row = QHBoxLayout()
+        self.ozi_download_btn = QPushButton('Скачать OziAPI…')
+        self.ozi_download_btn.setToolTip(
+            'Откроется страница загрузки OziAPI.dll:\n'
+            + OZI_API_DOWNLOAD_URL)
+        self.ozi_download_btn.clicked.connect(self._open_ozi_api_download)
+        ozi_dl_row.addWidget(self.ozi_download_btn)
+        ozi_dl_row.addStretch(1)
+        ozi.addLayout(ozi_dl_row)
+
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(
@@ -3634,6 +3763,25 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _browse(self, edit, mode: str, file_filter: str = ''):
+        """Диалог выбора папки ('dir') или файла ('file') для поля."""
+        current = edit.text().strip()
+        start = Path(current).expanduser() if current else Path.home()
+        if mode == 'dir':
+            chosen = QFileDialog.getExistingDirectory(
+                self, 'Выбрать папку', str(start))
+        else:
+            base = start if start.is_dir() else start.parent
+            chosen, _ = QFileDialog.getOpenFileName(
+                self, 'Выбрать файл', str(base),
+                file_filter or 'Все файлы (*)')
+        if chosen:
+            edit.setText(str(Path(chosen)))
+
+    def _open_ozi_api_download(self):
+        """Открывает в браузере страницу загрузки OziAPI.dll."""
+        QDesktopServices.openUrl(QUrl(OZI_API_DOWNLOAD_URL))
 
     def _save(self):
         root = self.fields['root_dir'].text().strip()
@@ -3674,6 +3822,8 @@ class SettingsDialog(QDialog):
         c['ftp_path'] = self.fields['ftp_path'].text().strip() or '/'
         c['base_url'] = self.fields['base_url'].text().strip()
         c['ftp_readonly'] = bool(self.ftp_readonly_cb.isChecked())
+        c['ozi_exe'] = self.fields['ozi_exe'].text().strip()
+        c['ozi_api_dll'] = self.fields['ozi_api_dll'].text().strip()
         c['root_dir_resolved'] = Path(root).expanduser().resolve()
         c['downloads_dir_resolved'] = Path(dl).expanduser().resolve()
 
@@ -3690,9 +3840,10 @@ class HelpDialog(QDialog):
   F2        Переименовать выделенный файл
   Ctrl+N    Создать папку
   Ctrl+X    Переместить файл в другую папку
-  Ctrl+Y    Копировать имя выделенного
+  Ctrl+Y    Копировать имя выделенного (без расширения)
   Ctrl+Shift+C  Копировать полный путь
   Ctrl+E    Показать файл в проводнике
+  Ctrl+Shift+O  Открыть файл в OziExplorer
   Ctrl+L    Показать / скрыть панель журнала
   Ctrl+D    Проверить папку загрузок
   Ctrl+1    Вкладка «Файлы»
@@ -3712,7 +3863,31 @@ class HelpDialog(QDialog):
   Enter на папке         — сделать корнем дерева
   Правый клик            — контекстное меню: открыть, переименовать,
                            переместить, копировать имя или путь,
-                           показать в проводнике
+                           показать в проводнике, открыть в OziExplorer
+
+KMZ → KML:
+  В контекстном меню файла .kmz. Делает копию с расширением .zip,
+  извлекает из неё .kml под именем исходного файла и удаляет
+  промежуточный .zip — остаются только .kmz и .kml.
+
+OziExplorer:
+  Кнопка «В OziExplorer» на панели (Ctrl+Shift+O) и пункт
+  «Открыть в OziExplorer» в контекстном меню файла форматов
+  .gpx, .plt, .wpt, .map.
+  OziExplorer открывает каждую команду в новом окне — чтобы файл
+  грузился в уже открытое окно, нужен OziAPI.dll. Кнопка
+  «Скачать OziAPI…» в настройках (F10 → OziExplorer) открывает
+  страницу загрузки; файл достаточно положить рядом с нашей
+  программой (или указать путь в настройках) и включить API в самом
+  OziExplorer (Configuration → OziAPI). Без DLL файл откроется
+  в новом окне OziExplorer.
+  Пути к oziexp.exe и OziAPI.dll задаются в настройках
+  (F10 → OziExplorer); пусто — искать автоматически.
+
+Настройки (F10):
+  У полей-путей (корневая папка, папка загрузок, oziexp.exe,
+  OziAPI.dll) справа есть кнопка «…» — выбрать папку или файл
+  в системном диалоге.
 
 Журнал слева:
   Панель можно показать или скрыть панель журнала кнопкой «Журнал»
