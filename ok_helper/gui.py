@@ -55,12 +55,13 @@ from ok_helper.ftp import (
     upload_extensions_hint, upload_file, upload_reason_for,
     validate_folder_name, validate_upload_target,
 )
+from ok_helper.gpxkml import GpxKmlError, read_gpx_kml
 from ok_helper.handlers import DirHandler, DownloadsHandler
 from ok_helper.kmz import KmzError, kmz_to_kml
 from ok_helper.ozi import (
-    OZI_API_DOWNLOAD_URL, OZI_FILE_SUFFIXES, OZI_TRACK_MAX,
-    OZI_WPT_DEFAULT_MODE, OZI_WPT_MODES, api_plan, extract_bundled_api,
-    open_in_oziexplorer)
+    OZI_API_DOWNLOAD_URL, OZI_FILE_SUFFIXES, OZI_PARSE_ACTION,
+    OZI_TRACK_MAX, OZI_WPT_DEFAULT_MODE, OZI_WPT_MODES, api_plan,
+    extract_bundled_api, open_in_oziexplorer)
 from ok_helper.translit import transliterate
 
 from watchdog.observers import Observer
@@ -1454,6 +1455,9 @@ class MainWindow(QMainWindow):
         self._downloads_baseline = 0.0
         # Защита от повторного показа диалога для одного и того же файла.
         self._seen_downloads: Set[Path] = set()
+        # Последнее сообщение ожидания OziExplorer: в журнал одно и то же
+        # пишем один раз, хотя колбэк зовётся на каждом шаге ожидания.
+        self._ozi_progress_text = ''
 
         self.ftp_folder = ''
         self.ftp_connected = False
@@ -3199,12 +3203,15 @@ class MainWindow(QMainWindow):
     def on_open_in_ozi(self):
         """Открывает выделенный файл в OziExplorer.
 
-        Гибрид: если найден OziAPI.dll и OziExplorer уже запущен, файл
-        грузится в текущее окно через API (см. ok_helper.ozi); иначе
-        запускается oziexp.exe с путём к файлу.
+        Гибрид: если найдена OziAPI.dll, файл грузится в **уже открытое**
+        окно (нужно ли запускать OziExplorer и как ждать его готовности —
+        решает ok_helper.ozi); для .gpx/.kml файл разбираем сами
+        (ok_helper.gpxkml), потому что API их не грузит. Без DLL .map
+        открывается запуском oziexp.exe, а остальные форматы в окно не
+        отдать — тогда честно сообщаем.
 
-        Про место загрузки спрашиваем только для API: при запуске exe
-        открывается новое окно, и затирать в нём нечего.
+        Про место загрузки спрашиваем только для API: в новом окне от
+        exe затирать нечего.
         """
         if self._warn_wrong_tab('Открыть в OziExplorer'):
             return
@@ -3215,7 +3222,19 @@ class MainWindow(QMainWindow):
         exe = str(self.config.get('ozi_exe', '') or '')
         dll = str(self.config.get('ozi_api_dll', '') or '')
         plan = api_plan(p, exe, dll)
-        position = self._ozi_position(p, plan)
+        content = None
+        if plan == OZI_PARSE_ACTION:
+            try:
+                content = read_gpx_kml(p)
+            except GpxKmlError as e:
+                self.log(f'[ОШБ] OZI: {e}', 'error')
+                self._show_notice_or_box('OziExplorer', str(e), 'error')
+                return
+            tracks = [track for track in content.tracks if track.has_points()]
+            self.log(f'[OZI] {p.name}: треков {len(tracks)} '
+                     f'({sum(t.count() for t in tracks)} точек), '
+                     f'точек {len(content.waypoints)}', 'info')
+        position = self._ozi_position(p, plan, content)
         if position is None:
             # пользователь отказался от загрузки в открытое окно
             self.log('[OZI] Загрузка отменена', 'warn')
@@ -3223,55 +3242,94 @@ class MainWindow(QMainWindow):
         track_num, wpt_mode = position
         ok, msg = open_in_oziexplorer(p, exe=exe, dll=dll,
                                       track_num=track_num,
-                                      wpt_mode=wpt_mode)
+                                      wpt_mode=wpt_mode,
+                                      content=content,
+                                      progress=self._ozi_progress)
         if ok:
             self.log(f'[OZI] {msg}', 'ok')
-            self._bump_ozi_track(plan, track_num)
+            self._bump_ozi_track(plan, track_num, content)
         else:
             self.log(f'[ОШБ] OZI: {msg}', 'error')
             self._show_notice_or_box('OziExplorer', msg, 'error')
 
-    def _ozi_position(self, p: Path, plan: str) -> Optional[Tuple[int, str]]:
+    def _ozi_progress(self, text: str):
+        """Отклик на время запуска OziExplorer: он занимает секунды.
+
+        Пишем в журнал по одному разу на сообщение и прокручиваем
+        очередь событий — иначе окно программы замерло бы до конца
+        ожидания.
+        """
+        if text != self._ozi_progress_text:
+            self._ozi_progress_text = text
+            self.log(f'[OZI] {text}', 'info')
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def _ozi_position(self, p: Path, plan: str,
+                      content=None) -> Optional[Tuple[int, str]]:
         """Место загрузки в открытое окно: (номер трека, режим точек).
 
         Спрашиваем, только если файл вообще пойдёт через API и вопрос не
-        снят галочкой «Запомнить». Выбор сохраняется в конфиг. None —
-        пользователь отказался.
+        снят галочкой «Запомнить». У .gpx/.kml спрашиваем про треки и про
+        точки по отдельности: в файле может быть только то или только
+        другое. Выбор сохраняется в конфиг. None — пользователь отказался.
         """
         track_num = _clamp_track_num(self.config.get('ozi_track_num', 1))
         wpt_mode = str(self.config.get('ozi_wpt_mode', OZI_WPT_DEFAULT_MODE))
         if wpt_mode not in OZI_WPT_MODES:
             wpt_mode = OZI_WPT_DEFAULT_MODE
-        if plan not in ('track', 'wp'):
+
+        if plan == 'track':
+            ask_track, ask_wpt = True, False
+        elif plan == 'wp':
+            ask_track, ask_wpt = False, True
+        elif plan == OZI_PARSE_ACTION:
+            # content=None — файл ещё не разобран: спрашиваем про всё.
+            ask_track = content is None or content.has_tracks
+            ask_wpt = content is None or content.has_waypoints
+        else:
             return track_num, wpt_mode
-        ask_key = 'ozi_track_ask' if plan == 'track' else 'ozi_wpt_ask'
-        if not bool(self.config.get(ask_key, True)):
+
+        if ask_track:
+            ask_track = bool(self.config.get('ozi_track_ask', True))
+        if ask_wpt:
+            ask_wpt = bool(self.config.get('ozi_wpt_ask', True))
+        if not ask_track and not ask_wpt:
             return track_num, wpt_mode
 
         dlg = OziLoadDialog(self, p, plan, track_num=track_num,
-                            wpt_mode=wpt_mode)
+                            wpt_mode=wpt_mode, content=content,
+                            ask_track=ask_track, ask_wpt=ask_wpt)
         if dlg.exec() != QDialog.Accepted:
             return None
-        if plan == 'track':
+        if ask_track:
             track_num = dlg.track_num
             self.config['ozi_track_num'] = track_num
-        else:
+        if ask_wpt:
             wpt_mode = dlg.wpt_mode
             self.config['ozi_wpt_mode'] = wpt_mode
         if dlg.remember:
-            self.config[ask_key] = False
+            if ask_track:
+                self.config['ozi_track_ask'] = False
+            if ask_wpt:
+                self.config['ozi_wpt_ask'] = False
         self._save_config_quiet()
         return track_num, wpt_mode
 
-    def _bump_ozi_track(self, plan: str, track_num: int):
-        """Следующий .plt по умолчанию ляжет в следующий номер.
+    def _bump_ozi_track(self, plan: str, track_num: int, content=None):
+        """Следующий файл по умолчанию ляжет в следующий свободный слот.
 
         Иначе «запомненный» номер затирал бы уже загруженный трек — та
-        самая подмена, из-за которой номер и выбирается.
+        самая подмена, из-за которой номер и выбирается. У .gpx/.kml
+        занимаем столько слотов, сколько в файле треков.
         """
-        if plan != 'track':
+        if plan not in ('track', OZI_PARSE_ACTION):
             return
-        nxt = min(int(track_num) + 1, OZI_TRACK_MAX)
+        count = 1
+        if plan == OZI_PARSE_ACTION and content is not None:
+            count = max(len([t for t in content.tracks if t.has_points()]), 1)
+        nxt = min(int(track_num) + count, OZI_TRACK_MAX)
         if nxt != _clamp_track_num(self.config.get('ozi_track_num', 1)):
             self.config['ozi_track_num'] = nxt
             self._save_config_quiet()
@@ -3826,8 +3884,10 @@ class SettingsDialog(QDialog):
         self.ozi_track_spin.setToolTip(
             f'Всего треков у OziExplorer: {OZI_TRACK_MAX}. Загрузка .plt в '
             f'занятый номер затирает то, что в нём лежало; после '
-            f'успешной загрузки номер увеличивается на 1')
-        ozi_form.addRow('Номер трека (.plt)', self.ozi_track_spin)
+            f'успешной загрузки номер увеличивается (у файла с несколькими '
+            f'треками — на их число). Треки из .gpx/.kml ложатся в этот '
+            f'номер и следующие за ним')
+        ozi_form.addRow('Номер трека', self.ozi_track_spin)
 
         self.ozi_wpt_combo = QComboBox()
         # Длинные пункты распирали бы вкладку по ширине: считаем минимум
@@ -3844,8 +3904,9 @@ class SettingsDialog(QDialog):
         self.ozi_wpt_combo.setToolTip(
             'Что делать с точками, уже загруженными в OziExplorer. '
             'Добавление идёт по точке и на больших файлах заметно '
-            'медленнее, зато ничего не пропадает')
-        ozi_form.addRow('Режим точек (.wpt)', self.ozi_wpt_combo)
+            'медленнее, зато ничего не пропадает. Относится и к точкам '
+            'из .gpx/.kml')
+        ozi_form.addRow('Режим точек', self.ozi_wpt_combo)
         ozi.addLayout(ozi_form)
 
         self.ozi_hint = QLabel(
@@ -3854,10 +3915,13 @@ class SettingsDialog(QDialog):
             'OziAPI», и файл по возможности будет грузиться в уже '
             'открытое окно OziExplorer. Включать API в самом OziExplorer '
             'не нужно: отдельной настройки для этого нет, достаточно '
-            'доступной DLL и запущенного OziExplorer 3.95.2 или новее. '
-            'Без DLL или запущенного OziExplorer файл откроется в новом '
-            'окне запуском oziexp.exe. Форматы .wpt, .plt и .map '
-            'грузятся в текущее окно, .gpx — всегда в новом окне.')
+            'доступной DLL и OziExplorer 3.95.2 или новее (если он ещё '
+            'не запущен, программа запустит его сама и подождёт). В '
+            'открытое окно грузятся .wpt, .plt, .map, а также .gpx и '
+            '.kml: их программа разбирает сама (треки — в выбранный '
+            'номер, точки — как обычно). Без DLL .map откроется запуском '
+            'oziexp.exe в новом окне, а остальные форматы в открытое окно '
+            'отдать нечем — скажем об этом прямо.')
         self.ozi_hint.setObjectName('Dim')
         self.ozi_hint.setWordWrap(True)
         ozi.addWidget(self.ozi_hint)
@@ -3867,15 +3931,16 @@ class SettingsDialog(QDialog):
             bool(config.get('ozi_track_ask', True)))
         self.ozi_track_ask_cb.setToolTip(
             'Спрашивать номер трека перед каждой загрузкой .plt в открытое '
-            'окно. Снимается галочкой «Запомнить» в самом диалоге')
+            'окно (и перед треками из .gpx/.kml). Снимается галочкой '
+            '«Запомнить» в самом диалоге')
         ozi.addWidget(self.ozi_track_ask_cb)
 
         self.ozi_wpt_ask_cb = QCheckBox('Спрашивать режим точек')
         self.ozi_wpt_ask_cb.setChecked(bool(config.get('ozi_wpt_ask', True)))
         self.ozi_wpt_ask_cb.setToolTip(
             'Спрашивать, добавлять точки или заменить набор, перед каждой '
-            'загрузкой .wpt в открытое окно. Снимается галочкой '
-            '«Запомнить» в самом диалоге')
+            'загрузкой .wpt в открытое окно (и перед точками из '
+            '.gpx/.kml). Снимается галочкой «Запомнить» в самом диалоге')
         ozi.addWidget(self.ozi_wpt_ask_cb)
 
         ozi_dl_row = QHBoxLayout()
@@ -4062,17 +4127,31 @@ KMZ → KML:
 OziExplorer:
   Кнопка «В OziExplorer» на панели (Ctrl+Shift+O) и пункт
   «Открыть в OziExplorer» в контекстном меню файла форматов
-  .gpx, .plt, .wpt, .map.
+  .gpx, .kml, .plt, .wpt, .map.
   OziExplorer открывает каждую команду в новом окне — чтобы файл
   грузился в уже открытое окно, используется OziAPI.dll. Она лежит
   в комплектном архиве assets/oziapi_dll.zip, но сама не
   распаковывается: нажмите «Распаковать OziAPI» в настройках
   (F10 → OziExplorer) — DLL распакуется в %LOCALAPPDATA% и путь
   подставится в поле. Включать API в самом OziExplorer не нужно:
-  отдельной настройки для этого нет, достаточно доступной DLL и
-  запущенного OziExplorer. Форматы .wpt, .plt и .map грузятся
-  в текущее окно; .gpx в новом окне запуском oziexp.exe. Если DLL
-  нет или OziExplorer не запущен, файл тоже откроется в новом окне.
+  отдельной настройки для этого нет, достаточно доступной DLL.
+  Если OziExplorer ещё не запущен, программа запустит его сама и
+  подождёт готовности API (заметно дольше обычного — секунды; в
+  журнале видно, что идёт ожидание).
+  У GPX и KML своих загрузчиков в API нет (на такой файл OziAPI
+  отвечает модальным «Invalid numeric input.»), поэтому их программа
+  разбирает сама и отдаёт OziExplorer обычными .plt/.wpt: треки —
+  в выбранный номер трека, точки — как обычно. Переносим координаты,
+  высоту (в .plt/.wpt она в футах — пересчитываем) и время как
+  записано, без пересчёта часового пояса. Символы точек из <sym> не
+  переносятся: это имена из набора Garmin, а OziExplorer ждёт номер.
+  Имя трека в OziExplorer — имя файла (в файле с несколькими треками
+  к нему добавляется номер). Разобранные .plt/.wpt пишутся в
+  %LOCALAPPDATA%\\ok-filemanager\\import (OziExplorer запоминает файл
+  трека, поэтому временные копии не удаляются).
+  Без DLL .map открывается запуском oziexp.exe в новом окне (карта
+  грузится и так), а .plt, .wpt, .gpx и .kml отдать в открытое окно
+  нечем — программа скажет об этом прямо, а не откроет пустое окно.
   Место загрузки выбирается: у OziExplorer 75 треков, и .plt грузится
   в выбранный номер — загрузка в занятый номер затирает прежний трек,
   поэтому по умолчанию спрашиваем номер и после загрузки предлагаем
@@ -4480,17 +4559,34 @@ class OziLoadDialog(QDialog):
     У OziExplorer 75 треков, и загрузка .plt в занятый номер затирает
     то, что в нём лежало, поэтому номер выбирается перед загрузкой.
     Для .wpt выбор другой: файл точек API умеет только заменять набор,
-    добавлять приходится по точке — предлагаем выбрать режим.
+    добавлять приходится по точке — предлагаем выбрать режим. В
+    .gpx/.kml бывает и то, и другое, поэтому про треки и точки
+    спрашиваем отдельными строками (``ask_track``/``ask_wpt``).
     """
 
     def __init__(self, parent, path, mode: str = 'track',
-                 track_num: int = 1, wpt_mode: str = OZI_WPT_DEFAULT_MODE):
+                 track_num: int = 1, wpt_mode: str = OZI_WPT_DEFAULT_MODE,
+                 content=None, ask_track: Optional[bool] = None,
+                 ask_wpt: Optional[bool] = None):
         super().__init__(parent)
         self.setWindowTitle('Загрузка в OziExplorer')
         self.mode = mode
         self.track_num = int(track_num)
         self.wpt_mode = wpt_mode
         self.remember = False
+
+        if ask_track is None or ask_wpt is None:
+            if mode == 'track':
+                ask_track, ask_wpt = True, False
+            elif mode == 'wp':
+                ask_track, ask_wpt = False, True
+            else:
+                # .gpx/.kml: спрашиваем только про то, что в файле есть.
+                ask_track = content is None or content.has_tracks
+                ask_wpt = content is None or content.has_waypoints
+        self.ask_track = bool(ask_track)
+        self.ask_wpt = bool(ask_wpt)
+        self.track_count = self._count_tracks(content)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -4500,14 +4596,23 @@ class OziLoadDialog(QDialog):
                        f'окно OziExplorer.')
         title.setWordWrap(True)
         layout.addWidget(title)
+        if mode == 'gpxkml' and content is not None:
+            loaded = [track for track in content.tracks if track.has_points()]
+            points_total = sum(track.count() for track in loaded)
+            what = QLabel(f'В файле: треков {len(loaded)} '
+                          f'({points_total} точек), '
+                          f'точек {len(content.waypoints)}.')
+            what.setObjectName('Dim')
+            what.setWordWrap(True)
+            layout.addWidget(what)
 
-        if mode == 'track':
+        if self.ask_track:
             self.track_num = min(max(int(track_num), 1), OZI_TRACK_MAX)
             row = QHBoxLayout()
             row.setSpacing(8)
             row.addWidget(QLabel('Номер трека:'))
             self.spin = QSpinBox()
-            self.spin.setRange(1, OZI_TRACK_MAX)
+            self.spin.setRange(1, self._max_track_start())
             self.spin.setValue(self.track_num)
             self.spin.setToolTip(
                 f'У OziExplorer {OZI_TRACK_MAX} треков. Загрузка в занятый '
@@ -4516,13 +4621,19 @@ class OziLoadDialog(QDialog):
             row.addStretch(1)
             layout.addLayout(row)
 
-            hint = QLabel('Если номер уже занят, лежавший в нём трек будет '
-                          'затёрт — выбирайте свободный. Показать треки '
-                          'можно в списке треков OziExplorer.')
+            hint_text = ('Если номер уже занят, лежавший в нём трек будет '
+                         'затёрт — выбирайте свободный. Показать треки '
+                         'можно в списке треков OziExplorer.')
+            if self.track_count > 1:
+                hint_text = (f'Треков в файле {self.track_count}: они лягут '
+                             f'в этот номер и следующие за ним.\n'
+                             + hint_text)
+            hint = QLabel(hint_text)
             hint.setObjectName('Dim')
             hint.setWordWrap(True)
             layout.addWidget(hint)
-        else:
+
+        if self.ask_wpt:
             self.append_rb = QRadioButton('Добавить к загруженным точкам')
             self.append_rb.setToolTip(
                 'Точки файла добавляются к тем, что уже загружены '
@@ -4557,12 +4668,23 @@ class OziLoadDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    @staticmethod
+    def _count_tracks(content) -> int:
+        """Сколько треков файла реально займут слоты."""
+        if content is None:
+            return 1
+        return max(len([t for t in content.tracks if t.has_points()]), 1)
+
+    def _max_track_start(self) -> int:
+        """Последний номер, с которого треки файла ещё помещаются."""
+        return max(OZI_TRACK_MAX - self.track_count + 1, 1)
+
     def _accept(self):
         """Забирает выбор из виджетов и закрывает диалог."""
         self.remember = bool(self.remember_cb.isChecked())
-        if self.mode == 'track':
+        if self.ask_track:
             self.track_num = int(self.spin.value())
-        else:
+        if self.ask_wpt:
             self.wpt_mode = ('append' if self.append_rb.isChecked()
                              else 'replace')
         self.accept()

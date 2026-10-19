@@ -20,6 +20,7 @@ import allure
 import pytest
 
 from ok_helper import gui
+from ok_helper.gpxkml import Content, Track, TrackPoint
 from ok_helper.gui import (
     HelpDialog,
     MoveDialog,
@@ -28,6 +29,7 @@ from ok_helper.gui import (
     RenameDialog,
     SettingsDialog,
 )
+from ok_helper.wpt import Waypoint
 
 
 pytestmark = [
@@ -976,6 +978,109 @@ class TestOziLoadDialog:
         dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track')
 
         assert not hasattr(dlg, 'append_rb')
+
+
+def gpx_content(tracks=1, points=0) -> Content:
+    """Что «нашлось» в .gpx/.kml для диалога."""
+    return Content(
+        tracks=[Track(segments=[[TrackPoint(lat=60.5 + i / 1000,
+                                            lon=60.1 + i / 1000)
+                                 for i in range(3)]])
+                for _ in range(tracks)],
+        waypoints=[Waypoint(name=f'A{i}', lat=57.4 + i / 100, lon=60.9)
+                   for i in range(points)],
+    )
+
+
+@pytest.mark.story('Диалог загрузки .gpx/.kml')
+class TestOziLoadDialogGpxKml:
+    """OziLoadDialog для .gpx/.kml: и треки, и точки в одном файле.
+
+    Про треки спрашиваем, только если треки в файле есть, про точки —
+    только если есть точки: спрашивать про то, чего нет, незачем.
+    """
+
+    def test_tracks_and_points_show_both_rows(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.gpx', 'gpxkml',
+                            content=gpx_content(tracks=2, points=3))
+
+        assert dlg.ask_track is True
+        assert dlg.ask_wpt is True
+        assert hasattr(dlg, 'spin')
+        assert hasattr(dlg, 'append_rb')
+
+    def test_only_tracks_hides_point_rows(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.gpx', 'gpxkml',
+                            content=gpx_content(tracks=1))
+
+        assert dlg.ask_track is True
+        assert dlg.ask_wpt is False
+        assert not hasattr(dlg, 'append_rb')
+
+    def test_only_points_hides_track_row(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'points.kml', 'gpxkml',
+                            content=gpx_content(tracks=0, points=2))
+
+        assert dlg.ask_track is False
+        assert dlg.ask_wpt is True
+        assert not hasattr(dlg, 'spin')
+
+    def test_empty_content_hides_everything(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'пусто.gpx', 'gpxkml',
+                            content=Content())
+
+        assert dlg.ask_track is False
+        assert dlg.ask_wpt is False
+
+    def test_summary_tells_what_is_in_file(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.gpx', 'gpxkml',
+                            content=gpx_content(tracks=1, points=4))
+        texts = [label.text() for label in dlg.findChildren(gui.QLabel)]
+
+        assert any('треков 1' in text and 'точек 4' in text
+                   for text in texts)
+
+    def test_track_count_limits_the_spin(self, qapp, tmp_path):
+        """Треки файла должны влезть в 75 слотов — это и ограничивает номер."""
+        dlg = OziLoadDialog(None, tmp_path / 'track.gpx', 'gpxkml',
+                            content=gpx_content(tracks=3))
+
+        assert dlg.track_count == 3
+        assert dlg.spin.maximum() == gui.OZI_TRACK_MAX - 2
+
+    def test_single_track_keeps_full_range(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.gpx', 'gpxkml',
+                            content=gpx_content(tracks=1))
+
+        assert dlg.spin.maximum() == gui.OZI_TRACK_MAX
+
+    def test_ask_flags_can_be_narrowed(self, qapp, tmp_path):
+        """Галочка «не спрашивать» снимает только свой вопрос."""
+        dlg = OziLoadDialog(None, tmp_path / 'track.gpx', 'gpxkml',
+                            content=gpx_content(tracks=1, points=1),
+                            ask_track=False, ask_wpt=True)
+
+        assert dlg.ask_track is False
+        assert dlg.ask_wpt is True
+        assert not hasattr(dlg, 'spin')
+
+    def test_accept_reads_both_choices(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.gpx', 'gpxkml',
+                            content=gpx_content(tracks=1, points=1))
+        dlg.spin.setValue(12)
+        dlg.replace_rb.setChecked(True)
+
+        dlg._accept()
+
+        assert dlg.track_num == 12
+        assert dlg.wpt_mode == 'replace'
+
+    def test_low_number_with_many_tracks(self, qapp, tmp_path):
+        """Номер подтягивается: 74 с тремя треками не поместились бы."""
+        dlg = OziLoadDialog(None, tmp_path / 'track.gpx', 'gpxkml',
+                            track_num=74, content=gpx_content(tracks=3))
+
+        assert dlg.spin.value() == 73
 
 
 @pytest.mark.story('Выбор пути в настройках')

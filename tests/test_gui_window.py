@@ -24,6 +24,8 @@ import pytest
 from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint
 
 from ok_helper import gui
+from ok_helper.gpxkml import Content, Track, TrackPoint
+from ok_helper.wpt import Waypoint
 
 
 pytestmark = [
@@ -31,6 +33,18 @@ pytestmark = [
     pytest.mark.epic('ok-filemanager'),
     pytest.mark.feature('Главное окно'),
 ]
+
+
+def gpx_content(tracks=1, points=0) -> Content:
+    """Что «нашлось» в .gpx/.kml (для проверок окна)."""
+    return Content(
+        tracks=[Track(segments=[[TrackPoint(lat=60.5 + i / 1000,
+                                            lon=60.1 + i / 1000)
+                                 for i in range(3)]])
+                for _ in range(tracks)],
+        waypoints=[Waypoint(name=f'A{i}', lat=57.4 + i / 100, lon=60.9)
+                   for i in range(points)],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -255,9 +269,13 @@ def stub_ozi_dialog(monkeypatch, accepted=True, track_num=None,
 
     class Stub:
         def __init__(self, parent, path, mode, track_num=1,
-                     wpt_mode='append'):
+                     wpt_mode='append', content=None, ask_track=None,
+                     ask_wpt=None):
             self.path = Path(path)
             self.mode = mode
+            self.content = content
+            self.ask_track = ask_track
+            self.ask_wpt = ask_wpt
             self.track_num = track_num
             self.wpt_mode = wpt_mode
             self.remember = False
@@ -2104,6 +2122,9 @@ class TestOziPositionChoice:
         monkeypatch.setattr(gui, 'api_plan',
                             lambda p, exe='', dll='':
                             seen.append((p, exe, dll)) or '')
+        # Проверяется только вызов api_plan; саму загрузку подменяем, иначе
+        # тест на машине с настоящей OziAPI.dll поднимал бы живой мост.
+        self.loads(monkeypatch)
         window.config['ozi_exe'] = r'C:\Ozi\oziexp.exe'
         window.config['ozi_api_dll'] = r'C:\Ozi\OziAPI.dll'
         select(window, files / 'track.plt')
@@ -2337,6 +2358,179 @@ class TestOziPositionChoice:
 
         assert calls[0][1]['track_num'] == 2
         assert '[НАСТР] Не сохранить конфиг' in log_text(window)
+
+
+@pytest.mark.story('Загрузка .gpx/.kml в OziExplorer')
+class TestOziGpxKml:
+    """.gpx/.kml: разбираем сами и грузим обычными файлами OziExplorer.
+
+    У OziAPI нет загрузчиков GPX/KML, поэтому файл разбирается в окне
+    (ok_helper.gpxkml), а в OziExplorer уходят обычные .plt/.wpt. Вопросы
+    про треки и точки задаются только по тому, что в файле есть.
+    """
+
+    @pytest.fixture(autouse=True)
+    def saved(self, monkeypatch):
+        rec = types.SimpleNamespace(calls=[])
+        monkeypatch.setattr(gui, 'save_config',
+                            lambda cfg: rec.calls.append(dict(cfg)))
+        return rec
+
+    def api(self, monkeypatch, plan=None):
+        plan = gui.OZI_PARSE_ACTION if plan is None else plan
+        monkeypatch.setattr(gui, 'api_plan', lambda *a, **kw: plan)
+
+    def parse(self, monkeypatch, content=None, error=None):
+        """Подмена разбора .gpx/.kml; возвращает список вызовов."""
+        calls = []
+
+        def fake(path):
+            calls.append(Path(path))
+            if error is not None:
+                raise gui.GpxKmlError(error)
+            return content
+
+        monkeypatch.setattr(gui, 'read_gpx_kml', fake)
+        return calls
+
+    def loads(self, monkeypatch, ok=True, msg='ок'):
+        calls = []
+
+        def fake(path, **kw):
+            calls.append((Path(path), kw))
+            return ok, msg
+
+        monkeypatch.setattr(gui, 'open_in_oziexplorer', fake)
+        return calls
+
+    @pytest.mark.smoke
+    def test_file_is_parsed_before_dialog(self, window, files, monkeypatch):
+        self.api(monkeypatch)
+        parsed = self.parse(monkeypatch, gpx_content(tracks=1, points=2))
+        dlg = stub_ozi_dialog(monkeypatch)
+        self.loads(monkeypatch)
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        assert parsed == [files / '2026-09-17_11-55_бабушка.gpx']
+        assert len(dlg) == 1
+        assert dlg[0].mode == gui.OZI_PARSE_ACTION
+        assert dlg[0].content.tracks and dlg[0].content.waypoints
+
+    def test_content_goes_to_the_loader(self, window, files, monkeypatch):
+        self.api(monkeypatch)
+        content = gpx_content(tracks=1)
+        self.parse(monkeypatch, content)
+        stub_ozi_dialog(monkeypatch, track_num=5)
+        calls = self.loads(monkeypatch)
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        assert calls[0][1]['content'] is content
+        assert calls[0][1]['track_num'] == 5
+
+    def test_all_tracks_of_file_bump_the_slot(self, window, files,
+                                              monkeypatch):
+        """Три трека — следующий файл ляжет через три слота."""
+        self.api(monkeypatch)
+        self.parse(monkeypatch, gpx_content(tracks=3))
+        stub_ozi_dialog(monkeypatch, track_num=5)
+        self.loads(monkeypatch)
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_track_num'] == 8
+
+    def test_points_only_does_not_ask_for_track(self, window, files,
+                                                monkeypatch):
+        self.api(monkeypatch)
+        self.parse(monkeypatch, gpx_content(tracks=0, points=2))
+        dlg = stub_ozi_dialog(monkeypatch)
+        self.loads(monkeypatch)
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        assert dlg[0].ask_track is False
+        assert dlg[0].ask_wpt is True
+
+    def test_ask_flags_are_passed_from_config(self, window, files,
+                                              monkeypatch):
+        self.api(monkeypatch)
+        self.parse(monkeypatch, gpx_content(tracks=1, points=1))
+        dlg = stub_ozi_dialog(monkeypatch)
+        self.loads(monkeypatch)
+        window.config['ozi_wpt_ask'] = False
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        assert dlg[0].ask_track is True
+        assert dlg[0].ask_wpt is False
+
+    def test_remember_clears_both_questions(self, window, files,
+                                            monkeypatch):
+        self.api(monkeypatch)
+        self.parse(monkeypatch, gpx_content(tracks=1, points=1))
+        stub_ozi_dialog(monkeypatch, remember=True, track_num=2,
+                        wpt_mode='replace')
+        self.loads(monkeypatch)
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_track_ask'] is False
+        assert window.config['ozi_wpt_ask'] is False
+
+    def test_parse_error_is_reported(self, window, files, monkeypatch):
+        self.api(monkeypatch)
+        self.parse(monkeypatch, error='битый файл: строка 5')
+        dlg = stub_ozi_dialog(monkeypatch)
+        calls = self.loads(monkeypatch)
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        assert dlg == []
+        assert calls == []
+        assert '[ОШБ] OZI' in log_text(window)
+        assert 'битый файл' in window.notice_label.text()
+
+    def test_unparsable_file_is_reported(self, window, files, monkeypatch):
+        """Настоящий разбор на файле, который не GPX."""
+        self.api(monkeypatch)
+        stub_ozi_dialog(monkeypatch)
+        calls = self.loads(monkeypatch)
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        assert calls == []
+        assert window.notice_label.text()
+
+    def test_progress_callback_is_passed(self, window, files, monkeypatch):
+        """Запуск OziExplorer занимает секунды — окно должно откликаться."""
+        self.api(monkeypatch)
+        self.parse(monkeypatch, gpx_content(tracks=1))
+        stub_ozi_dialog(monkeypatch)
+        calls = self.loads(monkeypatch)
+        select(window, files / '2026-09-17_11-55_бабушка.gpx')
+
+        window.on_open_in_ozi()
+
+        progress = calls[0][1]['progress']
+        assert callable(progress)
+        progress('Запускаем OziExplorer...')
+        assert '[OZI] Запускаем OziExplorer...' in log_text(window)
+
+    def test_progress_is_logged_once_per_message(self, window):
+        for _ in range(3):
+            window._ozi_progress('Ждём готовности...')
+
+        assert log_text(window).count('Ждём готовности...') == 1
 
 
 # ─────────────────────────────────────────────────────────────────

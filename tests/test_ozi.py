@@ -24,18 +24,26 @@ import allure
 import pytest
 
 from ok_helper import ozi
+from ok_helper.gpxkml import Content, Track, TrackPoint
 from ok_helper.wpt import Waypoint
 from ok_helper.ozi import (
     OZI_API_DOWNLOAD_URL,
     OZI_FILE_SUFFIXES,
+    OZI_PARSE_ACTION,
+    OZI_START_TIMEOUT,
     OZI_TRACK_MAX,
     OZI_WPT_DEFAULT_MODE,
     OZI_WPT_MODES,
     OziApiBridge,
+    _import_dir,
+    _import_path,
+    _track_name,
     api_plan,
+    clamp_track_num,
     extract_bundled_api,
     find_ozi_api,
     find_oziexplorer,
+    import_gpx_kml,
     open_in_oziexplorer,
 )
 
@@ -93,6 +101,21 @@ def make_zip(path: Path, members) -> Path:
         for name, data in members.items():
             zf.writestr(name, data)
     return path
+
+
+# Минимальный GPX для проверок .gpx-ветки: трек из двух точек и точка.
+GPX_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="test">
+  <wpt lat="57.483576" lon="60.990078"><name>A1</name></wpt>
+  <trk>
+    <name>Тестовый</name>
+    <trkseg>
+      <trkpt lat="60.581368" lon="60.154179"><ele>188.09</ele></trkpt>
+      <trkpt lat="60.581400" lon="60.154200"><ele>189.0</ele></trkpt>
+    </trkseg>
+  </trk>
+</gpx>
+"""
 
 
 @pytest.fixture(scope='module')
@@ -1023,16 +1046,27 @@ class TestGetBridge:
 class FakeBridge:
     """Подмена OziApiBridge для проверки логики open_in_oziexplorer."""
 
-    def __init__(self, ok=True, add_ok=True, add_counts=None):
+    def __init__(self, ok=True, add_ok=True, add_counts=None, running=True,
+                 fail_times=0, fail_loads=()):
         self.ok = ok
         self.add_ok = add_ok
         # (создано, не удалось); None — считать по числу точек
         self.add_counts = add_counts
+        # Ответ на oziFindOzi: False — «OziExplorer ещё не готов».
+        self.running = running
+        # Загрузки с этими номерами (с 1) не удаются: проверка повторов и
+        # того, что о частичном успехе сообщаем честно.
+        self.fail_loads = set(fail_loads) | set(range(1, fail_times + 1))
         self.loads = []
         self.added = []
 
+    def is_running(self):
+        return self.running
+
     def load(self, path, track_num=1):
         self.loads.append((Path(path), track_num))
+        if len(self.loads) in self.fail_loads:
+            return False
         return self.ok
 
     def add_waypoints(self, points):
@@ -1042,75 +1076,98 @@ class FakeBridge:
         return self.add_counts or (len(points), 0)
 
 
-@pytest.mark.story('open_in_oziexplorer')
-class TestOpenInOziExplorer:
-    def api_ready(self, monkeypatch, tmp_path, bridge=None, running=True,
-                  dll=None):
-        """«OziExplorer открыт и DLL на месте» + подмена моста."""
-        monkeypatch.setattr(ozi, 'find_oziexplorer',
-                            lambda cfg='': tmp_path / 'oziexp.exe')
+class OziWorld:
+    """Окружение OziExplorer для тестов: exe, DLL, процесс, мост, запуск.
+
+    ``running`` — запущен ли OziExplorer *до* вызова; Popen подменён так,
+    что после запуска exe процесс появляется (как в жизни).
+    """
+
+    def __init__(self, monkeypatch, tmp_path, bridge=None, dll=True,
+                 exe=True, running=True):
+        self.bridge = bridge
+        self.launched = []
+        self.exe = tmp_path / 'oziexp.exe' if exe else None
+        self.running = running
+        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': self.exe)
         monkeypatch.setattr(
             ozi, 'find_ozi_api',
-            lambda cfg='', exe=None: (tmp_path / 'OziAPI.dll' if dll is None
-                                      else dll))
-        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: running)
+            lambda cfg='', exe=None: (tmp_path / 'OziAPI.dll'
+                                      if dll else None))
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running',
+                            lambda: self.running)
         if bridge is not None:
             monkeypatch.setattr(ozi, 'get_bridge', lambda dll: bridge)
-        return bridge
+        monkeypatch.setattr(ozi.subprocess, 'Popen', self._popen)
+        # Проверки не должны ждать по-настоящему.
+        monkeypatch.setattr(ozi, '_OZI_POLL', 0.0)
 
+    def _popen(self, args):
+        self.launched.append(args)
+        self.running = True
+        return object()
+
+
+@pytest.mark.story('open_in_oziexplorer')
+class TestOpenInOziExplorer:
+    @pytest.mark.smoke
     def test_missing_file(self, tmp_path):
         ok, msg = open_in_oziexplorer(tmp_path / 'nope.gpx')
 
         assert ok is False
         assert 'не найден' in msg
 
-    def test_launch_exe(self, tmp_path, monkeypatch):
-        src = make_file(tmp_path / 'track.gpx')
-        exe = tmp_path / 'oziexp.exe'
-        launched = []
-        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: None)
-        monkeypatch.setattr(ozi.subprocess, 'Popen',
-                            lambda args: launched.append(args))
+    def test_map_launches_without_dll(self, tmp_path, monkeypatch):
+        """.map грузится и запуском exe — без DLL открываем в новом окне."""
+        src = make_file(tmp_path / 'map.map')
+        world = OziWorld(monkeypatch, tmp_path, dll=False)
 
         ok, msg = open_in_oziexplorer(src)
 
         assert ok is True
         assert 'открыто в OziExplorer' in msg
-        assert launched == [[str(exe), str(src)]]
+        assert world.launched == [[str(world.exe), str(src)]]
 
-    def test_exe_not_found(self, tmp_path, monkeypatch):
-        src = make_file(tmp_path / 'track.gpx')
-        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': None)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: None)
+    def test_map_launch_exe_not_found(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'map.map')
+        OziWorld(monkeypatch, tmp_path, dll=False, exe=False)
 
         ok, msg = open_in_oziexplorer(src)
 
         assert ok is False
         assert 'не найден' in msg
 
+    def test_exe_error_is_reported(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'map.map')
+        OziWorld(monkeypatch, tmp_path, dll=False)
+
+        def boom(args):
+            raise OSError('нет прав')
+
+        monkeypatch.setattr(ozi.subprocess, 'Popen', boom)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is False
+        assert 'не запустить' in msg
+
     def test_api_hit_skips_launch(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'points.wpt')
-        launched = []
         bridge = FakeBridge()
-        self.api_ready(monkeypatch, tmp_path, bridge)
-        monkeypatch.setattr(ozi.subprocess, 'Popen',
-                            lambda args: launched.append(args))
+        world = OziWorld(monkeypatch, tmp_path, bridge)
 
         ok, msg = open_in_oziexplorer(src, wpt_mode='replace')
 
         assert ok is True
         assert 'открытое окно' in msg
         assert bridge.loads == [(src, 1)]
-        assert launched == []
+        assert world.launched == []
 
     def test_wpt_append_adds_points(self, tmp_path, monkeypatch):
         src = tmp_path / 'points.wpt'
         src.write_bytes(WPT_SAMPLE)
         bridge = FakeBridge()
-        self.api_ready(monkeypatch, tmp_path, bridge)
+        OziWorld(monkeypatch, tmp_path, bridge)
 
         ok, msg = open_in_oziexplorer(src)
 
@@ -1125,7 +1182,7 @@ class TestOpenInOziExplorer:
         src = tmp_path / 'points.wpt'
         src.write_bytes(WPT_SAMPLE)
         bridge = FakeBridge()
-        self.api_ready(monkeypatch, tmp_path, bridge)
+        OziWorld(monkeypatch, tmp_path, bridge)
 
         open_in_oziexplorer(src)
 
@@ -1135,7 +1192,7 @@ class TestOpenInOziExplorer:
         src = tmp_path / 'points.wpt'
         src.write_bytes(WPT_SAMPLE)
         bridge = FakeBridge()
-        self.api_ready(monkeypatch, tmp_path, bridge)
+        OziWorld(monkeypatch, tmp_path, bridge)
 
         ok, msg = open_in_oziexplorer(src, wpt_mode='replace')
 
@@ -1146,7 +1203,7 @@ class TestOpenInOziExplorer:
     def test_wpt_append_without_points_fails(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'empty.wpt')
         bridge = FakeBridge()
-        self.api_ready(monkeypatch, tmp_path, bridge)
+        OziWorld(monkeypatch, tmp_path, bridge)
 
         ok, msg = open_in_oziexplorer(src)
 
@@ -1158,7 +1215,7 @@ class TestOpenInOziExplorer:
         src = tmp_path / 'points.wpt'
         src.write_bytes(WPT_SAMPLE)
         bridge = FakeBridge(add_ok=False)
-        self.api_ready(monkeypatch, tmp_path, bridge)
+        OziWorld(monkeypatch, tmp_path, bridge)
 
         ok, msg = open_in_oziexplorer(src)
 
@@ -1170,7 +1227,7 @@ class TestOpenInOziExplorer:
         src = tmp_path / 'points.wpt'
         src.write_bytes(WPT_SAMPLE)
         bridge = FakeBridge(add_counts=(2, 1))
-        self.api_ready(monkeypatch, tmp_path, bridge)
+        OziWorld(monkeypatch, tmp_path, bridge)
 
         ok, msg = open_in_oziexplorer(src)
 
@@ -1181,7 +1238,7 @@ class TestOpenInOziExplorer:
     def test_track_number_is_passed(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'track.plt')
         bridge = FakeBridge()
-        self.api_ready(monkeypatch, tmp_path, bridge)
+        OziWorld(monkeypatch, tmp_path, bridge)
 
         ok, _ = open_in_oziexplorer(src, track_num=7)
 
@@ -1191,108 +1248,389 @@ class TestOpenInOziExplorer:
     def test_map_loads_ignores_track_number(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'map.map')
         bridge = FakeBridge()
-        self.api_ready(monkeypatch, tmp_path, bridge)
+        OziWorld(monkeypatch, tmp_path, bridge)
 
         ok, _ = open_in_oziexplorer(src, track_num=7)
 
         assert ok is True
         assert bridge.loads == [(src, 7)]
 
-    def test_api_miss_falls_back_to_launch(self, tmp_path, monkeypatch):
-        src = make_file(tmp_path / 'points.wpt')
-        exe = tmp_path / 'oziexp.exe'
-        launched = []
-        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
-        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
-        monkeypatch.setattr(ozi, 'get_bridge',
-                            lambda dll: FakeBridge(ok=False))
-        monkeypatch.setattr(ozi.subprocess, 'Popen',
-                            lambda args: launched.append(args))
+    def test_api_miss_for_map_falls_back_to_launch(self, tmp_path,
+                                                   monkeypatch):
+        """Карту не оставляем пользователю неоткрытой из-за сбоя API."""
+        src = make_file(tmp_path / 'map.map')
+        world = OziWorld(monkeypatch, tmp_path, FakeBridge(ok=False))
 
-        ok, msg = open_in_oziexplorer(src, wpt_mode='replace')
+        ok, msg = open_in_oziexplorer(src)
 
         assert ok is True
-        assert launched == [[str(exe), str(src)]]
+        assert world.launched == [[str(world.exe), str(src)]]
 
-    def test_not_running_launches(self, tmp_path, monkeypatch):
-        """OziExplorer не запущен — мост даже не поднимается."""
-        src = make_file(tmp_path / 'points.wpt')
-        exe = tmp_path / 'oziexp.exe'
-        launched = []
-
-        def no_bridge(dll):
-            raise AssertionError('мост не нужен, OziExplorer не запущен')
-
-        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
-        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: False)
-        monkeypatch.setattr(ozi, 'get_bridge', no_bridge)
-        monkeypatch.setattr(ozi.subprocess, 'Popen',
-                            lambda args: launched.append(args))
-
-        ok, _ = open_in_oziexplorer(src)
-
-        assert ok is True
-        assert launched == [[str(exe), str(src)]]
-
-    def test_no_dll_launches(self, tmp_path, monkeypatch):
-        src = make_file(tmp_path / 'points.wpt')
-        exe = tmp_path / 'oziexp.exe'
-        launched = []
-        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: None)
-        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
-        monkeypatch.setattr(ozi.subprocess, 'Popen',
-                            lambda args: launched.append(args))
-
-        ok, _ = open_in_oziexplorer(src)
-
-        assert ok is True
-        assert launched == [[str(exe), str(src)]]
-
-    def test_gpx_always_launches(self, tmp_path, monkeypatch):
-        """Для .gpx загрузчика в API нет — только запуск exe."""
-        src = make_file(tmp_path / 'track.gpx')
-        exe = tmp_path / 'oziexp.exe'
-        launched = []
-        monkeypatch.setattr(ozi, 'find_oziexplorer', lambda cfg='': exe)
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
-        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
-        monkeypatch.setattr(ozi, 'get_bridge',
-                            lambda dll: pytest.fail('API для .gpx не нужен'))
-        monkeypatch.setattr(ozi.subprocess, 'Popen',
-                            lambda args: launched.append(args))
-
-        ok, _ = open_in_oziexplorer(src)
-
-        assert ok is True
-        assert launched == [[str(exe), str(src)]]
-
-    def test_popen_error_reported(self, tmp_path, monkeypatch):
-        src = make_file(tmp_path / 'track.gpx')
-        monkeypatch.setattr(ozi, 'find_oziexplorer',
-                            lambda cfg='': tmp_path / 'oziexp.exe')
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: None)
-
-        def boom(args):
-            raise OSError('нет прав')
-
-        monkeypatch.setattr(ozi.subprocess, 'Popen', boom)
+    def test_api_miss_for_track_reports_error(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'track.plt')
+        world = OziWorld(monkeypatch, tmp_path, FakeBridge(ok=False))
 
         ok, msg = open_in_oziexplorer(src)
 
         assert ok is False
-        assert 'не запустить' in msg
+        assert 'не принял файл' in msg
+        assert world.launched == []
+
+    @pytest.mark.smoke
+    def test_not_running_starts_oziexplorer(self, tmp_path, monkeypatch):
+        """OziExplorer не запущен — запускаем сами и грузим через API."""
+        src = make_file(tmp_path / 'track.plt')
+        bridge = FakeBridge()
+        world = OziWorld(monkeypatch, tmp_path, bridge, running=False)
+
+        ok, _ = open_in_oziexplorer(src, track_num=3)
+
+        assert ok is True
+        # exe запускается без файла: файл грузит API, а не командная строка.
+        assert world.launched == [[str(world.exe)]]
+        assert bridge.loads == [(src, 3)]
+
+    def test_started_oziexplorer_retries_load(self, tmp_path, monkeypatch):
+        """Сразу после запуска загрузка может не пройти — повторяем."""
+        src = make_file(tmp_path / 'track.plt')
+        bridge = FakeBridge(fail_times=2)
+        OziWorld(monkeypatch, tmp_path, bridge, running=False)
+
+        ok, _ = open_in_oziexplorer(src, track_num=3)
+
+        assert ok is True
+        assert len(bridge.loads) == 3
+
+    def test_start_timeout_is_reported(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'track.plt')
+        bridge = FakeBridge(running=False)
+        OziWorld(monkeypatch, tmp_path, bridge, running=False)
+        monkeypatch.setattr(ozi, 'OZI_START_TIMEOUT', 0.01)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is False
+        assert 'не ответил' in msg
+        assert bridge.loads == []
+
+    def test_start_without_exe_is_reported(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'track.plt')
+        bridge = FakeBridge(running=False)
+        OziWorld(monkeypatch, tmp_path, bridge, running=False, exe=False)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is False
+        assert 'oziexp.exe' in msg
+        assert bridge.loads == []
+
+    def test_progress_reports_start(self, tmp_path, monkeypatch):
+        """Пока запускается OziExplorer, программа показывает, что ждёт."""
+        src = make_file(tmp_path / 'track.plt')
+        bridge = FakeBridge()
+        OziWorld(monkeypatch, tmp_path, bridge, running=False)
+        seen = []
+
+        open_in_oziexplorer(src, progress=seen.append)
+
+        assert any('Запускаем' in text for text in seen)
+
+    @pytest.mark.parametrize('name', ['track.plt', 'points.wpt',
+                                      'track.gpx', 'track.kml'])
+    def test_without_dll_is_honest(self, tmp_path, monkeypatch, name):
+        """.plt/.wpt/.gpx/.kml без DLL в открытое окно не отдать."""
+        src = make_file(tmp_path / name)
+        world = OziWorld(monkeypatch, tmp_path, dll=False)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is False
+        assert 'OziAPI.dll' in msg
+        assert world.launched == []
+
+    def test_gpx_goes_through_api(self, tmp_path, monkeypatch):
+        """.gpx разбираем сами и грузим обычным .plt (см. gpxkml)."""
+        src = make_file(tmp_path / 'track.gpx', GPX_SAMPLE)
+        bridge = FakeBridge()
+        OziWorld(monkeypatch, tmp_path, bridge)
+
+        ok, msg = open_in_oziexplorer(src, track_num=5)
+
+        assert ok is True
+        assert bridge.loads == [(_import_path(src, '.plt'), 5)]
+        assert 'треки: слот 5' in msg
+        assert 'точки: добавлено 1' in msg
+        written = _import_path(src, '.plt').read_text(encoding='cp1251')
+        assert 'track' in written.splitlines()[4]
+
+    def test_kml_goes_through_api(self, tmp_path, monkeypatch):
+        src = make_file(
+            tmp_path / 'points.kml',
+            '<?xml version="1.0" encoding="UTF-8"?><kml><Document>'
+            '<Placemark><name>A1</name><Point><coordinates>60.99,57.48'
+            '</coordinates></Point></Placemark></Document></kml>')
+        bridge = FakeBridge()
+        OziWorld(monkeypatch, tmp_path, bridge)
+
+        ok, msg = open_in_oziexplorer(src, wpt_mode='replace')
+
+        assert ok is True
+        assert bridge.loads == [(_import_path(src, '.wpt'), 1)]
+        assert 'точки: заменены (1)' in msg
+
+    def test_gpx_unparsable_is_reported(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'track.gpx', '<gpx><мусор>')
+        bridge = FakeBridge()
+        OziWorld(monkeypatch, tmp_path, bridge)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is False
+        assert bridge.loads == []
+        assert tmp_path.name not in msg        # никаких путей наружу
+
+
+# ─────────────────────────────────────────────────────────────────
+# 7. import_gpx_kml: треки и точки из .gpx/.kml
+# ─────────────────────────────────────────────────────────────────
+
+def one_track(name='Тестовый', points=2) -> Track:
+    return Track(name=name, segments=[[
+        TrackPoint(lat=60.5 + index / 1000, lon=60.1 + index / 1000,
+                   altitude_m=188.09 + index)
+        for index in range(points)
+    ]])
+
+
+def one_point(name='A1') -> Waypoint:
+    return Waypoint(name=name, lat=57.483576, lon=60.990078)
+
+
+@pytest.mark.story('import_gpx_kml')
+class TestImportGpxKml:
+    def test_track_is_written_and_loaded(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+        bridge = FakeBridge()
+
+        ok, msg = import_gpx_kml(src, bridge, track_num=5,
+                                 content=Content(tracks=[one_track()]))
+
+        assert ok is True
+        target = _import_path(src, '.plt')
+        assert bridge.loads == [(target, 5)]
+        lines = target.read_text(encoding='cp1251').splitlines()
+        assert lines[0] == 'OziExplorer Track Point File Version 2.1'
+        assert 'track' in lines[4]
+        assert lines[5] == '2'
+        assert 'треки: слот 5 (2 точек)' in msg
+
+    def test_two_tracks_take_two_slots(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+        bridge = FakeBridge()
+        content = Content(tracks=[one_track('Первый'), one_track('Второй')])
+
+        ok, msg = import_gpx_kml(src, bridge, track_num=5, content=content)
+
+        assert ok is True
+        assert bridge.loads == [
+            (_import_path(src, '.plt', 1), 5),
+            (_import_path(src, '.plt', 2), 6),
+        ]
+        assert 'треки: слоты 5..6' in msg
+        assert ' 1' in _import_path(src, '.plt', 1).read_text(
+            encoding='cp1251').splitlines()[4]
+
+    def test_points_replace_writes_wpt(self, tmp_path):
+        src = make_file(tmp_path / 'points.kml')
+        bridge = FakeBridge()
+
+        ok, msg = import_gpx_kml(src, bridge, wpt_mode='replace',
+                                 content=Content(waypoints=[one_point()]))
+
+        assert ok is True
+        target = _import_path(src, '.wpt')
+        assert bridge.loads == [(target, 1)]
+        lines = target.read_text(encoding='cp1251').splitlines()
+        assert lines[0] == 'OziExplorer Waypoint File Version 1.1'
+        assert lines[4].startswith('1,A1,')
+        assert 'точки: заменены (1)' in msg
+
+    def test_points_append_creates_them(self, tmp_path):
+        src = make_file(tmp_path / 'points.kml')
+        bridge = FakeBridge()
+
+        ok, msg = import_gpx_kml(src, bridge, wpt_mode='append',
+                                 content=Content(waypoints=[one_point()]))
+
+        assert ok is True
+        assert len(bridge.added) == 1
+        assert bridge.loads == []
+        assert 'точки: добавлено 1' in msg
+
+    def test_tracks_and_points_together(self, tmp_path):
+        src = make_file(tmp_path / 'both.kml')
+        bridge = FakeBridge()
+        content = Content(tracks=[one_track()], waypoints=[one_point()])
+
+        ok, msg = import_gpx_kml(src, bridge, track_num=2,
+                                 wpt_mode='replace', content=content)
+
+        assert ok is True
+        assert bridge.loads == [(_import_path(src, '.plt'), 2),
+                                (_import_path(src, '.wpt'), 1)]
+        assert 'треки: слот 2' in msg
+        assert 'точки: заменены (1)' in msg
+
+    def test_slot_overflow_is_reported(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+        bridge = FakeBridge()
+        content = Content(tracks=[one_track(), one_track(), one_track()])
+
+        ok, msg = import_gpx_kml(src, bridge, track_num=OZI_TRACK_MAX,
+                                 content=content)
+
+        assert ok is False
+        assert 'не помещаются' in msg
+        assert bridge.loads == []
+
+    def test_last_slots_still_fit(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+        bridge = FakeBridge()
+        content = Content(tracks=[one_track(), one_track()])
+
+        ok, _ = import_gpx_kml(src, bridge,
+                               track_num=OZI_TRACK_MAX - 1, content=content)
+
+        assert ok is True
+        assert [num for _, num in bridge.loads] == [
+            OZI_TRACK_MAX - 1, OZI_TRACK_MAX]
+
+    def test_empty_content_is_reported(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+        bridge = FakeBridge()
+
+        ok, msg = import_gpx_kml(src, bridge, content=Content())
+
+        assert ok is False
+        assert 'нет ни треков, ни точек' in msg
+
+    def test_file_is_parsed_when_content_is_missing(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx', GPX_SAMPLE)
+        bridge = FakeBridge()
+
+        ok, _ = import_gpx_kml(src, bridge, track_num=4)
+
+        assert ok is True
+        assert bridge.loads[0][1] == 4
+
+    def test_unparsable_file_is_reported(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx', 'не xml')
+
+        ok, msg = import_gpx_kml(src, FakeBridge())
+
+        assert ok is False
+        assert 'track.gpx' in msg
+
+    def test_partial_failure_lists_what_loaded(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+        bridge = FakeBridge(fail_loads=(2,))
+        content = Content(tracks=[one_track(), one_track()])
+
+        ok, msg = import_gpx_kml(src, bridge, track_num=5, content=content)
+
+        assert ok is False
+        assert 'трек не лёг в слот 6' in msg
+        assert 'успело загрузиться' in msg
+        assert 'слот 5' in msg
+
+    def test_load_retries_when_asked(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+        bridge = FakeBridge(fail_times=1)
+
+        ok, _ = import_gpx_kml(src, bridge, track_num=5, retry=True,
+                               content=Content(tracks=[one_track()]))
+
+        assert ok is True
+        assert len(bridge.loads) == 2
+
+    def test_no_retry_by_default(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+        bridge = FakeBridge(fail_times=1)
+
+        ok, _ = import_gpx_kml(src, bridge, track_num=5,
+                               content=Content(tracks=[one_track()]))
+
+        assert ok is False
+        assert len(bridge.loads) == 1
+
+
+# ─────────────────────────────────────────────────────────────────
+# 8. Копии файлов и имена треков
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Копии файлов для OziExplorer')
+class TestImportPaths:
+    def test_import_dir_is_inside_program_cache(self):
+        assert _import_dir() == ozi._api_cache_dir() / 'import'
+        assert _import_dir().is_dir()
+
+    def test_same_file_gives_same_copy(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+
+        assert _import_path(src, '.plt') == _import_path(src, '.plt')
+
+    def test_different_files_do_not_collide(self, tmp_path):
+        """Одноимённые файлы из разных папок не затирают копии друг друга."""
+        first = make_file(tmp_path / 'a' / 'track.gpx')
+        second = make_file(tmp_path / 'b' / 'track.gpx')
+
+        assert _import_path(first, '.plt') != _import_path(second, '.plt')
+
+    def test_suffix_and_index(self, tmp_path):
+        src = make_file(tmp_path / 'track.gpx')
+
+        assert _import_path(src, '.wpt').suffix == '.wpt'
+        assert _import_path(src, '.plt', 2).stem.endswith('_2')
+
+    def test_track_name_for_single_track(self, tmp_path):
+        src = tmp_path / '20251016_Copter01.gpx'
+
+        assert _track_name(src, 0, 1) == '20251016_Copter01'
+
+    def test_track_name_for_several_tracks(self, tmp_path):
+        src = tmp_path / '20260813_Avtonom03.kml'
+
+        assert _track_name(src, 0, 3) == '20260813_Avtonom03 1'
+        assert _track_name(src, 2, 3) == '20260813_Avtonom03 3'
+
+
+@pytest.mark.story('clamp_track_num')
+class TestClampTrackNum:
+    def test_inside_range(self):
+        assert clamp_track_num(7) == 7
+
+    def test_low_is_one(self):
+        assert clamp_track_num(0) == 1
+        assert clamp_track_num(-5) == 1
+
+    def test_high_is_max(self):
+        assert clamp_track_num(OZI_TRACK_MAX + 10) == OZI_TRACK_MAX
+
+    def test_garbage_is_one(self):
+        assert clamp_track_num(None) == 1
+        assert clamp_track_num('abc') == 1
+
+    def test_string_number(self):
+        assert clamp_track_num('12') == 12
+
+
+def test_start_timeout_is_generous():
+    """Замер на живом OziExplorer: готовность ~9 с, запас больше."""
+    assert OZI_START_TIMEOUT >= 30.0
 
 
 def test_supported_suffixes():
-    assert OZI_FILE_SUFFIXES == {'.gpx', '.plt', '.wpt', '.map'}
+    assert OZI_FILE_SUFFIXES == {'.gpx', '.kml', '.plt', '.wpt', '.map'}
 
 
 def test_track_and_wpt_mode_constants():
@@ -1326,10 +1664,20 @@ class TestApiPlan:
 
         assert api_plan(tmp_path / 'map.map') == 'map'
 
-    def test_gpx_has_no_api_action(self, tmp_path, monkeypatch):
+    def test_gpx_is_parsed_by_us(self, tmp_path, monkeypatch):
         self.ready(monkeypatch, tmp_path)
 
-        assert api_plan(tmp_path / 'track.gpx') == ''
+        assert api_plan(tmp_path / 'track.gpx') == OZI_PARSE_ACTION
+
+    def test_kml_is_parsed_by_us(self, tmp_path, monkeypatch):
+        self.ready(monkeypatch, tmp_path)
+
+        assert api_plan(tmp_path / 'track.kml') == OZI_PARSE_ACTION
+
+    def test_unknown_suffix(self, tmp_path, monkeypatch):
+        self.ready(monkeypatch, tmp_path)
+
+        assert api_plan(tmp_path / 'track.txt') == ''
 
     def test_without_dll(self, tmp_path, monkeypatch):
         self.ready(monkeypatch, tmp_path, dll=False)
@@ -1337,6 +1685,7 @@ class TestApiPlan:
         assert api_plan(tmp_path / 'track.plt') == ''
 
     def test_without_running_oziexplorer(self, tmp_path, monkeypatch):
+        """OziExplorer не запущен, но его можно запустить — место спросим."""
         self.ready(monkeypatch, tmp_path, running=False)
 
-        assert api_plan(tmp_path / 'track.plt') == ''
+        assert api_plan(tmp_path / 'track.plt') == 'track'

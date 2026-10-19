@@ -13,9 +13,14 @@ OziExplorer многовконный: ``oziexp.exe <файл>`` всегда п�
 
 Алгоритм:
 
-1. OziExplorer запущен и найдена OziAPI.dll — файл грузится в текущее
-   окно (``oziLoadWPfile``, ``oziLoadTrackFile``, ``oziLoadMap``);
-2. иначе — запуск ``oziexp.exe`` с файлом (откроется новое окно).
+1. найдена OziAPI.dll — файл грузится в текущее окно
+   (``oziLoadWPfile``, ``oziLoadTrackFile``, ``oziLoadMap``); если
+   OziExplorer ещё не запущен, запускаем его сами и ждём, пока API
+   начнёт отвечать (проверено: окно готово к командам не сразу, а
+   секунд через восемь после старта — до этого загрузка не проходит);
+2. DLL нет: ``.map`` открывается запуском ``oziexp.exe`` (карта
+   грузится и так), а ``.plt``/``.wpt``/``.gpx``/``.kml`` отдать в
+   открытое окно нечем — говорим об этом прямо.
 
 DLL ищется как готовый файл (заданный путь, папка нашей программы,
 распакованная копия, папка ``oziexp.exe``). Комплектный архив
@@ -24,8 +29,10 @@ DLL ищется как готовый файл (заданный путь, па
 (``extract_bundled_api``), пока её не нажали — DLL считается недоступной.
 
 Формат файла определяет действие: ``.wpt`` — набор точек, ``.plt`` —
-трек, ``.map`` — карта. Для ``.gpx`` загрузчика в API нет, поэтому такой
-файл всегда открывается запуском exe.
+трек, ``.map`` — карта. У GPX и KML своих загрузчиков в API нет (а
+``oziLoadTrackFile`` на такой файл отвечает модальным «Invalid numeric
+input.»), поэтому ``.gpx``/``.kml`` разбираем сами (:mod:`ok_helper.gpxkml`)
+и отдаём OziExplorer обычными ``.plt``/``.wpt``.
 
 Место загрузки выбирается: у OziExplorer 75 треков, и ``.plt`` грузится
 в указанный номер (``oziLoadTrackFile``), иначе каждый следующий трек
@@ -36,6 +43,7 @@ DLL ищется как готовый файл (заданный путь, па
 
 import atexit
 import ctypes
+import hashlib
 import json
 import os
 import queue
@@ -50,11 +58,13 @@ import zipfile
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
+from ok_helper.gpxkml import (Content, GpxKmlError, read_gpx_kml, write_plt,
+                              write_wpt)
 from ok_helper.wpt import read_wpt
 
 
 # Форматы, которые имеет смысл открывать в OziExplorer.
-OZI_FILE_SUFFIXES = {'.gpx', '.plt', '.wpt', '.map'}
+OZI_FILE_SUFFIXES = {'.gpx', '.kml', '.plt', '.wpt', '.map'}
 
 # Страница загрузки OziAPI.dll (DLL не входит в комплект OziExplorer).
 OZI_API_DOWNLOAD_URL = 'https://www.oziexplorer4.com/oziapi/oziapi.html'
@@ -65,8 +75,22 @@ OZI_PROCESS_NAMES = ('oziexp.exe', 'oziexplorer.exe')
 # Что умеет грузить API: расширение -> действие моста.
 _API_ACTIONS = {'.wpt': 'wp', '.plt': 'track', '.map': 'map'}
 
+# Что API не умеет: такие файлы разбираем сами (ok_helper.gpxkml) и
+# отдаём OziExplorer уже обычными .plt/.wpt.
+OZI_PARSE_ACTION = 'gpxkml'
+_PARSE_ACTIONS = {'.gpx': OZI_PARSE_ACTION, '.kml': OZI_PARSE_ACTION}
+
 # Сколько треков (и наборов точек) у OziExplorer.
 OZI_TRACK_MAX = 75
+
+# Сколько ждать готовности запущенного OziExplorer, секунд. Замер на
+# живом OziExplorer 3.95: оболочка появляется сразу, API отвечает
+# «нашёл» секунды через семь, а команды начинают проходить секунд через
+# восемь-девять; запас взят с большим избытком.
+OZI_START_TIMEOUT = 60.0
+
+# Шаг ожидания при запуске и повторах загрузки, секунд.
+_OZI_POLL = 0.5
 
 # Что делать с уже загруженными точками при загрузке .wpt:
 # 'append' — добавить к ним (по одной через oziCreateWPex),
@@ -647,74 +671,316 @@ def _launch(exe_path: Optional[Path], path: Path) -> Tuple[bool, str]:
     return True, f'открыто в OziExplorer: {path.name}'
 
 
-def _api_ready(path, exe: str = '', dll: str = ''):
-    """(действие API, путь к DLL), если файл пойдёт через API.
+def clamp_track_num(value) -> int:
+    """Номер трека в допустимых границах (1..75)."""
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        num = 1
+    return min(max(num, 1), OZI_TRACK_MAX)
 
-    Пусто — файл будет открыт запуском ``oziexp.exe`` (новое окно): нет
-    DLL, OziExplorer не запущен или формат API не поддерживает.
+
+def _api_action(path) -> str:
+    """Действие для файла: ``track``/``wp``/``map``/``gpxkml``.
+
+    Пустая строка — через API такой файл в открытое окно не отдать.
     """
-    action = _API_ACTIONS.get(Path(path).suffix.lower())
-    if action is None:
-        return '', None
-    exe_path = find_oziexplorer(exe)
-    dll_path = find_ozi_api(dll, exe_path)
-    if dll_path is None or not is_oziexplorer_running():
-        return '', None
-    return action, dll_path
+    suffix = Path(path).suffix.lower()
+    if suffix in _API_ACTIONS:
+        return _API_ACTIONS[suffix]
+    return _PARSE_ACTIONS.get(suffix, '')
 
 
 def api_plan(path, exe: str = '', dll: str = '') -> str:
-    """Каким действием API откроется файл: ``wp`` / ``track`` / ``map``.
+    """Каким действием файл попадёт в уже открытое окно OziExplorer.
 
-    Пустая строка — файл откроется запуском ``oziexp.exe`` в новом окне.
-    Нужна до вызова :func:`open_in_oziexplorer`, чтобы спросить у
-    пользователя место загрузки только тогда, когда оно вообще есть.
+    ``track`` — обычный ``.plt`` (важен номер трека), ``wp`` — ``.wpt``
+    (важен режим точек), ``map`` — карта, ``gpxkml`` — ``.gpx``/``.kml``,
+    которые разбираем сами (:mod:`ok_helper.gpxkml`).
+
+    Пустая строка — либо для формата такого действия нет (``.map`` при
+    этом всё равно откроется запуском ``oziexp.exe``), либо не нашлась
+    ``OziAPI.dll``: без неё файл в открытое окно не отдать, и спрашивать
+    место загрузки незачем. Нужна до :func:`open_in_oziexplorer`, чтобы
+    спрашивать место только тогда, когда оно вообще есть.
     """
-    return _api_ready(path, exe, dll)[0]
+    action = _api_action(path)
+    if not action:
+        return ''
+    if find_ozi_api(dll, find_oziexplorer(exe)) is None:
+        return ''
+    return action
+
+
+def _wait_api(bridge: OziApiBridge, timeout: float, progress=None) -> bool:
+    """Ждёт, пока запущенный OziExplorer начнёт отвечать API."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if bridge.is_running():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if progress is not None:
+            progress('Ждём, пока OziExplorer начнёт отвечать...')
+        time.sleep(_OZI_POLL)
+
+
+def _prepare_oziexplorer(exe_path: Optional[Path], dll_path,
+                         progress=None
+                         ) -> Tuple[Optional[OziApiBridge], bool, str]:
+    """Мост к открытому OziExplorer; нет окна — запускаем и ждём.
+
+    Возвращает (мост, только что запустили OziExplorer, сообщение об
+    ошибке). Мост равен None, если поднять API не удалось.
+    """
+    started = False
+    if not is_oziexplorer_running():
+        if exe_path is None:
+            return None, False, ('OziExplorer не запущен, а найти oziexp.exe '
+                                 'не удалось. Укажите путь в настройках '
+                                 '(F10 → OziExplorer).')
+        try:
+            subprocess.Popen([str(exe_path)])
+        except OSError as e:
+            return None, False, f'не запустить OziExplorer: {e}'
+        started = True
+        if progress is not None:
+            progress(f'Запускаем OziExplorer ({exe_path.name})...')
+
+    bridge = get_bridge(dll_path)
+    if bridge is None:
+        return None, started, ('не удалось поднять OziAPI.dll: нужен '
+                               '32-битный PowerShell из Windows и сама DLL')
+    if started and not _wait_api(bridge, OZI_START_TIMEOUT, progress):
+        return None, started, (f'OziExplorer не ответил за '
+                               f'{int(OZI_START_TIMEOUT)} с, файл не '
+                               f'загружен')
+    return bridge, started, ''
+
+
+def _load_file(bridge: OziApiBridge, path, track_num: int,
+               retry: bool = False, progress=None) -> bool:
+    """Грузит файл в открытое окно, при необходимости повторяя попытки.
+
+    Повторы нужны сразу после запуска OziExplorer: ``oziFindOzi``
+    отвечает «нашёл» уже в первые секунды, но команды ещё не проходят —
+    OziExplorer восстанавливает своё состояние. Неудачная попытка ничего
+    не портит: файл просто не грузится.
+    """
+    deadline = time.monotonic() + (OZI_START_TIMEOUT if retry else 0.0)
+    while True:
+        if bridge.load(path, track_num):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if progress is not None:
+            progress('OziExplorer ещё не готов, повторяем загрузку...')
+        time.sleep(_OZI_POLL)
+
+
+def _add_points(bridge: OziApiBridge, points, retry: bool = False,
+                progress=None) -> Optional[Tuple[int, int]]:
+    """Добавляет точки. (создано, не удалось) или None при отказе."""
+    deadline = time.monotonic() + (OZI_START_TIMEOUT if retry else 0.0)
+    while True:
+        added = bridge.add_waypoints(points)
+        if added is not None:
+            return added
+        if time.monotonic() >= deadline:
+            return None
+        if progress is not None:
+            progress('OziExplorer ещё не готов, повторяем...')
+        time.sleep(_OZI_POLL)
+
+
+def _import_dir() -> Path:
+    """Каталог, куда пишем ``.plt``/``.wpt`` для загрузки в OziExplorer.
+
+    Файлы не удаляем: OziExplorer запоминает имя файла трека (и при
+    следующем запуске восстанавливает трек из него), поэтому удалённый
+    файл оставил бы трек «битым».
+    """
+    d = _api_cache_dir() / 'import'
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:  # pragma: no cover - сбой файловой системы
+        return Path(tempfile.gettempdir())
+    return d
+
+
+def _import_path(path: Path, suffix: str, index: int = 0) -> Path:
+    """Имя файла для загрузки: имя исходника + хеш полного пути.
+
+    Хеш нужен, чтобы одноимённые файлы из разных папок не затирали копии
+    друг друга, а повторная загрузка того же файла — перезаписывала свои.
+    """
+    digest = hashlib.md5(str(path).lower().encode('utf-8')).hexdigest()[:8]
+    tail = f'_{index}' if index else ''
+    return _import_dir() / f'{path.stem}_{digest}{tail}{suffix}'
+
+
+def _track_name(path: Path, index: int, total: int) -> str:
+    """Имя трека в OziExplorer: имя файла, для нескольких — с номером.
+
+    Имя файла пользователь уже даёт по своим правилам (дата и позывной),
+    а имена внутри GPX/KML бывают служебными вида
+    «Oct-16th-2025-10-53AM-Flight-Airdata».
+    """
+    return path.stem if total == 1 else f'{path.stem} {index + 1}'
+
+
+def _partial(path: Path, done: List[str], problem: str) -> str:
+    """Сообщение о неудаче: что успело загрузиться до неё."""
+    text = f'{path.name}: {problem}'
+    if done:
+        text += '; успело загрузиться — ' + '; '.join(done)
+    return text
+
+
+def _tracks_summary(start: int, loaded: int, tracks) -> str:
+    """Что уже легло в OziExplorer: слоты и число точек."""
+    last = start + loaded - 1
+    where = f'слот {start}' if last == start else f'слоты {start}..{last}'
+    total = sum(track.count() for track in tracks[:loaded])
+    return f'треки: {where} ({total} точек)'
+
+
+def import_gpx_kml(path, bridge: OziApiBridge, track_num: int = 1,
+                   wpt_mode: str = OZI_WPT_DEFAULT_MODE,
+                   content: Optional[Content] = None,
+                   retry: bool = False, progress=None) -> Tuple[bool, str]:
+    """Грузит ``.gpx``/``.kml`` в открытое окно OziExplorer.
+
+    Треки пишем во временные ``.plt`` и грузим ``oziLoadTrackFile`` в
+    выбранный слот и следующие за ним, точки — во временный ``.wpt``
+    (``oziLoadWPfile``, режим «заменить») либо создаём по одной
+    (``oziCreateWPex``, режим «добавить»). ``content`` — уже разобранный
+    файл (:class:`ok_helper.gpxkml.Content`), чтобы не разбирать дважды.
+    """
+    path = Path(path)
+    if content is None:
+        try:
+            content = read_gpx_kml(path)
+        except GpxKmlError as e:
+            return False, str(e)
+
+    tracks = [track for track in content.tracks if track.has_points()]
+    points = list(content.waypoints)
+    if not tracks and not points:
+        return False, f'{path.name}: в файле нет ни треков, ни точек'
+
+    start = clamp_track_num(track_num)
+    if tracks and start + len(tracks) - 1 > OZI_TRACK_MAX:
+        return False, (f'{path.name}: треков в файле {len(tracks)}, а у '
+                       f'OziExplorer их всего {OZI_TRACK_MAX} — начиная с '
+                       f'трека {start} они не помещаются, выберите номер '
+                       f'поменьше')
+
+    parts: List[str] = []
+    for index, track in enumerate(tracks):
+        target = _import_path(path, '.plt',
+                              index + 1 if len(tracks) > 1 else 0)
+        write_plt(track, target, _track_name(path, index, len(tracks)))
+        slot = start + index
+        if not _load_file(bridge, target, slot, retry, progress):
+            return False, _partial(path, parts, f'трек не лёг в слот {slot}')
+        # Что уже в OziExplorer — на случай отказа на следующем треке.
+        parts = [_tracks_summary(start, index + 1, tracks)]
+
+    if points:
+        if wpt_mode == 'replace':
+            target = _import_path(path, '.wpt')
+            write_wpt(points, target)
+            if not _load_file(bridge, target, 1, retry, progress):
+                return False, _partial(
+                    path, parts, f'не удалось заменить точки ({len(points)})')
+            parts.append(f'точки: заменены ({len(points)})')
+        else:
+            added = _add_points(bridge, points, retry, progress)
+            if added is None:
+                return False, _partial(path, parts,
+                                       'не удалось добавить точки')
+            created, failed = added
+            text = f'точки: добавлено {created}'
+            if failed:
+                text += f', не удалось {failed}'
+            parts.append(text)
+
+    return True, (f'{path.name} — загружено в открытое окно OziExplorer: '
+                  + '; '.join(parts))
 
 
 def open_in_oziexplorer(path, exe: str = '', dll: str = '',
                         track_num: int = 1,
-                        wpt_mode: str = OZI_WPT_DEFAULT_MODE
-                        ) -> Tuple[bool, str]:
+                        wpt_mode: str = OZI_WPT_DEFAULT_MODE,
+                        content: Optional[Content] = None,
+                        progress=None) -> Tuple[bool, str]:
     """Открывает файл в OziExplorer. Возвращает (успех, сообщение).
 
-    Если OziExplorer уже запущен и доступна OziAPI.dll, файл грузится в
-    текущее окно; иначе запускается ``oziexp.exe`` (новое окно).
+    Если нашлась ``OziAPI.dll``, файл уходит в **уже открытое** окно (при
+    необходимости OziExplorer запускается сам, и мы ждём готовности API).
+    Без DLL ``.map`` открывается запуском ``oziexp.exe`` — карта грузится
+    и так, — а остальные форматы отдать в окно нечем: об этом прямо
+    сообщаем, потому что запуск exe их всё равно не загрузит.
 
-    ``track_num`` — номер трека для ``.plt`` (1..75). ``wpt_mode`` —
-    что делать с точками при загрузке ``.wpt``: ``append`` добавляет их
-    к загруженным, ``replace`` заменяет набор целиком.
+    ``track_num`` — номер трека для ``.plt`` (1..75); с него начинаются и
+    треки из ``.gpx``/``.kml``. ``wpt_mode`` — что делать с точками:
+    ``append`` добавляет их к загруженным, ``replace`` заменяет набор
+    целиком. ``content`` — разобранный ``.gpx``/``.kml``
+    (:class:`ok_helper.gpxkml.Content`). ``progress`` — необязательный
+    отклик (например, «запускаем OziExplorer»): запуск занимает секунды
+    и в графической программе их надо показывать.
     """
     path = Path(path)
     if not path.is_file():
         return False, f'файл не найден: {path.name}'
 
-    action, dll_path = _api_ready(path, exe, dll)
-    if action:
-        bridge = get_bridge(dll_path)
-        if bridge is not None:
-            if action == 'wp' and wpt_mode == 'append':
-                points = read_wpt(path)
-                if not points:
-                    return False, f'{path.name}: в файле нет точек'
-                added = bridge.add_waypoints(points)
-                if added is not None:
-                    created, failed = added
-                    msg = (f'{path.name} — добавлено точек в открытое '
-                           f'окно OziExplorer: {created}')
-                    if failed:
-                        msg += f' (не удалось: {failed})'
-                    return True, msg
-                return False, ('не удалось добавить точки в OziExplorer; '
-                               'попробуйте заменить набор точек: это делает '
-                               'сам OziExplorer')
-            if bridge.load(path, track_num):
-                if action == 'track':
-                    return True, (f'{path.name} — загружено в трек '
-                                  f'{int(track_num)} открытого окна '
-                                  f'OziExplorer')
-                return True, (f'{path.name} — загружено в открытое окно '
-                              f'OziExplorer')
+    action = _api_action(path)
+    exe_path = find_oziexplorer(exe)
+    dll_path = find_ozi_api(dll, exe_path) if action else None
 
-    return _launch(find_oziexplorer(exe), path)
+    if action and dll_path is not None:
+        bridge, started, error = _prepare_oziexplorer(exe_path, dll_path,
+                                                      progress)
+        if bridge is None:
+            return False, error
+        if action == OZI_PARSE_ACTION:
+            return import_gpx_kml(path, bridge, track_num=track_num,
+                                  wpt_mode=wpt_mode, content=content,
+                                  retry=started, progress=progress)
+        if action == 'wp' and wpt_mode == 'append':
+            points = read_wpt(path)
+            if not points:
+                return False, f'{path.name}: в файле нет точек'
+            added = _add_points(bridge, points, started, progress)
+            if added is not None:
+                created, failed = added
+                msg = (f'{path.name} — добавлено точек в открытое окно '
+                       f'OziExplorer: {created}')
+                if failed:
+                    msg += f' (не удалось: {failed})'
+                return True, msg
+            return False, ('не удалось добавить точки в OziExplorer; '
+                           'попробуйте заменить набор точек: это делает '
+                           'сам OziExplorer')
+        if _load_file(bridge, path, track_num, started, progress):
+            if action == 'track':
+                return True, (f'{path.name} — загружено в трек '
+                              f'{clamp_track_num(track_num)} открытого окна '
+                              f'OziExplorer')
+            return True, (f'{path.name} — загружено в открытое окно '
+                          f'OziExplorer')
+        if action == 'map':
+            # Карта грузится и простым запуском exe — не оставляем
+            # пользователя без карты, если API не справился.
+            return _launch(exe_path, path)
+        return False, (f'{path.name}: OziExplorer не принял файл '
+                       f'(мост вернул ошибку)')
+
+    if path.suffix.lower() == '.map':
+        return _launch(exe_path, path)
+
+    return False, (f'{path.name}: без OziAPI.dll файл в уже открытое окно '
+                   f'OziExplorer не загрузить — запуск oziexp.exe с файлом '
+                   f'его не грузит. DLL лежит в комплектном архиве: '
+                   f'F10 → OziExplorer → «Распаковать OziAPI».')
