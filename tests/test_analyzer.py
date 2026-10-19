@@ -545,6 +545,8 @@ class TestOtherExtensions:
         'no_extension_at_all',
         'data.json',
         'script.py',
+        'track.kml',
+        'track.kmz',
     ])
     def test_not_validated(self, tmp_path, name):
         info = analyze_file(touch(tmp_path / name))

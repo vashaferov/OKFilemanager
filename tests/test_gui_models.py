@@ -228,6 +228,37 @@ class TestFileTreeModelStatus:
         assert model.item(0).child(3).foreground().color().name() == \
             gui.THEMES['light']['tree_file']
 
+    def test_kmz_status_suggests_kml_conversion(self, qapp, tmp_path):
+        """.kmz можно распаковать в .kml — это видно в колонке «Статус»."""
+        root = tmp_path / 'kmz-root'
+        root.mkdir()
+        (root / 'track.kmz').write_text('')
+        (root / 'track.kml').write_text('')
+        model = FileTreeModel()
+        model.set_theme('light')
+        model.set_root(root)
+
+        kmz = model.find_item(root / 'track.kmz')
+        kmz_status = kmz.parent().child(kmz.row(),
+                                        FileTreeModel.COL_STATUS)
+        assert kmz_status.text() == gui.KMZ_TO_KML_HINT
+        assert kmz_status.text() == 'можно конвертировать в .kml'
+        assert kmz_status.foreground().color().name() == \
+            gui.THEMES['light']['text_dim']
+        assert kmz.foreground().color().name() == \
+            gui.THEMES['light']['tree_file']
+
+    def test_kml_status_has_no_conversion_hint(self, qapp, tmp_path):
+        root = tmp_path / 'kml-root'
+        root.mkdir()
+        (root / 'track.kml').write_text('')
+        model = FileTreeModel()
+        model.set_root(root)
+
+        item = model.find_item(root / 'track.kml')
+        assert item.parent().child(
+            item.row(), FileTreeModel.COL_STATUS).text() == ''
+
 
 # ─────────────────────────────────────────────────────────────────
 # 3. FileTreeModel — ленивая подгрузка

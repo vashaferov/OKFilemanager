@@ -136,6 +136,7 @@ class TestDownloadsHandler:
     @pytest.mark.smoke
     @pytest.mark.parametrize('name', [
         'track.gpx', 'track.plt', 'points.wpt',
+        'track.kml', 'track.kmz',
         '2026-09-17_11-55_бабушка.gpx',
         'Waypoints_20260923.wpt',
     ])
@@ -147,7 +148,7 @@ class TestDownloadsHandler:
 
     @pytest.mark.smoke
     @pytest.mark.parametrize('name', [
-        'track.GPX', 'track.Plt', 'points.WPT',
+        'track.GPX', 'track.Plt', 'points.WPT', 'track.KML', 'track.Kmz',
     ])
     def test_extension_case_insensitive(self, handler, tmp_path, name):
         p = tmp_path / name
@@ -229,7 +230,9 @@ class TestDownloadsHandler:
         assert '.crdownload' in DownloadsHandler._TEMP_SUFFIXES
         assert '.part' in DownloadsHandler._TEMP_SUFFIXES
         assert DownloadsHandler._INTERESTING_SUFFIXES == \
-            {'.gpx', '.plt', '.wpt'}
+            {'.gpx', '.plt', '.wpt', '.kml', '.kmz'}
+        assert DownloadsHandler.INTERESTING_SUFFIXES_TEXT == \
+            '.gpx, .plt, .wpt, .kml, .kmz'
 
     def test_temp_suffixes_are_not_interesting(self):
         overlap = (DownloadsHandler._TEMP_SUFFIXES

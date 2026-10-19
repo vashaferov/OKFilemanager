@@ -71,6 +71,10 @@ STUB_TEXT = '(загрузка…)'
 ROLE_PATH = Qt.UserRole + 1
 ROLE_FTP_NAME = Qt.UserRole + 2
 
+# Подсказка в колонке «Статус»: .kmz можно распаковать в .kml
+# действием «KMZ → KML» из контекстного меню файла.
+KMZ_TO_KML_HINT = 'можно конвертировать в .kml'
+
 # Ключи ввода-вывода состояния интерфейса в конфиге.
 UI_STATE_KEYS = ('window_geometry', 'splitter_state', 'tree_column_widths',
                  'log_visible')
@@ -1100,6 +1104,8 @@ class FileTreeModel(QStandardItemModel):
                     status_parts.append(info['reason'] or 'ошибка')
             if is_uploadable(child_path, info):
                 status_parts.append('можно на FTP')
+            if child_path.suffix.lower() == '.kmz':
+                status_parts.append(KMZ_TO_KML_HINT)
 
             name_item = QStandardItem(child_path.name)
             name_item.setEditable(False)
@@ -2479,7 +2485,8 @@ class MainWindow(QMainWindow):
             return
 
         self.log(f'[ЗАГРУЗКИ] Слежение включено: {d} '
-                 f'(.gpx, .plt, .wpt; проверка каждые '
+                 f'({DownloadsHandler.INTERESTING_SUFFIXES_TEXT}; '
+                 f'проверка каждые '
                  f'{DOWNLOAD_POLL_MS // 1000} с)', 'cfg')
 
         # Файлы, скачанные до запуска сервиса, не предлагаем: иначе
@@ -2548,7 +2555,8 @@ class MainWindow(QMainWindow):
 
         files = self._download_candidates()
         if not files:
-            self.log(f'[ЗАГРУЗКИ] В {d} нет файлов .gpx, .plt, .wpt', 'info')
+            self.log(f'[ЗАГРУЗКИ] В {d} нет файлов '
+                     f'{DownloadsHandler.INTERESTING_SUFFIXES_TEXT}', 'info')
             return
 
         self.log(f'[ЗАГРУЗКИ] В {d} найдено {len(files)}, проверяю',
@@ -4185,10 +4193,13 @@ OziExplorer:
 
 Папка загрузок:
   Слежение включается в F10 → Папки («Следить за папкой загрузок»)
-  или в меню «Загрузки». Когда в папке появляется новый .gpx, .plt
-  или .wpt, сервис предлагает перенести его в корень дерева или
-  выбрать папку. Временные файлы браузеров (.crdownload, .part и
-  подобные) не считаются готовыми и не предлагаются.
+  или в меню «Загрузки». Когда в папке появляется новый .gpx, .plt,
+  .wpt, .kml или .kmz, сервис предлагает перенести его в корень дерева
+  или выбрать папку. Файл .kmz в дереве помечается в колонке
+  «Статус» подсказкой «можно конвертировать в .kml» — распаковка доступна
+  в контекстном меню (KMZ → KML). Временные файлы браузеров
+  (.crdownload, .part и подобные) не считаются готовыми и не
+  предлагаются.
 
   Папка проверяется и по событиям системы, и дополнительно каждые
   несколько секунд — события могут не дойти на сетевом диске,

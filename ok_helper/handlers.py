@@ -34,7 +34,9 @@ class DownloadsHandler(FileSystemEventHandler):
         '.crdownload', '.part', '.tmp', '.download', '.partial',
         '.opdownload',  # Opera
     }
-    _INTERESTING_SUFFIXES = {'.gpx', '.plt', '.wpt'}
+    _DOWNLOAD_SUFFIX_ORDER = ('.gpx', '.plt', '.wpt', '.kml', '.kmz')
+    _INTERESTING_SUFFIXES = set(_DOWNLOAD_SUFFIX_ORDER)
+    INTERESTING_SUFFIXES_TEXT = ', '.join(_DOWNLOAD_SUFFIX_ORDER)
 
     def __init__(self, callback: Callable[[Path], None]):
         self.callback = callback

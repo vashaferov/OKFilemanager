@@ -3526,6 +3526,19 @@ class TestDownloadsWatch:
 
         assert window.poll_downloads(ignore_before=0) == 0
 
+    @pytest.mark.smoke
+    @pytest.mark.parametrize('name', ['track.kml', 'track.kmz'])
+    def test_poll_offers_kml_and_kmz(self, window, gui_config, monkeypatch,
+                                     poll_timers, msgbox, name):
+        """KML и KMZ — такие же поддерживаемые файлы папки загрузок."""
+        d = self.downloads_dir(gui_config, window)
+        msgbox.click_text = 'Игнорировать'
+        p = d / name
+        p.write_text('')
+
+        assert window.poll_downloads(ignore_before=0) == 1
+        assert p in window._seen_downloads
+
     def test_poll_skips_stale_files(self, window, gui_config, monkeypatch,
                                     poll_timers):
         """Скачанное до запуска сервиса не предлагается."""
@@ -3554,7 +3567,7 @@ class TestDownloadsWatch:
 
         window.on_check_downloads()
 
-        assert 'нет файлов .gpx, .plt, .wpt' in log_text(window)
+        assert 'нет файлов .gpx, .plt, .wpt, .kml, .kmz' in log_text(window)
 
     def test_check_downloads_offers_old_file(self, window, gui_config,
                                              monkeypatch, poll_timers,
