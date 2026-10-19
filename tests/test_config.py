@@ -452,10 +452,47 @@ class TestLoadConfig:
     @pytest.mark.parametrize('key', [
         'root_dir', 'downloads_dir',
         'ftp_host', 'ftp_user', 'ftp_password', 'ftp_path', 'base_url',
-        'ozi_exe', 'ozi_api_dll',
+        'ozi_exe', 'ozi_api_dll', 'ozi_wpt_mode',
     ])
     def test_string_keys_are_strings(self, cfg_file, key):
         assert isinstance(load_config()[key], str)
+
+    @pytest.mark.parametrize('key', ['ozi_track_ask', 'ozi_wpt_ask'])
+    def test_ozi_ask_flags_are_bools(self, cfg_file, key):
+        assert isinstance(load_config()[key], bool)
+
+    @pytest.mark.parametrize('raw,expected', [
+        ('1', 1), ('75', 75), ('0', 1), ('-3', 1), ('76', 75),
+        ('abc', 1), ('', 1),
+    ])
+    def test_track_number_is_clamped(self, cfg_file, raw, expected):
+        """Треков всего 75: номер вне диапазона молча приводим в него."""
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg_file.write_text(f'ozi_track_num = "{raw}"\n', encoding='utf-8')
+
+        num = load_config()['ozi_track_num']
+        assert num == expected
+        assert isinstance(num, int)
+
+    @pytest.mark.parametrize('raw,expected', [
+        ('append', 'append'), ('replace', 'replace'),
+        ('', 'append'), ('мыло', 'append'),
+    ])
+    def test_wpt_mode_whitelist(self, cfg_file, raw, expected):
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg_file.write_text(f'ozi_wpt_mode = "{raw}"\n', encoding='utf-8')
+
+        assert load_config()['ozi_wpt_mode'] == expected
+
+    def test_wpt_mode_default_is_append(self, cfg_file):
+        """Добавление — безопасный режим по умолчанию: ничего не пропадёт."""
+        assert load_config()['ozi_wpt_mode'] == 'append'
+
+    def test_ask_flags_default_to_true(self, cfg_file):
+        cfg = load_config()
+
+        assert cfg['ozi_track_ask'] is True
+        assert cfg['ozi_wpt_ask'] is True
 
     def test_unknown_keys_ignored(self, cfg_file):
         cfg_file.parent.mkdir(parents=True, exist_ok=True)
@@ -521,6 +558,10 @@ class TestSaveConfig:
             'first_run': False,
             'ozi_exe': r'C:\Ozi\oziexp.exe',
             'ozi_api_dll': r'C:\Ozi\OziAPI.dll',
+            'ozi_track_num': 7,
+            'ozi_track_ask': False,
+            'ozi_wpt_mode': 'replace',
+            'ozi_wpt_ask': False,
         })
 
         save_config(cfg)
@@ -530,7 +571,8 @@ class TestSaveConfig:
                     'ftp_host', 'ftp_port', 'ftp_user', 'ftp_password',
                     'ftp_path', 'ftp_readonly', 'base_url',
                     'help_visible_at_start', 'first_run',
-                    'ozi_exe', 'ozi_api_dll'):
+                    'ozi_exe', 'ozi_api_dll', 'ozi_track_num',
+                    'ozi_track_ask', 'ozi_wpt_mode', 'ozi_wpt_ask'):
             assert again[key] == cfg[key], key
 
     def test_ui_state_round_trip(self, cfg_file):

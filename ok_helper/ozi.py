@@ -26,10 +26,17 @@ DLL ищется как готовый файл (заданный путь, па
 Формат файла определяет действие: ``.wpt`` — набор точек, ``.plt`` —
 трек, ``.map`` — карта. Для ``.gpx`` загрузчика в API нет, поэтому такой
 файл всегда открывается запуском exe.
+
+Место загрузки выбирается: у OziExplorer 75 треков, и ``.plt`` грузится
+в указанный номер (``oziLoadTrackFile``), иначе каждый следующий трек
+затирал бы первый. Файл точек API умеет грузить только целиком — это
+заменяет уже загруженный набор, поэтому точки можно и добавить по одной
+(``oziCreateWPex``, разбор файла — в :mod:`ok_helper.wpt`).
 """
 
 import atexit
 import ctypes
+import json
 import os
 import queue
 import re
@@ -42,6 +49,8 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
+
+from ok_helper.wpt import read_wpt
 
 
 # Форматы, которые имеет смысл открывать в OziExplorer.
@@ -56,13 +65,26 @@ OZI_PROCESS_NAMES = ('oziexp.exe', 'oziexplorer.exe')
 # Что умеет грузить API: расширение -> действие моста.
 _API_ACTIONS = {'.wpt': 'wp', '.plt': 'track', '.map': 'map'}
 
+# Сколько треков (и наборов точек) у OziExplorer.
+OZI_TRACK_MAX = 75
+
+# Что делать с уже загруженными точками при загрузке .wpt:
+# 'append' — добавить к ним (по одной через oziCreateWPex),
+# 'replace' — заменить набор целиком (oziLoadWPfile).
+OZI_WPT_MODES = ('append', 'replace')
+OZI_WPT_DEFAULT_MODE = 'append'
+
 # Скрипт-мост рядом с этим модулем.
 _BRIDGE_SCRIPT = Path(__file__).resolve().with_name('ozi_api_bridge.ps1')
 
 # Сколько ждать готовности и ответа моста, секунд.
 _BRIDGE_TIMEOUT = 20.0
 
-_RESULT_RE = re.compile(r'^OZI_RESULT found=(-?\d+) rc=(-?\d+)$')
+_RESULT_RE = re.compile(
+    r'^OZI_RESULT found=(-?\d+) rc=(-?\d+)(?P<extra>(?:\s+\w+=-?\d+)*)$')
+
+# Дополнительные счётчики в ответе моста (например created=5).
+_EXTRA_RE = re.compile(r'(\w+)=(-?\d+)')
 
 # Типичные места установки oziexp.exe.
 _CANDIDATE_EXES: List[str] = [
@@ -505,14 +527,24 @@ class OziApiBridge:
                 return line
             # прочие строки (предупреждения) пропускаем
 
-    def _found_and_rc(self, command: str) -> Optional[Tuple[int, int]]:
+    def _result(self, command: str) -> Optional[dict]:
+        """Ответ моста словарём: ``found``, ``rc`` и счётчики команды."""
         line = self._request(command)
         if line is None:
             return None
         m = _RESULT_RE.match(line)
         if m is None:
             return None
-        return int(m.group(1)), int(m.group(2))
+        res = {'found': int(m.group(1)), 'rc': int(m.group(2))}
+        for key, value in _EXTRA_RE.findall(m.group('extra')):
+            res[key] = int(value)
+        return res
+
+    def _found_and_rc(self, command: str) -> Optional[Tuple[int, int]]:
+        res = self._result(command)
+        if res is None:
+            return None
+        return res['found'], res['rc']
 
     def is_running(self) -> bool:
         """Найден ли запущенный OziExplorer (``oziFindOzi``)."""
@@ -520,13 +552,34 @@ class OziApiBridge:
         return res is not None and res[0] == 0
 
     def load(self, path, track_num: int = 1) -> bool:
-        """Грузит файл в открытое окно. True при rc=0."""
+        """Грузит файл в открытое окно. True при rc=0.
+
+        Для трека ``track_num`` — номер трека (1..75); мост ещё включает
+        показ треков и перерисовывает карту.
+        """
         path = Path(path)
         action = _API_ACTIONS.get(path.suffix.lower())
         if action is None:
             return False
         res = self._found_and_rc(f'{action}\t{path}\t{int(track_num)}')
         return res == (0, 0)
+
+    def add_waypoints(self, points) -> Optional[Tuple[int, int]]:
+        """Добавляет точки к загруженным. (создано, не удалось) или None.
+
+        ``oziLoadWPfile`` грузит файл целиком и заменяет набор, поэтому
+        «добавить» можно только по точке (``oziCreateWPex``). Список
+        уезжает в мост одной командой, чтобы не платить за круговой рейт
+        на каждую точку; мост отвечает счётчиками (в том числе частичных
+        отказов — файл может содержать точки, которые OziExplorer взял, и
+        точки, которые он отверг).
+        """
+        payload = json.dumps([p.as_api() for p in points],
+                             ensure_ascii=True, separators=(',', ':'))
+        res = self._result('addwpts\t' + payload)
+        if res is None or res['found'] != 0 or res['rc'] != 0:
+            return None
+        return int(res.get('created', 0)), int(res.get('failed', 0))
 
     def stop(self):
         """Останавливает мост (``quit``, при необходимости — kill)."""
@@ -594,26 +647,74 @@ def _launch(exe_path: Optional[Path], path: Path) -> Tuple[bool, str]:
     return True, f'открыто в OziExplorer: {path.name}'
 
 
+def _api_ready(path, exe: str = '', dll: str = ''):
+    """(действие API, путь к DLL), если файл пойдёт через API.
+
+    Пусто — файл будет открыт запуском ``oziexp.exe`` (новое окно): нет
+    DLL, OziExplorer не запущен или формат API не поддерживает.
+    """
+    action = _API_ACTIONS.get(Path(path).suffix.lower())
+    if action is None:
+        return '', None
+    exe_path = find_oziexplorer(exe)
+    dll_path = find_ozi_api(dll, exe_path)
+    if dll_path is None or not is_oziexplorer_running():
+        return '', None
+    return action, dll_path
+
+
+def api_plan(path, exe: str = '', dll: str = '') -> str:
+    """Каким действием API откроется файл: ``wp`` / ``track`` / ``map``.
+
+    Пустая строка — файл откроется запуском ``oziexp.exe`` в новом окне.
+    Нужна до вызова :func:`open_in_oziexplorer`, чтобы спросить у
+    пользователя место загрузки только тогда, когда оно вообще есть.
+    """
+    return _api_ready(path, exe, dll)[0]
+
+
 def open_in_oziexplorer(path, exe: str = '', dll: str = '',
-                        track_num: int = 1) -> Tuple[bool, str]:
+                        track_num: int = 1,
+                        wpt_mode: str = OZI_WPT_DEFAULT_MODE
+                        ) -> Tuple[bool, str]:
     """Открывает файл в OziExplorer. Возвращает (успех, сообщение).
 
     Если OziExplorer уже запущен и доступна OziAPI.dll, файл грузится в
     текущее окно; иначе запускается ``oziexp.exe`` (новое окно).
+
+    ``track_num`` — номер трека для ``.plt`` (1..75). ``wpt_mode`` —
+    что делать с точками при загрузке ``.wpt``: ``append`` добавляет их
+    к загруженным, ``replace`` заменяет набор целиком.
     """
     path = Path(path)
     if not path.is_file():
         return False, f'файл не найден: {path.name}'
 
-    exe_path = find_oziexplorer(exe)
-    dll_path = find_ozi_api(dll, exe_path)
-
-    if (dll_path is not None
-            and path.suffix.lower() in _API_ACTIONS
-            and is_oziexplorer_running()):
+    action, dll_path = _api_ready(path, exe, dll)
+    if action:
         bridge = get_bridge(dll_path)
-        if bridge is not None and bridge.load(path, track_num):
-            return True, (f'{path.name} — загружено в открытое окно '
-                          f'OziExplorer')
+        if bridge is not None:
+            if action == 'wp' and wpt_mode == 'append':
+                points = read_wpt(path)
+                if not points:
+                    return False, f'{path.name}: в файле нет точек'
+                added = bridge.add_waypoints(points)
+                if added is not None:
+                    created, failed = added
+                    msg = (f'{path.name} — добавлено точек в открытое '
+                           f'окно OziExplorer: {created}')
+                    if failed:
+                        msg += f' (не удалось: {failed})'
+                    return True, msg
+                return False, ('не удалось добавить точки в OziExplorer; '
+                               'попробуйте заменить набор точек: это делает '
+                               'сам OziExplorer')
+            if bridge.load(path, track_num):
+                if action == 'track':
+                    return True, (f'{path.name} — загружено в трек '
+                                  f'{int(track_num)} открытого окна '
+                                  f'OziExplorer')
+                return True, (f'{path.name} — загружено в открытое окно '
+                              f'OziExplorer')
 
-    return _launch(exe_path, path)
+    return _launch(find_oziexplorer(exe), path)

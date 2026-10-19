@@ -37,7 +37,8 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDockWidget, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLayout, QLineEdit, QMainWindow,
-    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSplitter,
+    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
+    QSizePolicy, QSpinBox, QSplitter,
     QStyle, QToolButton, QStatusBar, QTabWidget, QToolBar, QTreeView,
     QVBoxLayout, QWidget,
 )
@@ -57,7 +58,8 @@ from ok_helper.ftp import (
 from ok_helper.handlers import DirHandler, DownloadsHandler
 from ok_helper.kmz import KmzError, kmz_to_kml
 from ok_helper.ozi import (
-    OZI_API_DOWNLOAD_URL, OZI_FILE_SUFFIXES, extract_bundled_api,
+    OZI_API_DOWNLOAD_URL, OZI_FILE_SUFFIXES, OZI_TRACK_MAX,
+    OZI_WPT_DEFAULT_MODE, OZI_WPT_MODES, api_plan, extract_bundled_api,
     open_in_oziexplorer)
 from ok_helper.translit import transliterate
 
@@ -118,6 +120,15 @@ def _parse_ui_columns(text: str) -> Optional[Tuple[int, int, int]]:
     if any(width < 0 for width in widths):
         return None
     return widths  # type: ignore[return-value]
+
+
+def _clamp_track_num(value) -> int:
+    """Номер трека из конфига в допустимых пределах (1..75)."""
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return min(max(num, 1), OZI_TRACK_MAX)
 
 
 def _std_icon(sp: QStyle.StandardPixmap) -> QIcon:
@@ -3191,6 +3202,9 @@ class MainWindow(QMainWindow):
         Гибрид: если найден OziAPI.dll и OziExplorer уже запущен, файл
         грузится в текущее окно через API (см. ok_helper.ozi); иначе
         запускается oziexp.exe с путём к файлу.
+
+        Про место загрузки спрашиваем только для API: при запуске exe
+        открывается новое окно, и затирать в нём нечего.
         """
         if self._warn_wrong_tab('Открыть в OziExplorer'):
             return
@@ -3198,16 +3212,76 @@ class MainWindow(QMainWindow):
         if p is None or not p.is_file():
             QMessageBox.information(self, 'OziExplorer', 'Выберите файл')
             return
-        ok, msg = open_in_oziexplorer(
-            p,
-            exe=str(self.config.get('ozi_exe', '') or ''),
-            dll=str(self.config.get('ozi_api_dll', '') or ''),
-        )
+        exe = str(self.config.get('ozi_exe', '') or '')
+        dll = str(self.config.get('ozi_api_dll', '') or '')
+        plan = api_plan(p, exe, dll)
+        position = self._ozi_position(p, plan)
+        if position is None:
+            # пользователь отказался от загрузки в открытое окно
+            self.log('[OZI] Загрузка отменена', 'warn')
+            return
+        track_num, wpt_mode = position
+        ok, msg = open_in_oziexplorer(p, exe=exe, dll=dll,
+                                      track_num=track_num,
+                                      wpt_mode=wpt_mode)
         if ok:
             self.log(f'[OZI] {msg}', 'ok')
+            self._bump_ozi_track(plan, track_num)
         else:
             self.log(f'[ОШБ] OZI: {msg}', 'error')
             self._show_notice_or_box('OziExplorer', msg, 'error')
+
+    def _ozi_position(self, p: Path, plan: str) -> Optional[Tuple[int, str]]:
+        """Место загрузки в открытое окно: (номер трека, режим точек).
+
+        Спрашиваем, только если файл вообще пойдёт через API и вопрос не
+        снят галочкой «Запомнить». Выбор сохраняется в конфиг. None —
+        пользователь отказался.
+        """
+        track_num = _clamp_track_num(self.config.get('ozi_track_num', 1))
+        wpt_mode = str(self.config.get('ozi_wpt_mode', OZI_WPT_DEFAULT_MODE))
+        if wpt_mode not in OZI_WPT_MODES:
+            wpt_mode = OZI_WPT_DEFAULT_MODE
+        if plan not in ('track', 'wp'):
+            return track_num, wpt_mode
+        ask_key = 'ozi_track_ask' if plan == 'track' else 'ozi_wpt_ask'
+        if not bool(self.config.get(ask_key, True)):
+            return track_num, wpt_mode
+
+        dlg = OziLoadDialog(self, p, plan, track_num=track_num,
+                            wpt_mode=wpt_mode)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        if plan == 'track':
+            track_num = dlg.track_num
+            self.config['ozi_track_num'] = track_num
+        else:
+            wpt_mode = dlg.wpt_mode
+            self.config['ozi_wpt_mode'] = wpt_mode
+        if dlg.remember:
+            self.config[ask_key] = False
+        self._save_config_quiet()
+        return track_num, wpt_mode
+
+    def _bump_ozi_track(self, plan: str, track_num: int):
+        """Следующий .plt по умолчанию ляжет в следующий номер.
+
+        Иначе «запомненный» номер затирал бы уже загруженный трек — та
+        самая подмена, из-за которой номер и выбирается.
+        """
+        if plan != 'track':
+            return
+        nxt = min(int(track_num) + 1, OZI_TRACK_MAX)
+        if nxt != _clamp_track_num(self.config.get('ozi_track_num', 1)):
+            self.config['ozi_track_num'] = nxt
+            self._save_config_quiet()
+
+    def _save_config_quiet(self):
+        """Сохраняет конфиг, не мешая загрузке файла сообщением."""
+        try:
+            save_config(self.config)
+        except Exception as e:
+            self.log(f'[НАСТР] Не сохранить конфиг: {e}', 'error')
 
     def on_apply_fix(self):
         p = self._selected_path()
@@ -3592,8 +3666,11 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('Настройки')
         # Минимум — под маленькие экраны; удобный размер задаётся resize.
-        self.setMinimumWidth(440)
-        self.resize(520, 640)
+        # Настройки разбиты на вкладки, поэтому окно больше не растёт в
+        # высоту: важно только, чтобы поместилась самая высокая вкладка,
+        # а по ширине — строка кнопок OziAPI (она самая широкая).
+        self.setMinimumWidth(560)
+        self.resize(600, 470)
         self.config = config
 
         layout = QVBoxLayout(self)
@@ -3630,22 +3707,24 @@ class SettingsDialog(QDialog):
             self.browse_buttons[key] = btn
             form.addRow(label, row)
 
-        def section(title: str) -> QVBoxLayout:
-            """Заголовок раздела и карточка под ним."""
-            lbl = QLabel(title)
-            lbl.setObjectName('SectionTitle')
-            layout.addWidget(lbl)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
 
-            card = QFrame()
-            card.setObjectName('Card')
-            inner = QVBoxLayout(card)
-            inner.setContentsMargins(14, 12, 14, 12)
-            inner.setSpacing(10)
-            layout.addWidget(card)
-            return inner
+        def page(title: str) -> QVBoxLayout:
+            """Добавляет вкладку и возвращает её раскладку.
 
-        # --- Папки ---
-        folders = section('Папки')
+            Раньше это были разделы с заголовками в одном длинном окне,
+            из-за чего F10 разрослось по высоте.
+            """
+            w = QWidget()
+            v = QVBoxLayout(w)
+            v.setContentsMargins(16, 14, 16, 14)
+            v.setSpacing(10)
+            self.tabs.addTab(w, title)
+            return v
+
+        # --- Вкладка «Папки» ---
+        folders = page('Папки')
         folders_form = QFormLayout()
         folders_form.setSpacing(8)
         add_field(folders_form, 'Корневая папка', 'root_dir', browse='dir')
@@ -3658,9 +3737,10 @@ class SettingsDialog(QDialog):
         self.watch_cb.setToolTip(
             'Предлагать переносить новые файлы из папки загрузок')
         folders.addWidget(self.watch_cb)
+        folders.addStretch(1)
 
-        # --- Интерфейс ---
-        ui = section('Интерфейс')
+        # --- Вкладка «Интерфейс» ---
+        ui = page('Интерфейс')
 
         theme_row = QHBoxLayout()
         theme_row.setSpacing(8)
@@ -3670,10 +3750,6 @@ class SettingsDialog(QDialog):
         self.theme_combo.setCurrentText(config.get('theme', 'auto'))
         self.theme_combo.setToolTip('auto — по системной теме Windows')
         theme_row.addWidget(self.theme_combo)
-
-        dim = QLabel('auto — по системной теме')
-        dim.setObjectName('Dim')
-        theme_row.addWidget(dim)
         theme_row.addStretch(1)
         ui.addLayout(theme_row)
 
@@ -3689,13 +3765,16 @@ class SettingsDialog(QDialog):
         ui.addWidget(self.log_visible_cb)
 
         self.blocking_errors_cb = QCheckBox(
-            'Показывать отказы модальным окном (иначе — плашкой сверху)')
+            'Показывать отказы модальным окном')
+        self.blocking_errors_cb.setToolTip(
+            'Выключено — отказ показывается плашкой сверху окна')
         self.blocking_errors_cb.setChecked(
             bool(config.get('blocking_errors', False)))
         ui.addWidget(self.blocking_errors_cb)
+        ui.addStretch(1)
 
-        # --- FTP ---
-        ftp = section('FTP')
+        # --- Вкладка «FTP» ---
+        ftp = page('FTP')
         ftp_form = QFormLayout()
         ftp_form.setSpacing(8)
         add_field(ftp_form, 'Хост', 'ftp_host')
@@ -3715,9 +3794,10 @@ class SettingsDialog(QDialog):
             'Подключаться и читать листинг, но не создавать, '
             'не загружать и не удалять файлы')
         ftp.addWidget(self.ftp_readonly_cb)
+        ftp.addStretch(1)
 
-        # --- OziExplorer ---
-        ozi = section('OziExplorer')
+        # --- Вкладка «OziExplorer» ---
+        ozi = page('OziExplorer')
         ozi_form = QFormLayout()
         ozi_form.setSpacing(8)
         add_field(ozi_form, 'Путь к oziexp.exe', 'ozi_exe', browse='file',
@@ -3734,20 +3814,69 @@ class SettingsDialog(QDialog):
             'среди распакованных кнопкой «Распаковать OziAPI», затем '
             'рядом с oziexp.exe. Сам архив DLL здесь не считается: пока '
             'не распаковали, DLL недоступна')
+
+        # Место загрузки в открытое окно. Спрашивается при загрузке, но
+        # значения по умолчанию и сами вопросы живут здесь: галочка
+        # «Запомнить» в диалоге снимает вопрос, а вернуть его можно
+        # только отсюда.
+        self.ozi_track_spin = QSpinBox()
+        self.ozi_track_spin.setRange(1, OZI_TRACK_MAX)
+        self.ozi_track_spin.setValue(
+            _clamp_track_num(config.get('ozi_track_num', 1)))
+        self.ozi_track_spin.setToolTip(
+            f'Всего треков у OziExplorer: {OZI_TRACK_MAX}. Загрузка .plt в '
+            f'занятый номер затирает то, что в нём лежало; после '
+            f'успешной загрузки номер увеличивается на 1')
+        ozi_form.addRow('Номер трека (.plt)', self.ozi_track_spin)
+
+        self.ozi_wpt_combo = QComboBox()
+        # Длинные пункты распирали бы вкладку по ширине: считаем минимум
+        # по длине, а не по самому длинному пункту.
+        self.ozi_wpt_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.ozi_wpt_combo.setMinimumContentsLength(12)
+        self.ozi_wpt_combo.addItem('Добавить к загруженным точкам',
+                                   'append')
+        self.ozi_wpt_combo.addItem('Заменить загруженные точки', 'replace')
+        wpt_mode = str(config.get('ozi_wpt_mode', OZI_WPT_DEFAULT_MODE))
+        wpt_idx = self.ozi_wpt_combo.findData(wpt_mode)
+        self.ozi_wpt_combo.setCurrentIndex(wpt_idx if wpt_idx >= 0 else 0)
+        self.ozi_wpt_combo.setToolTip(
+            'Что делать с точками, уже загруженными в OziExplorer. '
+            'Добавление идёт по точке и на больших файлах заметно '
+            'медленнее, зато ничего не пропадает')
+        ozi_form.addRow('Режим точек (.wpt)', self.ozi_wpt_combo)
         ozi.addLayout(ozi_form)
 
-        ozi_hint = QLabel(
+        self.ozi_hint = QLabel(
             'OziAPI.dll лежит в комплектном архиве assets/oziapi_dll.zip, '
             'но сама по себе не распаковывается — нажмите «Распаковать '
             'OziAPI», и файл по возможности будет грузиться в уже '
-            'открытое окно OziExplorer. Чтобы это работало, включите API '
-            'в самом OziExplorer (Configuration → OziAPI). Если DLL нет '
-            'или OziExplorer не запущен, файл откроется в новом окне '
-            'запуском oziexp.exe. Форматы .wpt, .plt и .map грузятся '
-            'в текущее окно, .gpx — всегда в новом окне.')
-        ozi_hint.setObjectName('Dim')
-        ozi_hint.setWordWrap(True)
-        ozi.addWidget(ozi_hint)
+            'открытое окно OziExplorer. Включать API в самом OziExplorer '
+            'не нужно: отдельной настройки для этого нет, достаточно '
+            'доступной DLL и запущенного OziExplorer 3.95.2 или новее. '
+            'Без DLL или запущенного OziExplorer файл откроется в новом '
+            'окне запуском oziexp.exe. Форматы .wpt, .plt и .map '
+            'грузятся в текущее окно, .gpx — всегда в новом окне.')
+        self.ozi_hint.setObjectName('Dim')
+        self.ozi_hint.setWordWrap(True)
+        ozi.addWidget(self.ozi_hint)
+
+        self.ozi_track_ask_cb = QCheckBox('Спрашивать номер трека')
+        self.ozi_track_ask_cb.setChecked(
+            bool(config.get('ozi_track_ask', True)))
+        self.ozi_track_ask_cb.setToolTip(
+            'Спрашивать номер трека перед каждой загрузкой .plt в открытое '
+            'окно. Снимается галочкой «Запомнить» в самом диалоге')
+        ozi.addWidget(self.ozi_track_ask_cb)
+
+        self.ozi_wpt_ask_cb = QCheckBox('Спрашивать режим точек')
+        self.ozi_wpt_ask_cb.setChecked(bool(config.get('ozi_wpt_ask', True)))
+        self.ozi_wpt_ask_cb.setToolTip(
+            'Спрашивать, добавлять точки или заменить набор, перед каждой '
+            'загрузкой .wpt в открытое окно. Снимается галочкой '
+            '«Запомнить» в самом диалоге')
+        ozi.addWidget(self.ozi_wpt_ask_cb)
 
         ozi_dl_row = QHBoxLayout()
         self.ozi_download_btn = QPushButton('Скачать OziAPI')
@@ -3765,8 +3894,7 @@ class SettingsDialog(QDialog):
         ozi_dl_row.addWidget(self.ozi_extract_btn)
         ozi_dl_row.addStretch(1)
         ozi.addLayout(ozi_dl_row)
-
-        layout.addStretch(1)
+        ozi.addStretch(1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -3815,19 +3943,40 @@ class SettingsDialog(QDialog):
         QMessageBox.information(
             self, 'OziAPI',
             f'OziAPI.dll распакована:\n{dll}\n\n'
-            'Путь подставлен в поле выше. Осталось включить API в самом '
-            'OziExplorer (Configuration → OziAPI).')
+            'Путь подставлен в поле выше. Отдельно включать API в самом '
+            'OziExplorer не нужно — достаточно, чтобы он был запущен.')
+
+    def _tab_of(self, widget) -> int:
+        """Индекс вкладки, на которой находится виджет (0, если не нашли).
+
+        Нужен, чтобы при ошибке валидации показать ту вкладку, где
+        проблема: иначе поле с ошибкой может быть на скрытой вкладке.
+        """
+        for i in range(self.tabs.count()):
+            page = self.tabs.widget(i)
+            w = widget
+            while w is not None:
+                if w is page:
+                    return i
+                w = w.parentWidget()
+        return 0
+
+    def _show_tab_of(self, key: str):
+        """Переключает на вкладку с полем ``key``."""
+        self.tabs.setCurrentIndex(self._tab_of(self.fields[key]))
 
     def _save(self):
         root = self.fields['root_dir'].text().strip()
         if not Path(root).expanduser().is_dir():
             QMessageBox.critical(self, 'Ошибка',
                                  f'root_dir не директория:\n{root}')
+            self._show_tab_of('root_dir')
             return
         dl = self.fields['downloads_dir'].text().strip()
         if not Path(dl).expanduser().is_dir():
             QMessageBox.critical(self, 'Ошибка',
                                  f'downloads_dir не директория:\n{dl}')
+            self._show_tab_of('downloads_dir')
             return
         try:
             port = int(self.fields['ftp_port'].text() or 21)
@@ -3836,6 +3985,7 @@ class SettingsDialog(QDialog):
         except ValueError:
             QMessageBox.critical(self, 'Ошибка',
                                  'Некорректный FTP порт')
+            self._show_tab_of('ftp_port')
             return
 
         theme = self.theme_combo.currentText().strip() or 'auto'
@@ -3859,6 +4009,10 @@ class SettingsDialog(QDialog):
         c['ftp_readonly'] = bool(self.ftp_readonly_cb.isChecked())
         c['ozi_exe'] = self.fields['ozi_exe'].text().strip()
         c['ozi_api_dll'] = self.fields['ozi_api_dll'].text().strip()
+        c['ozi_track_num'] = int(self.ozi_track_spin.value())
+        c['ozi_track_ask'] = bool(self.ozi_track_ask_cb.isChecked())
+        c['ozi_wpt_mode'] = str(self.ozi_wpt_combo.currentData())
+        c['ozi_wpt_ask'] = bool(self.ozi_wpt_ask_cb.isChecked())
         c['root_dir_resolved'] = Path(root).expanduser().resolve()
         c['downloads_dir_resolved'] = Path(dl).expanduser().resolve()
 
@@ -3914,19 +4068,30 @@ OziExplorer:
   в комплектном архиве assets/oziapi_dll.zip, но сама не
   распаковывается: нажмите «Распаковать OziAPI» в настройках
   (F10 → OziExplorer) — DLL распакуется в %LOCALAPPDATA% и путь
-  подставится в поле. Осталось включить API в самом OziExplorer
-  (Configuration → OziAPI). Форматы .wpt, .plt и .map грузятся
+  подставится в поле. Включать API в самом OziExplorer не нужно:
+  отдельной настройки для этого нет, достаточно доступной DLL и
+  запущенного OziExplorer. Форматы .wpt, .plt и .map грузятся
   в текущее окно; .gpx в новом окне запуском oziexp.exe. Если DLL
   нет или OziExplorer не запущен, файл тоже откроется в новом окне.
+  Место загрузки выбирается: у OziExplorer 75 треков, и .plt грузится
+  в выбранный номер — загрузка в занятый номер затирает прежний трек,
+  поэтому по умолчанию спрашиваем номер и после загрузки предлагаем
+  следующий. Точки .wpt можно добавить к уже загруженным или заменить
+  набор целиком (API умеет только замену файлом, добавление идёт по
+  точке и на больших файлах заметно медленнее). В диалоге загрузки
+  есть галочка «Запомнить»: она снимает вопрос, а вернуть его можно
+  в настройках.
   Пути к oziexp.exe и OziAPI.dll задаются в настройках
-  (F10 → OziExplorer); пусто — искать автоматически. Кнопка
+  (F10 → OziExplorer); пусто — искать автоматически. Там же — номер
+  трека и режим точек по умолчанию с галочками «Спрашивать». Кнопка
   «Скачать OziAPI» открывает страницу загрузки DLL на случай,
   если комплектный архив не подошёл.
 
 Настройки (F10):
-  У полей-путей (корневая папка, папка загрузок, oziexp.exe,
-  OziAPI.dll) справа есть кнопка «…» — выбрать папку или файл
-  в системном диалоге.
+  Разбиты на вкладки: Папки, Интерфейс, FTP, OziExplorer — чтобы
+  окно не разрасталось по высоте. У полей-путей (корневая папка,
+  папка загрузок, oziexp.exe, OziAPI.dll) справа есть кнопка «…» —
+  выбрать папку или файл в системном диалоге.
 
 Журнал слева:
   Панель можно показать или скрыть панель журнала кнопкой «Журнал»
@@ -3940,11 +4105,11 @@ OziExplorer:
 при закрытии окна.
 
 Папка загрузок:
-  Слежение включается в F10 («Следить за папкой загрузок») или в меню
-  «Загрузки». Когда в папке появляется новый .gpx, .plt или .wpt,
-  сервис предлагает перенести его в корень дерева или выбрать папку.
-  Временные файлы браузеров (.crdownload, .part и подобные) не
-  считаются готовыми и не предлагаются.
+  Слежение включается в F10 → Папки («Следить за папкой загрузок»)
+  или в меню «Загрузки». Когда в папке появляется новый .gpx, .plt
+  или .wpt, сервис предлагает перенести его в корень дерева или
+  выбрать папку. Временные файлы браузеров (.crdownload, .part и
+  подобные) не считаются готовыми и не предлагаются.
 
   Папка проверяется и по событиям системы, и дополнительно каждые
   несколько секунд — события могут не дойти на сетевом диске,
@@ -4007,7 +4172,7 @@ FTP-синхронизация:
   но не создаёт папки, не загружает и не удаляет файлы.
 
 Тема интерфейса:
-  Настройка «theme» в F10:
+  Настройка «theme» в F10 → Интерфейс:
     auto  — по системной теме Windows;
     light — светлая;
     dark  — тёмная.
@@ -4306,6 +4471,100 @@ class MoveDialog(QDialog):
                                     'Файл уже в этой папке')
             return
         self.result = self.current_dir
+        self.accept()
+
+
+class OziLoadDialog(QDialog):
+    """Куда загрузить файл в уже открытом окне OziExplorer.
+
+    У OziExplorer 75 треков, и загрузка .plt в занятый номер затирает
+    то, что в нём лежало, поэтому номер выбирается перед загрузкой.
+    Для .wpt выбор другой: файл точек API умеет только заменять набор,
+    добавлять приходится по точке — предлагаем выбрать режим.
+    """
+
+    def __init__(self, parent, path, mode: str = 'track',
+                 track_num: int = 1, wpt_mode: str = OZI_WPT_DEFAULT_MODE):
+        super().__init__(parent)
+        self.setWindowTitle('Загрузка в OziExplorer')
+        self.mode = mode
+        self.track_num = int(track_num)
+        self.wpt_mode = wpt_mode
+        self.remember = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel(f'Файл «{Path(path).name}» грузится в уже открытое '
+                       f'окно OziExplorer.')
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        if mode == 'track':
+            self.track_num = min(max(int(track_num), 1), OZI_TRACK_MAX)
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addWidget(QLabel('Номер трека:'))
+            self.spin = QSpinBox()
+            self.spin.setRange(1, OZI_TRACK_MAX)
+            self.spin.setValue(self.track_num)
+            self.spin.setToolTip(
+                f'У OziExplorer {OZI_TRACK_MAX} треков. Загрузка в занятый '
+                f'номер затирает то, что в нём было')
+            row.addWidget(self.spin)
+            row.addStretch(1)
+            layout.addLayout(row)
+
+            hint = QLabel('Если номер уже занят, лежавший в нём трек будет '
+                          'затёрт — выбирайте свободный. Показать треки '
+                          'можно в списке треков OziExplorer.')
+            hint.setObjectName('Dim')
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+        else:
+            self.append_rb = QRadioButton('Добавить к загруженным точкам')
+            self.append_rb.setToolTip(
+                'Точки файла добавляются к тем, что уже загружены '
+                'в OziExplorer')
+            self.replace_rb = QRadioButton('Заменить все загруженные точки')
+            self.replace_rb.setToolTip(
+                'Загружается только этот файл, прежние точки пропадают')
+            if wpt_mode == 'replace':
+                self.replace_rb.setChecked(True)
+            else:
+                self.append_rb.setChecked(True)
+            layout.addWidget(self.append_rb)
+            layout.addWidget(self.replace_rb)
+
+            hint = QLabel('Добавление идёт по точке, поэтому заметно '
+                          'медленнее на больших файлах.')
+            hint.setObjectName('Dim')
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+        self.remember_cb = QCheckBox('Запомнить и больше не спрашивать')
+        self.remember_cb.setToolTip(
+            'Включить обратно можно в настройках: F10 → OziExplorer')
+        layout.addWidget(self.remember_cb)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText('Загрузить')
+        buttons.button(QDialogButtonBox.Ok).setObjectName('Accent')
+        buttons.button(QDialogButtonBox.Cancel).setText('Отмена')
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept(self):
+        """Забирает выбор из виджетов и закрывает диалог."""
+        self.remember = bool(self.remember_cb.isChecked())
+        if self.mode == 'track':
+            self.track_num = int(self.spin.value())
+        else:
+            self.wpt_mode = ('append' if self.append_rb.isChecked()
+                             else 'replace')
         self.accept()
 
 

@@ -244,6 +244,39 @@ def stub_dialog(monkeypatch, attr, result=None, accepted=True,
     monkeypatch.setattr(gui, attr, Stub)
 
 
+def stub_ozi_dialog(monkeypatch, accepted=True, track_num=None,
+                    wpt_mode=None, remember=False):
+    """Подмена OziLoadDialog: сразу «нажимает» кнопку.
+
+    Возвращает список созданных диалогов — по ним видно, с каким местом
+    загрузки окно пригласило пользователя и что он выбрал.
+    """
+    calls = []
+
+    class Stub:
+        def __init__(self, parent, path, mode, track_num=1,
+                     wpt_mode='append'):
+            self.path = Path(path)
+            self.mode = mode
+            self.track_num = track_num
+            self.wpt_mode = wpt_mode
+            self.remember = False
+            calls.append(self)
+
+        def exec(self):
+            if not accepted:
+                return gui.QDialog.Rejected
+            if track_num is not None:
+                self.track_num = track_num
+            if wpt_mode is not None:
+                self.wpt_mode = wpt_mode
+            self.remember = remember
+            return gui.QDialog.Accepted
+
+    monkeypatch.setattr(gui, 'OziLoadDialog', Stub)
+    return calls
+
+
 def log_text(win):
     return win.log_edit.toPlainText()
 
@@ -1969,6 +2002,16 @@ class TestKmzToKml:
 
 @pytest.mark.story('Открытие в OziExplorer')
 class TestOpenInOzi:
+    @pytest.fixture(autouse=True)
+    def no_api(self, monkeypatch):
+        """Файл уходит в новое окно, диалога выбора места нет.
+
+        На машине с запущенным OziExplorer и найденной DLL настоящий
+        api_plan вернул бы действие, и модальный диалог остановил бы
+        прогон — выбор места проверяется отдельным классом ниже.
+        """
+        monkeypatch.setattr(gui, 'api_plan', lambda *a, **kw: '')
+
     def test_success_is_logged(self, window, files, monkeypatch):
         monkeypatch.setattr(gui, 'open_in_oziexplorer',
                             lambda *a, **kw: (True, 'открыто: track.plt'))
@@ -2021,6 +2064,279 @@ class TestOpenInOzi:
         window.on_open_in_ozi()
 
         assert 'вкладке «Файлы»' in window.notice_label.text()
+
+
+@pytest.mark.story('Выбор места загрузки в OziExplorer')
+class TestOziPositionChoice:
+    """Куда грузить файл в уже открытое окно OziExplorer.
+
+    У OziExplorer 75 треков, и загрузка .plt в занятый номер затирает
+    то, что в нём лежало, поэтому номер (и режим точек для .wpt)
+    выбирается перед загрузкой. Галочка «Запомнить» снимает вопрос, а
+    выбор сохраняется в конфиге — в том числе автоматический переход к
+    следующему номеру трека.
+    """
+
+    @pytest.fixture(autouse=True)
+    def saved(self, monkeypatch):
+        """save_config не пишет на диск, а отдаёт копии конфига."""
+        rec = types.SimpleNamespace(calls=[])
+        monkeypatch.setattr(gui, 'save_config',
+                            lambda cfg: rec.calls.append(dict(cfg)))
+        return rec
+
+    def api(self, monkeypatch, plan='track'):
+        monkeypatch.setattr(gui, 'api_plan', lambda *a, **kw: plan)
+
+    def loads(self, monkeypatch, ok=True, msg='ок'):
+        """Подменяет open_in_oziexplorer и запоминает аргументы."""
+        calls = []
+
+        def fake(path, **kw):
+            calls.append((path, kw))
+            return ok, msg
+
+        monkeypatch.setattr(gui, 'open_in_oziexplorer', fake)
+        return calls
+
+    def test_api_plan_gets_configured_paths(self, window, files, monkeypatch):
+        seen = []
+        monkeypatch.setattr(gui, 'api_plan',
+                            lambda p, exe='', dll='':
+                            seen.append((p, exe, dll)) or '')
+        window.config['ozi_exe'] = r'C:\Ozi\oziexp.exe'
+        window.config['ozi_api_dll'] = r'C:\Ozi\OziAPI.dll'
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert seen == [(files / 'track.plt', r'C:\Ozi\oziexp.exe',
+                         r'C:\Ozi\OziAPI.dll')]
+
+    def test_no_dialog_when_launching_exe(self, window, files, monkeypatch):
+        """Новое окно — затирать нечего, спрашивать не о чем."""
+        self.api(monkeypatch, plan='')
+        dlg = stub_ozi_dialog(monkeypatch)
+        self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert dlg == []
+
+    def test_track_dialog_gets_current_number(self, window, files,
+                                              monkeypatch):
+        self.api(monkeypatch, plan='track')
+        dlg = stub_ozi_dialog(monkeypatch)
+        self.loads(monkeypatch)
+        window.config['ozi_track_num'] = 6
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert len(dlg) == 1
+        assert dlg[0].mode == 'track'
+        assert dlg[0].track_num == 6
+
+    def test_track_number_from_dialog_is_used(self, window, files,
+                                              monkeypatch):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, track_num=9)
+        calls = self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert calls[0][1]['track_num'] == 9
+        # выбор пользователя запомнен, но после успешной загрузки
+        # предлагается уже следующий номер
+        assert window.config['ozi_track_num'] == 10
+
+    def test_dialog_cancel_skips_load(self, window, files, monkeypatch):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, accepted=False)
+        calls = self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert calls == []
+        assert '[OZI] Загрузка отменена' in log_text(window)
+
+    def test_cancel_does_not_change_config(self, window, files, monkeypatch):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, accepted=False)
+        self.loads(monkeypatch)
+        window.config['ozi_track_num'] = 3
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_track_num'] == 3
+
+    def test_ask_disabled_uses_saved_number(self, window, files, monkeypatch):
+        self.api(monkeypatch, plan='track')
+        dlg = stub_ozi_dialog(monkeypatch)
+        calls = self.loads(monkeypatch)
+        window.config.update({'ozi_track_ask': False, 'ozi_track_num': 6})
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert dlg == []
+        assert calls[0][1]['track_num'] == 6
+
+    def test_remember_clears_track_question(self, window, files, monkeypatch):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, track_num=2, remember=True)
+        self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_track_ask'] is False
+
+    def test_next_track_number_is_suggested(self, window, files, monkeypatch):
+        """Иначе «запомненный» номер затирал бы уже загруженный трек."""
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, track_num=2)
+        self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_track_num'] == 3
+
+    def test_bump_is_persisted(self, window, files, monkeypatch, saved):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, track_num=2)
+        self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert saved.calls
+        assert saved.calls[-1]['ozi_track_num'] == 3
+
+    def test_bump_stops_at_last_track(self, window, files, monkeypatch):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, track_num=gui.OZI_TRACK_MAX)
+        self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_track_num'] == gui.OZI_TRACK_MAX
+
+    def test_no_bump_on_failure(self, window, files, monkeypatch):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, track_num=4)
+        self.loads(monkeypatch, ok=False, msg='трек занят')
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_track_num'] == 4
+
+    def test_bad_number_in_config_is_clamped(self, window, files,
+                                             monkeypatch):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch)
+        calls = self.loads(monkeypatch)
+        window.config.update({'ozi_track_ask': False, 'ozi_track_num': 999})
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert calls[0][1]['track_num'] == gui.OZI_TRACK_MAX
+
+    def test_wpt_dialog_mode_is_used(self, window, files, monkeypatch):
+        self.api(monkeypatch, plan='wp')
+        stub_ozi_dialog(monkeypatch, wpt_mode='replace')
+        calls = self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert calls[0][1]['wpt_mode'] == 'replace'
+        assert window.config['ozi_wpt_mode'] == 'replace'
+
+    def test_wpt_remember_clears_question(self, window, files, monkeypatch):
+        self.api(monkeypatch, plan='wp')
+        stub_ozi_dialog(monkeypatch, wpt_mode='replace', remember=True)
+        self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_wpt_ask'] is False
+
+    def test_wpt_ask_disabled_uses_saved_mode(self, window, files,
+                                              monkeypatch):
+        self.api(monkeypatch, plan='wp')
+        dlg = stub_ozi_dialog(monkeypatch)
+        calls = self.loads(monkeypatch)
+        window.config.update({'ozi_wpt_ask': False,
+                              'ozi_wpt_mode': 'replace'})
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert dlg == []
+        assert calls[0][1]['wpt_mode'] == 'replace'
+
+    def test_bad_wpt_mode_falls_back_to_append(self, window, files,
+                                               monkeypatch):
+        self.api(monkeypatch, plan='wp')
+        stub_ozi_dialog(monkeypatch)
+        calls = self.loads(monkeypatch)
+        window.config.update({'ozi_wpt_ask': False,
+                              'ozi_wpt_mode': 'мусор'})
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert calls[0][1]['wpt_mode'] == 'append'
+
+    def test_wpt_load_does_not_bump_track_number(self, window, files,
+                                                 monkeypatch):
+        self.api(monkeypatch, plan='wp')
+        stub_ozi_dialog(monkeypatch)
+        self.loads(monkeypatch)
+        window.config['ozi_track_num'] = 5
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert window.config['ozi_track_num'] == 5
+
+    def test_declined_dialog_saves_nothing(self, window, files, monkeypatch,
+                                           saved):
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, accepted=False)
+        self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert saved.calls == []
+
+    def test_save_error_does_not_stop_load(self, window, files, monkeypatch):
+        """Не записался конфиг — файл всё равно грузится."""
+        self.api(monkeypatch, plan='track')
+        stub_ozi_dialog(monkeypatch, track_num=2)
+
+        def boom(cfg):
+            raise OSError('нет доступа')
+
+        monkeypatch.setattr(gui, 'save_config', boom)
+        calls = self.loads(monkeypatch)
+        select(window, files / 'track.plt')
+
+        window.on_open_in_ozi()
+
+        assert calls[0][1]['track_num'] == 2
+        assert '[НАСТР] Не сохранить конфиг' in log_text(window)
 
 
 # ─────────────────────────────────────────────────────────────────

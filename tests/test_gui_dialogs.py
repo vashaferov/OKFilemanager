@@ -1,7 +1,8 @@
 """Тесты диалогов GUI (ok_helper.gui).
 
 Функциональность: RenameDialog (F2), NewFolderDialog (Ctrl+N),
-MoveDialog (Ctrl+X), SettingsDialog (F10), HelpDialog (F1).
+MoveDialog (Ctrl+X), SettingsDialog (F10), HelpDialog (F1),
+OziLoadDialog (куда грузить файл в открытое окно OziExplorer).
 
 Диалоги не показываются: модальные окна и exec() не вызываются —
 проверяются поля, правила предзаполнения и результат _apply/_save.
@@ -23,6 +24,7 @@ from ok_helper.gui import (
     HelpDialog,
     MoveDialog,
     NewFolderDialog,
+    OziLoadDialog,
     RenameDialog,
     SettingsDialog,
 )
@@ -484,6 +486,20 @@ class TestSettingsDialog:
         assert 'не найден' in msgbox.texts()[0]
         assert dlg.fields['ozi_api_dll'].text() == ''   # поле не меняем
 
+    def test_ozi_hint_says_no_extra_enabling_needed(self, qapp, gui_config):
+        """В OziExplorer нет настройки «включить OziAPI».
+
+        Проверено по справке OziExplorer.chm (3.95.6f): слово OziAPI
+        встречается там только в истории версий, поэтому подсказка не
+        должна отправлять пользователя в Configuration → OziAPI.
+        """
+        dlg = SettingsDialog(None, gui_config)
+
+        hint = dlg.ozi_hint.text()
+
+        assert 'Configuration' not in hint
+        assert 'не нужно' in hint
+
     def test_password_is_masked(self, qapp, gui_config):
         dlg = SettingsDialog(None, gui_config)
 
@@ -588,6 +604,11 @@ class TestSettingsDialog:
         dlg.fields['base_url'].setText('  https://new.example.com/ftp  ')
         dlg.fields['ozi_exe'].setText(r'  C:\Ozi\oziexp.exe  ')
         dlg.fields['ozi_api_dll'].setText(r'  C:\Ozi\OziAPI.dll  ')
+        dlg.ozi_track_spin.setValue(12)
+        dlg.ozi_wpt_combo.setCurrentIndex(
+            dlg.ozi_wpt_combo.findData('replace'))
+        dlg.ozi_track_ask_cb.setChecked(False)
+        dlg.ozi_wpt_ask_cb.setChecked(False)
         dlg.theme_combo.setCurrentText('dark')
         dlg.watch_cb.setChecked(True)
         dlg.help_cb.setChecked(True)
@@ -608,6 +629,10 @@ class TestSettingsDialog:
         assert gui_config['base_url'] == 'https://new.example.com/ftp'
         assert gui_config['ozi_exe'] == r'C:\Ozi\oziexp.exe'
         assert gui_config['ozi_api_dll'] == r'C:\Ozi\OziAPI.dll'
+        assert gui_config['ozi_track_num'] == 12
+        assert gui_config['ozi_wpt_mode'] == 'replace'
+        assert gui_config['ozi_track_ask'] is False
+        assert gui_config['ozi_wpt_ask'] is False
         assert gui_config['theme'] == 'dark'
         assert gui_config['watch_downloads'] is True
         assert gui_config['help_visible_at_start'] is True
@@ -647,6 +672,310 @@ class TestSettingsDialog:
         dlg._save()
 
         assert gui_config['theme'] == 'light'
+
+
+@pytest.mark.story('Вкладки в настройках')
+class TestSettingsTabs:
+    """F10 разбито на вкладки, чтобы окно не разрасталось по высоте.
+
+    Все разделы подряд давали окно 851x982; вкладки оставляют ту же
+    функциональность, но высоту определяет самая высокая вкладка.
+    """
+
+    def test_tab_names(self, qapp, gui_config):
+        dlg = SettingsDialog(None, gui_config)
+
+        names = [dlg.tabs.tabText(i) for i in range(dlg.tabs.count())]
+
+        assert names == ['Папки', 'Интерфейс', 'FTP', 'OziExplorer']
+
+    @pytest.mark.parametrize('key,tab', [
+        ('root_dir', 'Папки'),
+        ('downloads_dir', 'Папки'),
+        ('ftp_host', 'FTP'),
+        ('base_url', 'FTP'),
+        ('ozi_exe', 'OziExplorer'),
+        ('ozi_api_dll', 'OziExplorer'),
+    ])
+    def test_fields_live_on_expected_tabs(self, qapp, gui_config, key, tab):
+        dlg = SettingsDialog(None, gui_config)
+
+        assert dlg.tabs.tabText(dlg._tab_of(dlg.fields[key])) == tab
+
+    @pytest.mark.parametrize('attr,tab', [
+        ('watch_cb', 'Папки'),
+        ('theme_combo', 'Интерфейс'),
+        ('help_cb', 'Интерфейс'),
+        ('log_visible_cb', 'Интерфейс'),
+        ('blocking_errors_cb', 'Интерфейс'),
+        ('ftp_readonly_cb', 'FTP'),
+        ('ozi_download_btn', 'OziExplorer'),
+        ('ozi_extract_btn', 'OziExplorer'),
+        ('ozi_track_spin', 'OziExplorer'),
+        ('ozi_wpt_combo', 'OziExplorer'),
+        ('ozi_track_ask_cb', 'OziExplorer'),
+        ('ozi_wpt_ask_cb', 'OziExplorer'),
+    ])
+    def test_widgets_live_on_expected_tabs(self, qapp, gui_config, attr, tab):
+        dlg = SettingsDialog(None, gui_config)
+
+        assert dlg.tabs.tabText(dlg._tab_of(getattr(dlg, attr))) == tab
+
+    def test_bad_root_dir_switches_to_folders_tab(self, qapp, gui_config,
+                                                  msgbox, tmp_path):
+        """Поле с ошибкой может быть на скрытой вкладке — показываем её."""
+        dlg = SettingsDialog(None, gui_config)
+        dlg.tabs.setCurrentIndex(2)                      # уходим на «FTP»
+        dlg.fields['root_dir'].setText(str(tmp_path / 'нет-такой-папки'))
+
+        dlg._save()
+
+        assert msgbox.kinds == ['critical']
+        assert dlg.tabs.tabText(dlg.tabs.currentIndex()) == 'Папки'
+
+    def test_bad_downloads_dir_switches_to_folders_tab(self, qapp, gui_config,
+                                                       msgbox, tmp_path):
+        dlg = SettingsDialog(None, gui_config)
+        dlg.tabs.setCurrentIndex(2)
+        dlg.fields['downloads_dir'].setText(str(tmp_path / 'нет-такой'))
+
+        dlg._save()
+
+        assert msgbox.kinds == ['critical']
+        assert dlg.tabs.tabText(dlg.tabs.currentIndex()) == 'Папки'
+
+    def test_bad_port_switches_to_ftp_tab(self, qapp, gui_config, msgbox):
+        dlg = SettingsDialog(None, gui_config)
+        dlg.tabs.setCurrentIndex(0)
+        dlg.fields['ftp_port'].setText('0')
+
+        dlg._save()
+
+        assert msgbox.kinds == ['critical']
+        assert dlg.tabs.tabText(dlg.tabs.currentIndex()) == 'FTP'
+
+    def test_dialog_is_compact(self, qapp, gui_config):
+        dlg = SettingsDialog(None, gui_config)
+
+        assert dlg.minimumSizeHint().height() < 700
+        assert dlg.minimumSizeHint().width() < 700
+
+    def test_no_page_content_is_clipped(self, qapp, gui_config):
+        """Содержимое каждой вкладки помещается целиком."""
+        dlg = SettingsDialog(None, gui_config)
+        dlg.show()
+        qapp.processEvents()
+
+        for i in range(dlg.tabs.count()):
+            page = dlg.tabs.widget(i)
+            dlg.tabs.setCurrentIndex(i)
+            qapp.processEvents()
+            need = page.minimumSizeHint()
+            assert page.width() >= need.width(), dlg.tabs.tabText(i)
+            assert page.height() >= need.height(), dlg.tabs.tabText(i)
+
+        dlg.close()
+
+    def test_ozi_buttons_fit_on_their_tab(self, qapp, gui_config):
+        """Строку кнопок OziAPI не сжимает — иначе текст обрезается."""
+        dlg = SettingsDialog(None, gui_config)
+        dlg.show()
+        dlg.tabs.setCurrentIndex(dlg.tabs.count() - 1)
+        qapp.processEvents()
+
+        row = dlg.ozi_download_btn.parentWidget()
+        need = (dlg.ozi_download_btn.sizeHint().width()
+                + dlg.ozi_extract_btn.sizeHint().width())
+
+        assert row.width() >= need
+        dlg.close()
+
+
+@pytest.mark.story('Выбор места загрузки в OziExplorer')
+class TestOziPositionSettings:
+    """Поля «куда грузить» на вкладке OziExplorer (F10)."""
+
+    def test_track_spin_range(self, qapp, gui_config):
+        dlg = SettingsDialog(None, gui_config)
+
+        assert dlg.ozi_track_spin.minimum() == 1
+        assert dlg.ozi_track_spin.maximum() == gui.OZI_TRACK_MAX
+
+    def test_track_spin_from_config(self, qapp, gui_config):
+        gui_config['ozi_track_num'] = 9
+
+        assert SettingsDialog(None, gui_config).ozi_track_spin.value() == 9
+
+    @pytest.mark.parametrize('raw,expected', [
+        (0, 1), (-4, 1), (76, 75), (1000, 75),
+    ])
+    def test_track_spin_clamps_bad_config(self, qapp, gui_config, raw,
+                                          expected):
+        """Мусор в конфиге не должен ронять окно настроек."""
+        gui_config['ozi_track_num'] = raw
+
+        assert SettingsDialog(None, gui_config).ozi_track_spin.value() == \
+            expected
+
+    def test_track_spin_survives_text(self, qapp, gui_config):
+        gui_config['ozi_track_num'] = 'abc'
+
+        assert SettingsDialog(None, gui_config).ozi_track_spin.value() == 1
+
+    def test_wpt_combo_items(self, qapp, gui_config):
+        dlg = SettingsDialog(None, gui_config)
+
+        data = [dlg.ozi_wpt_combo.itemData(i)
+                for i in range(dlg.ozi_wpt_combo.count())]
+
+        assert data == list(gui.OZI_WPT_MODES)
+
+    def test_wpt_combo_from_config(self, qapp, gui_config):
+        gui_config['ozi_wpt_mode'] = 'replace'
+
+        assert SettingsDialog(None, gui_config).ozi_wpt_combo \
+            .currentData() == 'replace'
+
+    def test_wpt_combo_bad_config_falls_back_to_append(self, qapp,
+                                                       gui_config):
+        gui_config['ozi_wpt_mode'] = 'что-то своё'
+
+        assert SettingsDialog(None, gui_config).ozi_wpt_combo \
+            .currentData() == 'append'
+
+    def test_ask_checkboxes_default_true(self, qapp, gui_config):
+        dlg = SettingsDialog(None, gui_config)
+
+        assert dlg.ozi_track_ask_cb.isChecked() is True
+        assert dlg.ozi_wpt_ask_cb.isChecked() is True
+
+    def test_ask_checkboxes_reflect_config(self, qapp, gui_config):
+        gui_config['ozi_track_ask'] = False
+        gui_config['ozi_wpt_ask'] = False
+
+        dlg = SettingsDialog(None, gui_config)
+
+        assert dlg.ozi_track_ask_cb.isChecked() is False
+        assert dlg.ozi_wpt_ask_cb.isChecked() is False
+
+    def test_ask_checkboxes_explain_themselves(self, qapp, gui_config):
+        """Галочки снимаются диалогом загрузки — об этом надо сказать."""
+        dlg = SettingsDialog(None, gui_config)
+
+        assert 'Запомнить' in dlg.ozi_track_ask_cb.toolTip()
+        assert 'Запомнить' in dlg.ozi_wpt_ask_cb.toolTip()
+
+
+@pytest.mark.story('Диалог выбора места загрузки')
+class TestOziLoadDialog:
+    """OziLoadDialog: номер трека для .plt или добавление/замена .wpt."""
+
+    def test_track_mode_shows_spin(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track',
+                            track_num=5)
+
+        assert dlg.spin.value() == 5
+        assert dlg.spin.minimum() == 1
+        assert dlg.spin.maximum() == gui.OZI_TRACK_MAX
+
+    @pytest.mark.parametrize('raw,expected', [
+        (0, 1), (-3, 1), (100, gui.OZI_TRACK_MAX),
+    ])
+    def test_track_number_is_clamped(self, qapp, tmp_path, raw, expected):
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track',
+                            track_num=raw)
+
+        assert dlg.spin.value() == expected
+
+    def test_file_name_is_shown(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'трек.plt', 'track')
+
+        assert 'трек.plt' in dlg.findChild(gui.QLabel).text()
+
+    def test_track_accept_reads_spin(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track')
+        dlg.spin.setValue(23)
+
+        dlg._accept()
+
+        assert dlg.track_num == 23
+        assert dlg.mode == 'track'
+
+    def test_wpt_mode_defaults_to_append(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'points.wpt', 'wp')
+
+        assert dlg.append_rb.isChecked() is True
+        assert dlg.replace_rb.isChecked() is False
+
+    def test_wpt_mode_prefilled_from_config(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'points.wpt', 'wp',
+                            wpt_mode='replace')
+
+        assert dlg.replace_rb.isChecked() is True
+
+    def test_wpt_accept_reads_radio(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'points.wpt', 'wp')
+        dlg.replace_rb.setChecked(True)
+
+        dlg._accept()
+
+        assert dlg.wpt_mode == 'replace'
+
+    def test_wpt_accept_append(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'points.wpt', 'wp',
+                            wpt_mode='replace')
+        dlg.append_rb.setChecked(True)
+
+        dlg._accept()
+
+        assert dlg.wpt_mode == 'append'
+
+    def test_remember_defaults_to_false(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track')
+
+        assert dlg.remember_cb.isChecked() is False
+        assert dlg.remember is False
+
+    def test_remember_is_read_on_accept(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track')
+        dlg.remember_cb.setChecked(True)
+
+        dlg._accept()
+
+        assert dlg.remember is True
+
+    def test_remember_explains_how_to_turn_it_back(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track')
+
+        assert 'F10' in dlg.remember_cb.toolTip()
+
+    def test_ok_button_says_load(self, qapp, tmp_path):
+        """Кнопки диалога: действие, а не «ОК»."""
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track')
+        box = dlg.findChild(gui.QDialogButtonBox)
+
+        assert box.button(gui.QDialogButtonBox.Ok).text() == 'Загрузить'
+        assert box.button(gui.QDialogButtonBox.Cancel).text() == 'Отмена'
+
+    def test_reject_keeps_values(self, qapp, tmp_path):
+        """Отмена — настройки не меняются, загрузки не будет."""
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track',
+                            track_num=4)
+        dlg.spin.setValue(30)
+        dlg.reject()
+
+        assert dlg.track_num == 4
+        assert dlg.remember is False
+
+    def test_has_no_track_widgets_in_wpt_mode(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'points.wpt', 'wp')
+
+        assert not hasattr(dlg, 'spin')
+
+    def test_has_no_radio_widgets_in_track_mode(self, qapp, tmp_path):
+        dlg = OziLoadDialog(None, tmp_path / 'track.plt', 'track')
+
+        assert not hasattr(dlg, 'append_rb')
 
 
 @pytest.mark.story('Выбор пути в настройках')
@@ -784,3 +1113,7 @@ class TestHelpDialog:
     def test_help_explains_double_click_on_file(self):
         """README: двойной клик по файлу — меню действий, а не открытие."""
         assert 'меню доступных действий' in HelpDialog.HELP_TEXT
+
+    def test_help_has_no_ozi_api_setting_pointer(self):
+        """Справка ссылалась на отсутствующий пункт Configuration → OziAPI."""
+        assert 'Configuration' not in HelpDialog.HELP_TEXT

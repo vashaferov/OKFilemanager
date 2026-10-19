@@ -14,6 +14,7 @@ WinAPI подменяются, реестр и PATH изолируются.
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
 
+import json
 import queue
 import sys
 import zipfile
@@ -23,10 +24,15 @@ import allure
 import pytest
 
 from ok_helper import ozi
+from ok_helper.wpt import Waypoint
 from ok_helper.ozi import (
     OZI_API_DOWNLOAD_URL,
     OZI_FILE_SUFFIXES,
+    OZI_TRACK_MAX,
+    OZI_WPT_DEFAULT_MODE,
+    OZI_WPT_MODES,
     OziApiBridge,
+    api_plan,
     extract_bundled_api,
     find_ozi_api,
     find_oziexplorer,
@@ -66,6 +72,20 @@ def make_file(path: Path, text: str = '') -> Path:
     return path
 
 
+# Два waypoint'а в реальном формате: cp1251, высота в футах, дата
+# TDateTime. Второй без даты и с неизвестной высотой (-777).
+WPT_SAMPLE = (
+    'OziExplorer Waypoint File Version 1.1\r\n'
+    'WGS 84\r\n'
+    'Reserved 2\r\n'
+    'garmin\r\n'
+    '1,Дом,55.755800,37.617300,44927.5,1,1,5,0,2,0,1,0,328,-1,-1,-1,'
+    '0,0,0,0,0,0\r\n'
+    '2,Точка2,55.700000,37.700000,,3,1,5,0,2,0,1,0,-777,-1,-1,-1,'
+    '0,0,0,0,0,0\r\n'
+).encode('cp1251')
+
+
 def make_zip(path: Path, members) -> Path:
     """Создаёт zip с заданными элементами (имя -> байты)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,6 +93,12 @@ def make_zip(path: Path, members) -> Path:
         for name, data in members.items():
             zf.writestr(name, data)
     return path
+
+
+@pytest.fixture(scope='module')
+def bridge_script() -> str:
+    """Текст скрипта-моста: он обязан быть ASCII (PowerShell 5.1)."""
+    return ozi._BRIDGE_SCRIPT.read_text(encoding='ascii')
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -471,6 +497,56 @@ class TestDownloadUrl:
 
 
 # ─────────────────────────────────────────────────────────────────
+# 3б. Скрипт-мост: то, что нельзя поймать на подменённом процессе
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Скрипт-мост ozi_api_bridge.ps1')
+class TestBridgeScript:
+    """Проверки самого скрипта: мост исполняет PowerShell, не Python."""
+
+    def test_is_ascii_only(self, bridge_script):
+        """PowerShell 5.1 читает .ps1 как ANSI: кириллица сломала бы мост.
+
+        Чтение с encoding='ascii' в фикстуре уже это гарантирует; тест
+        оставлен, чтобы отказ был понятен по имени.
+        """
+        assert bridge_script.isascii()
+
+    @pytest.mark.smoke
+    def test_waypoints_iterated_with_foreach(self, bridge_script):
+        """Список точек разбирается foreach, а не @(...).
+
+        Проверено на живом PowerShell 5.1: ``@($json | ConvertFrom-Json)``
+        даёт массив из ОДНОГО элемента (весь список), поэтому поля точки
+        не читаются, и файл из нескольких точек не добавлялся вовсе.
+        """
+        code = [line for line in bridge_script.splitlines()
+                if not line.lstrip().startswith('#')]
+
+        assert 'foreach ($p in ($json | ConvertFrom-Json))' in bridge_script
+        assert not [line for line in code
+                    if '@($json | ConvertFrom-Json)' in line]
+
+    def test_loads_track_into_given_slot(self, bridge_script):
+        assert 'oziLoadTrackFile($track' in bridge_script
+
+    def test_shows_tracks_and_refreshes(self, bridge_script):
+        """Иначе загруженный в другой номер трек остаётся скрытым."""
+        assert 'oziShowAllTracks()' in bridge_script
+        assert 'oziShowTrack($track)' in bridge_script
+        assert 'oziRefreshMap()' in bridge_script
+
+    def test_declares_waypoint_api(self, bridge_script):
+        assert 'oziCreateWPex' in bridge_script
+
+    def test_declares_stdcall(self, bridge_script):
+        assert bridge_script.count('CallingConvention.StdCall') >= 10
+
+    def test_reports_counters(self, bridge_script):
+        assert "' created={0} failed={1}'" in bridge_script
+
+
+# ─────────────────────────────────────────────────────────────────
 # 4. 32-битный PowerShell и поиск запущенного OziExplorer
 # ─────────────────────────────────────────────────────────────────
 
@@ -769,6 +845,84 @@ class TestOziApiBridge:
         assert bridge.load(p) is True
         assert len(fake_popen['procs']) == 2
 
+    # --- добавление точек (addwpts) ---
+
+    def test_add_waypoints_command(self, tmp_path, fake_popen):
+        fake_popen['answer'] = (
+            lambda cmd: 'OZI_RESULT found=0 rc=0 created=3 failed=1')
+        bridge = make_bridge(tmp_path, timeout=1.0)
+        points = [Waypoint(name='Дом', lat=55.7, lon=37.6),
+                  Waypoint(name='Точка', lat=55.8, lon=37.9)]
+
+        assert bridge.add_waypoints(points) == (3, 1)
+        line = fake_popen['proc'].written[-1]
+        assert line.startswith('addwpts\t')
+        assert '"name":"Дом"' not in line          # JSON в ASCII
+        assert '\\u0414\\u043e\\u043c' in line
+
+    def test_add_waypoints_payload_is_json_array(self, tmp_path, fake_popen):
+        fake_popen['answer'] = lambda cmd: 'OZI_RESULT found=0 rc=0 created=2'
+        bridge = make_bridge(tmp_path, timeout=1.0)
+        points = [Waypoint(name='A', lat=1.0, lon=2.0, altitude_m=100.5),
+                  Waypoint(name='B', lat=3.0, lon=4.0)]
+
+        bridge.add_waypoints(points)
+
+        data = json.loads(fake_popen['proc'].written[-1].split('\t', 1)[1])
+        assert [p['name'] for p in data] == ['A', 'B']
+        assert data[0]['lat'] == 1.0
+        assert data[0]['altitude'] == 100.5
+        # поля, которые API ждёт всегда, есть у каждой точки
+        for key in ('symbol', 'date', 'description', 'fontSize',
+                    'proximityRoute'):
+            assert key in data[1]
+
+    def test_add_waypoints_empty_list_not_sent(self, tmp_path, fake_popen):
+        """Пустой список не гоняем: мост ответил бы rc=-4."""
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge.add_waypoints([]) == (0, 0)
+        # запрос всё же уходит одним пакетом с пустым массивом
+        assert fake_popen['proc'].written[-1] == 'addwpts\t[]'
+
+    def test_add_waypoints_nothing_created(self, tmp_path, fake_popen):
+        fake_popen['answer'] = (
+            lambda cmd: 'OZI_RESULT found=0 rc=-4 created=0 failed=5')
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge.add_waypoints([Waypoint(name='A')]) is None
+
+    def test_add_waypoints_not_running(self, tmp_path, fake_popen):
+        fake_popen['answer'] = lambda cmd: 'OZI_RESULT found=-1 rc=-1'
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge.add_waypoints([Waypoint(name='A')]) is None
+
+    def test_add_waypoints_timeout(self, tmp_path, fake_popen):
+        fake_popen['answer'] = lambda cmd: None
+        bridge = make_bridge(tmp_path, timeout=0.2)
+
+        assert bridge.add_waypoints([Waypoint(name='A')]) is None
+
+    def test_result_parses_extras(self, tmp_path, fake_popen):
+        fake_popen['answer'] = (
+            lambda cmd: 'OZI_RESULT found=0 rc=0 created=7 failed=2')
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge._result('addwpts\t[]') == {
+            'found': 0, 'rc': 0, 'created': 7, 'failed': 2}
+
+    def test_result_without_extras(self, tmp_path, fake_popen):
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge._result('find') == {'found': 0, 'rc': 0}
+
+    def test_result_garbage_line(self, tmp_path, fake_popen):
+        fake_popen['answer'] = lambda cmd: 'OZI_RESULT какой-то мусор'
+        bridge = make_bridge(tmp_path, timeout=1.0)
+
+        assert bridge._result('find') is None
+
     def test_stop_sends_quit(self, tmp_path, fake_popen):
         bridge = make_bridge(tmp_path, timeout=1.0)
         bridge.start()
@@ -869,17 +1023,41 @@ class TestGetBridge:
 class FakeBridge:
     """Подмена OziApiBridge для проверки логики open_in_oziexplorer."""
 
-    def __init__(self, ok=True):
+    def __init__(self, ok=True, add_ok=True, add_counts=None):
         self.ok = ok
+        self.add_ok = add_ok
+        # (создано, не удалось); None — считать по числу точек
+        self.add_counts = add_counts
         self.loads = []
+        self.added = []
 
     def load(self, path, track_num=1):
         self.loads.append((Path(path), track_num))
         return self.ok
 
+    def add_waypoints(self, points):
+        self.added.append(list(points))
+        if not self.add_ok:
+            return None
+        return self.add_counts or (len(points), 0)
+
 
 @pytest.mark.story('open_in_oziexplorer')
 class TestOpenInOziExplorer:
+    def api_ready(self, monkeypatch, tmp_path, bridge=None, running=True,
+                  dll=None):
+        """«OziExplorer открыт и DLL на месте» + подмена моста."""
+        monkeypatch.setattr(ozi, 'find_oziexplorer',
+                            lambda cfg='': tmp_path / 'oziexp.exe')
+        monkeypatch.setattr(
+            ozi, 'find_ozi_api',
+            lambda cfg='', exe=None: (tmp_path / 'OziAPI.dll' if dll is None
+                                      else dll))
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: running)
+        if bridge is not None:
+            monkeypatch.setattr(ozi, 'get_bridge', lambda dll: bridge)
+        return bridge
+
     def test_missing_file(self, tmp_path):
         ok, msg = open_in_oziexplorer(tmp_path / 'nope.gpx')
 
@@ -917,31 +1095,103 @@ class TestOpenInOziExplorer:
         src = make_file(tmp_path / 'points.wpt')
         launched = []
         bridge = FakeBridge()
-        monkeypatch.setattr(ozi, 'find_oziexplorer',
-                            lambda cfg='': tmp_path / 'oziexp.exe')
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
-        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
-        monkeypatch.setattr(ozi, 'get_bridge', lambda dll: bridge)
+        self.api_ready(monkeypatch, tmp_path, bridge)
         monkeypatch.setattr(ozi.subprocess, 'Popen',
                             lambda args: launched.append(args))
 
-        ok, msg = open_in_oziexplorer(src)
+        ok, msg = open_in_oziexplorer(src, wpt_mode='replace')
 
         assert ok is True
         assert 'открытое окно' in msg
         assert bridge.loads == [(src, 1)]
         assert launched == []
 
+    def test_wpt_append_adds_points(self, tmp_path, monkeypatch):
+        src = tmp_path / 'points.wpt'
+        src.write_bytes(WPT_SAMPLE)
+        bridge = FakeBridge()
+        self.api_ready(monkeypatch, tmp_path, bridge)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is True
+        assert 'добавлено точек' in msg
+        assert '2' in msg
+        assert len(bridge.added) == 1
+        assert len(bridge.added[0]) == 2
+        assert bridge.loads == []
+
+    def test_wpt_append_is_default(self, tmp_path, monkeypatch):
+        src = tmp_path / 'points.wpt'
+        src.write_bytes(WPT_SAMPLE)
+        bridge = FakeBridge()
+        self.api_ready(monkeypatch, tmp_path, bridge)
+
+        open_in_oziexplorer(src)
+
+        assert bridge.added and not bridge.loads
+
+    def test_wpt_replace_uses_load(self, tmp_path, monkeypatch):
+        src = tmp_path / 'points.wpt'
+        src.write_bytes(WPT_SAMPLE)
+        bridge = FakeBridge()
+        self.api_ready(monkeypatch, tmp_path, bridge)
+
+        ok, msg = open_in_oziexplorer(src, wpt_mode='replace')
+
+        assert ok is True
+        assert bridge.loads == [(src, 1)]
+        assert bridge.added == []
+
+    def test_wpt_append_without_points_fails(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'empty.wpt')
+        bridge = FakeBridge()
+        self.api_ready(monkeypatch, tmp_path, bridge)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is False
+        assert 'нет точек' in msg
+        assert bridge.added == []
+
+    def test_wpt_append_failure_suggests_replace(self, tmp_path, monkeypatch):
+        src = tmp_path / 'points.wpt'
+        src.write_bytes(WPT_SAMPLE)
+        bridge = FakeBridge(add_ok=False)
+        self.api_ready(monkeypatch, tmp_path, bridge)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is False
+        assert 'заменить' in msg
+
+    def test_wpt_append_reports_rejected_points(self, tmp_path, monkeypatch):
+        """Часть точек OziExplorer может не взять — об этом говорим."""
+        src = tmp_path / 'points.wpt'
+        src.write_bytes(WPT_SAMPLE)
+        bridge = FakeBridge(add_counts=(2, 1))
+        self.api_ready(monkeypatch, tmp_path, bridge)
+
+        ok, msg = open_in_oziexplorer(src)
+
+        assert ok is True
+        assert 'добавлено точек' in msg
+        assert 'не удалось: 1' in msg
+
     def test_track_number_is_passed(self, tmp_path, monkeypatch):
         src = make_file(tmp_path / 'track.plt')
         bridge = FakeBridge()
-        monkeypatch.setattr(ozi, 'find_oziexplorer',
-                            lambda cfg='': tmp_path / 'oziexp.exe')
-        monkeypatch.setattr(ozi, 'find_ozi_api',
-                            lambda cfg='', exe=None: tmp_path / 'OziAPI.dll')
-        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: True)
-        monkeypatch.setattr(ozi, 'get_bridge', lambda dll: bridge)
+        self.api_ready(monkeypatch, tmp_path, bridge)
+
+        ok, _ = open_in_oziexplorer(src, track_num=7)
+
+        assert ok is True
+        assert bridge.loads == [(src, 7)]
+
+    def test_map_loads_ignores_track_number(self, tmp_path, monkeypatch):
+        src = make_file(tmp_path / 'map.map')
+        bridge = FakeBridge()
+        self.api_ready(monkeypatch, tmp_path, bridge)
 
         ok, _ = open_in_oziexplorer(src, track_num=7)
 
@@ -961,7 +1211,7 @@ class TestOpenInOziExplorer:
         monkeypatch.setattr(ozi.subprocess, 'Popen',
                             lambda args: launched.append(args))
 
-        ok, msg = open_in_oziexplorer(src)
+        ok, msg = open_in_oziexplorer(src, wpt_mode='replace')
 
         assert ok is True
         assert launched == [[str(exe), str(src)]]
@@ -1043,3 +1293,50 @@ class TestOpenInOziExplorer:
 
 def test_supported_suffixes():
     assert OZI_FILE_SUFFIXES == {'.gpx', '.plt', '.wpt', '.map'}
+
+
+def test_track_and_wpt_mode_constants():
+    assert OZI_TRACK_MAX == 75
+    assert OZI_WPT_MODES == ('append', 'replace')
+    assert OZI_WPT_DEFAULT_MODE in OZI_WPT_MODES
+
+
+@pytest.mark.story('api_plan: пойдёт ли файл в открытое окно')
+class TestApiPlan:
+    def ready(self, monkeypatch, tmp_path, running=True, dll=True):
+        monkeypatch.setattr(ozi, 'find_oziexplorer',
+                            lambda cfg='': tmp_path / 'oziexp.exe')
+        monkeypatch.setattr(ozi, 'find_ozi_api',
+                            lambda cfg='', exe=None: (tmp_path / 'OziAPI.dll'
+                                                      if dll else None))
+        monkeypatch.setattr(ozi, 'is_oziexplorer_running', lambda: running)
+
+    def test_track(self, tmp_path, monkeypatch):
+        self.ready(monkeypatch, tmp_path)
+
+        assert api_plan(tmp_path / 'track.plt') == 'track'
+
+    def test_waypoints(self, tmp_path, monkeypatch):
+        self.ready(monkeypatch, tmp_path)
+
+        assert api_plan(tmp_path / 'points.wpt') == 'wp'
+
+    def test_map(self, tmp_path, monkeypatch):
+        self.ready(monkeypatch, tmp_path)
+
+        assert api_plan(tmp_path / 'map.map') == 'map'
+
+    def test_gpx_has_no_api_action(self, tmp_path, monkeypatch):
+        self.ready(monkeypatch, tmp_path)
+
+        assert api_plan(tmp_path / 'track.gpx') == ''
+
+    def test_without_dll(self, tmp_path, monkeypatch):
+        self.ready(monkeypatch, tmp_path, dll=False)
+
+        assert api_plan(tmp_path / 'track.plt') == ''
+
+    def test_without_running_oziexplorer(self, tmp_path, monkeypatch):
+        self.ready(monkeypatch, tmp_path, running=False)
+
+        assert api_plan(tmp_path / 'track.plt') == ''

@@ -56,12 +56,29 @@ DEFAULT_CONFIG = {
     'ozi_exe': '',
     # Путь к OziAPI.dll. Пусто — искать рядом с oziexp.exe.
     'ozi_api_dll': '',
+    # Номер трека (1..75) для следующей загрузки .plt в открытое окно:
+    # у OziExplorer 75 треков, и загрузка в занятый номер затирает его.
+    # После успешной загрузки номер увеличивается на 1, а спрашивать ли
+    # его каждый раз, решает ozi_track_ask.
+    'ozi_track_num': 1,
+    'ozi_track_ask': True,
+    # Что делать с уже загруженными точками при загрузке .wpt:
+    # 'append' — добавить к ним, 'replace' — заменить набор.
+    'ozi_wpt_mode': 'append',
+    'ozi_wpt_ask': True,
 }
 
 
 # Логические настройки: при чтении приводятся к bool.
 _BOOL_KEYS = ('watch_downloads', 'ftp_readonly', 'help_visible_at_start',
-              'first_run', 'log_visible', 'blocking_errors')
+              'first_run', 'log_visible', 'blocking_errors',
+              'ozi_track_ask', 'ozi_wpt_ask')
+
+# Режимы загрузки точек (см. ok_helper.ozi.OZI_WPT_MODES).
+_WPT_MODES = ('append', 'replace')
+
+# Сколько треков у OziExplorer (см. ok_helper.ozi.OZI_TRACK_MAX).
+_TRACK_MAX = 75
 
 
 _LITERAL_KEYS = {
@@ -201,13 +218,22 @@ def load_config() -> dict:
     except (ValueError, TypeError):
         cfg['log_dock_height'] = 180
 
+    try:
+        cfg['ozi_track_num'] = int(cfg.get('ozi_track_num', 1))
+    except (ValueError, TypeError):
+        cfg['ozi_track_num'] = 1
+    cfg['ozi_track_num'] = min(max(cfg['ozi_track_num'], 1), _TRACK_MAX)
+
+    if cfg.get('ozi_wpt_mode') not in _WPT_MODES:
+        cfg['ozi_wpt_mode'] = DEFAULT_CONFIG['ozi_wpt_mode']
+
     for key in _BOOL_KEYS:
         cfg[key] = bool(cfg.get(key, DEFAULT_CONFIG[key]))
 
     for k in ('root_dir', 'downloads_dir', 'ftp_host', 'ftp_user',
               'ftp_password', 'ftp_path', 'base_url', 'window_geometry',
               'splitter_state', 'tree_column_widths',
-              'ozi_exe', 'ozi_api_dll'):
+              'ozi_exe', 'ozi_api_dll', 'ozi_wpt_mode'):
         cfg[k] = str(cfg.get(k, DEFAULT_CONFIG[k]))
 
     cfg['root_dir_resolved'] = _as_path(cfg['root_dir'])
@@ -254,6 +280,17 @@ def save_config(cfg: dict):
     tree_column_widths = str(cfg.get('tree_column_widths', ''))
     ozi_exe = str(cfg.get('ozi_exe', ''))
     ozi_api_dll = str(cfg.get('ozi_api_dll', ''))
+    try:
+        ozi_track_num = int(cfg.get('ozi_track_num', 1))
+    except (ValueError, TypeError):
+        ozi_track_num = 1
+    ozi_track_num = min(max(ozi_track_num, 1), _TRACK_MAX)
+    ozi_wpt_mode = str(cfg.get('ozi_wpt_mode',
+                               DEFAULT_CONFIG['ozi_wpt_mode']))
+    if ozi_wpt_mode not in _WPT_MODES:
+        ozi_wpt_mode = DEFAULT_CONFIG['ozi_wpt_mode']
+    ozi_track_ask = bools['ozi_track_ask']
+    ozi_wpt_ask = bools['ozi_wpt_ask']
 
     lines = [
         '# Конфиг ok-filemanager',
@@ -303,9 +340,23 @@ def save_config(cfg: dict):
         '#                если DLL найдена и OziExplorer запущен, файл',
         '#                грузится в текущее окно через API, иначе',
         '#                запускается exe.',
+        '# ozi_track_num — номер трека (1..75) для следующей загрузки .plt;',
+        '#                у OziExplorer 75 треков, загрузка в занятый номер',
+        '#                затирает его, поэтому после успешной загрузки',
+        '#                номер увеличивается на 1;',
+        '# ozi_track_ask — спрашивать номер трека перед загрузкой .plt',
+        '#                (снимается галочкой «Запомнить» в диалоге);',
+        '# ozi_wpt_mode  — append / replace: при загрузке .wpt добавлять',
+        '#                точки к уже загруженным или заменять набор;',
+        '# ozi_wpt_ask   — спрашивать режим перед загрузкой .wpt',
+        '#                (снимается галочкой «Запомнить» в диалоге).',
         '',
         f'ozi_exe         = {_toml_value("ozi_exe", ozi_exe)}',
         f'ozi_api_dll     = {_toml_value("ozi_api_dll", ozi_api_dll)}',
+        f'ozi_track_num   = {ozi_track_num}',
+        f'ozi_track_ask   = {_toml_value("ozi_track_ask", ozi_track_ask)}',
+        f'ozi_wpt_mode    = {_toml_value("ozi_wpt_mode", ozi_wpt_mode)}',
+        f'ozi_wpt_ask     = {_toml_value("ozi_wpt_ask", ozi_wpt_ask)}',
         '',
         '# --- Окна при старте ---',
         '# help_visible_at_start — показывать окно подсказок (F1)',
