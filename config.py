@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -67,7 +68,17 @@ DEFAULT_CONFIG = {
     # .gpx, .kml): 'append' — добавить к ним, 'replace' — заменить набор.
     'ozi_wpt_mode': 'append',
     'ozi_wpt_ask': True,
+    # --- словари для переименования ---
+    # Имена групп — часть имени сразу после даты:
+    #   ГГГГММДД_<группа><номер>_<позывной>.
+    'group_names': [],
+    # Позывные — необязательная часть после номера группы.
+    'callsigns': [],
 }
+
+
+# Ключи-списки: читаются как list[str] и пишутся TOML-массивами.
+_LIST_KEYS = ('group_names', 'callsigns')
 
 
 # Логические настройки: при чтении приводятся к bool.
@@ -128,6 +139,41 @@ def _as_path(value: str) -> Path:
         return Path(value).expanduser().resolve()
     except (OSError, RuntimeError):
         return Path(value).expanduser()
+
+
+def _string_list(value) -> list:
+    """Приводит значение из конфига к списку непустых строк.
+
+    TOML-массивы приходят списком; мягкий разбор (когда файл не разобрал
+    tomllib) отдаёт их строкой вида ``["Lisa", "Moscow"]``. Понимаем оба
+    варианта, а заодно построчный список — так удобнее править руками.
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        text = str(value).strip()
+        if text.startswith('[') and text.endswith(']'):
+            text = text[1:-1]
+        parts = re.split(r'[,\n]', text)
+
+    result = []
+    seen = set()
+    for part in parts:
+        text = str(part).strip().strip('"\'')
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _toml_array(values) -> str:
+    """TOML-массив строк для ключей из _LIST_KEYS."""
+    items = ', '.join(_toml_value('', v) for v in _string_list(values))
+    return f'[{items}]'
 
 
 def _toml_value(key: str, value) -> str:
@@ -237,6 +283,9 @@ def load_config() -> dict:
               'ozi_exe', 'ozi_api_dll', 'ozi_wpt_mode'):
         cfg[k] = str(cfg.get(k, DEFAULT_CONFIG[k]))
 
+    for k in _LIST_KEYS:
+        cfg[k] = _string_list(cfg.get(k, DEFAULT_CONFIG[k]))
+
     cfg['root_dir_resolved'] = _as_path(cfg['root_dir'])
     cfg['downloads_dir_resolved'] = _as_path(cfg['downloads_dir'])
     cfg['_path'] = p
@@ -292,6 +341,8 @@ def save_config(cfg: dict):
         ozi_wpt_mode = DEFAULT_CONFIG['ozi_wpt_mode']
     ozi_track_ask = bools['ozi_track_ask']
     ozi_wpt_ask = bools['ozi_wpt_ask']
+    group_names = _string_list(cfg.get('group_names', []))
+    callsigns = _string_list(cfg.get('callsigns', []))
 
     lines = [
         '# Конфиг ok-filemanager',
@@ -361,6 +412,16 @@ def save_config(cfg: dict):
         f'ozi_track_ask   = {_toml_value("ozi_track_ask", ozi_track_ask)}',
         f'ozi_wpt_mode    = {_toml_value("ozi_wpt_mode", ozi_wpt_mode)}',
         f'ozi_wpt_ask     = {_toml_value("ozi_wpt_ask", ozi_wpt_ask)}',
+        '',
+        '# --- Словари для переименования ---',
+        '# group_names — имена групп: часть сразу после даты',
+        '#               (ГГГГММДД_<группа><номер>_<позывной>);',
+        '# callsigns   — позывные: необязательная часть после номера',
+        '#               группы. Списки пополняются из диалога',
+        '#               переименования, а правятся здесь.',
+        '',
+        f'group_names     = {_toml_array(group_names)}',
+        f'callsigns       = {_toml_array(callsigns)}',
         '',
         '# --- Окна при старте ---',
         '# help_visible_at_start — показывать окно подсказок (F1)',

@@ -25,12 +25,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import (
-    QEvent, QModelIndex, QObject, QPoint, QPointF, QRect, QSize, Qt,
-    QTimer, QUrl, Signal, Slot,
+    QEvent, QModelIndex, QObject, QPoint, QPointF, QRect, QRegularExpression,
+    QSize, Qt, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QFontMetrics, QIcon, QImage,
-    QKeySequence, QPainter, QPen, QStandardItem, QStandardItemModel,
+    QKeySequence, QPainter, QPen, QRegularExpressionValidator,
+    QStandardItem, QStandardItemModel,
     QTextBlockFormat, QTextCharFormat, QTextCursor, QTextOption,
 )
 from PySide6.QtWidgets import (
@@ -45,8 +46,9 @@ from PySide6.QtWidgets import (
 
 from config import config_path, save_config
 from ok_helper.analyzer import (
-    analyze_file, human_size, normalize_callsign, sanitize_callsign,
-    validate_new_folder_name,
+    analyze_file, build_file_name, clean_name_part, human_size, is_m_gpx,
+    normalize_callsign, normalize_group_name, sanitize_callsign,
+    split_name_parts, validate_new_folder_name,
 )
 from ok_helper.appicon import app_icon
 from ok_helper.clipboard import copy_to_clipboard
@@ -91,6 +93,33 @@ DOWNLOAD_POLL_MS = 3000
 # Запас к ширине текста кнопки: внутренние отступы (6px 14px) и рамка
 # из таблицы стилей плюс небольшой люфт под системный шрифт.
 BUTTON_WIDTH_MARGIN = 40
+
+
+def _list_text(value) -> str:
+    """Список из конфига → текст для редактора (по одному на строку)."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith('[') and text.endswith(']'):
+            parts = [p.strip().strip('"\'')
+                     for p in text[1:-1].split(',')]
+            return '\n'.join(p for p in parts if p)
+        return value
+    if isinstance(value, (list, tuple)):
+        return '\n'.join(str(v) for v in value if str(v).strip())
+    return ''
+
+
+def _parse_list_text(text: str) -> List[str]:
+    """Текст редактора → список: строки, trim, без пустых и повторов."""
+    result: List[str] = []
+    seen = set()
+    for line in text.splitlines():
+        value = line.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _ui_geometry(width: int, height: int, x: int, y: int) -> str:
@@ -3072,7 +3101,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'Переименование',
                                     'Выберите файл')
             return
-        dlg = RenameDialog(self, p)
+        dlg = RenameDialog(self, p, self.config)
         if dlg.exec() != QDialog.Accepted or dlg.result is None:
             return
         new_name = dlg.result
@@ -3736,7 +3765,7 @@ class SettingsDialog(QDialog):
         # высоту: важно только, чтобы поместилась самая высокая вкладка,
         # а по ширине — строка кнопок OziAPI (она самая широкая).
         self.setMinimumWidth(560)
-        self.resize(600, 470)
+        self.resize(620, 560)
         self.config = config
 
         layout = QVBoxLayout(self)
@@ -3838,6 +3867,35 @@ class SettingsDialog(QDialog):
             bool(config.get('blocking_errors', False)))
         ui.addWidget(self.blocking_errors_cb)
         ui.addStretch(1)
+
+        # --- Вкладка «Словари» ---
+        # Два списка имён для диалога переименования: группа (часть сразу
+        # после даты) и позывной (необязательная часть после номера).
+        dictionaries = page('Словари')
+
+        dict_hint = QLabel(
+            'Словари подставляются в диалог переименования (F2) для файлов '
+            '.gpx и .plt: имя группы — часть сразу после даты, позывной — '
+            'необязательная часть после номера группы. Новые значения, '
+            'введённые в диалоге, добавляются сюда автоматически. '
+            'По одному имени на строку.')
+        dict_hint.setObjectName('Dim')
+        dict_hint.setWordWrap(True)
+        dictionaries.addWidget(dict_hint)
+
+        dictionaries.addWidget(QLabel('Имена групп:'))
+        self.group_names_edit = QPlainTextEdit(
+            _list_text(config.get('group_names', [])))
+        self.group_names_edit.setPlaceholderText('Например:\nLisa\nMoscow')
+        self.group_names_edit.setMinimumHeight(110)
+        dictionaries.addWidget(self.group_names_edit, 1)
+
+        dictionaries.addWidget(QLabel('Позывные:'))
+        self.callsigns_edit = QPlainTextEdit(
+            _list_text(config.get('callsigns', [])))
+        self.callsigns_edit.setPlaceholderText('Например:\nIvanov\nPetrov')
+        self.callsigns_edit.setMinimumHeight(110)
+        dictionaries.addWidget(self.callsigns_edit, 1)
 
         # --- Вкладка «FTP» ---
         ftp = page('FTP')
@@ -4086,6 +4144,10 @@ class SettingsDialog(QDialog):
         c['ozi_track_ask'] = bool(self.ozi_track_ask_cb.isChecked())
         c['ozi_wpt_mode'] = str(self.ozi_wpt_combo.currentData())
         c['ozi_wpt_ask'] = bool(self.ozi_wpt_ask_cb.isChecked())
+        c['group_names'] = _parse_list_text(
+            self.group_names_edit.toPlainText())
+        c['callsigns'] = _parse_list_text(
+            self.callsigns_edit.toPlainText())
         c['root_dir_resolved'] = Path(root).expanduser().resolve()
         c['downloads_dir_resolved'] = Path(dl).expanduser().resolve()
 
@@ -4225,8 +4287,16 @@ FTP — ссылка на папку:
   Пока base_url пуст, показывается прочерк.
 
 Правила именования:
-  .gpx / .plt — формат ГГГГММДД_Позывной.
-    – первая буква позывного — заглавная (lisa → Lisa);
+  .gpx / .plt — формат ГГГГММДД_ГруппаНомер_Позывной
+  (позывной необязателен). В диалоге переименования (F2) имя
+  собирается из отдельных полей: дата, позывной группы, номер
+  группы и позывной. Поля группы и позывного подсказывают имена
+  из словарей (F10 → Словари); введённые значения пополняют их
+  автоматически. Поле «Итог» редактируемое: можно ввести имя
+  целиком — тогда части выше не проверяются, а при их изменении
+  «Итог» пересобирается.
+    – первая буква — заглавная (lisa → Lisa);
+    – номер группы из одной цифры дополняется нулём (3 → 03);
     – хвостовой номер — минимум 2 разряда, разделитель _/- перед
       цифрами убирается:
         lisa_1        → Lisa01
@@ -4300,16 +4370,32 @@ FTP-синхронизация:
 
 
 class RenameDialog(QDialog):
-    def __init__(self, parent, path: Path):
+    """Переименование файла.
+
+    Для .gpx/.plt имя собирается из четырёх частей:
+    ``ГГГГММДД_<группа><номер>_<позывной>``. Группа и позывной берутся
+    из словарей конфига (их можно выбрать в списке или ввести вручную).
+    Для остальных расширений остаётся прежнее единое поле имени.
+    """
+
+    STRUCTURED_SUFFIXES = ('.gpx', '.plt')
+    GROUP_KEY = 'group_names'
+    CALLSIGN_KEY = 'callsigns'
+
+    def __init__(self, parent, path: Path, config: Optional[dict] = None):
         super().__init__(parent)
         self.setWindowTitle('Переименование')
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(480)
         self.path = path
+        self.config = config if config is not None else {}
         self.result: Optional[str] = None
+        self.edit: Optional[QLineEdit] = None
 
         info = analyze_file(path)
         self.suggestion = info['new_name'] or path.name
         changed = self.suggestion != path.name
+        self.structured = (path.suffix.lower() in self.STRUCTURED_SUFFIXES
+                           and not is_m_gpx(path))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -4332,9 +4418,12 @@ class RenameDialog(QDialog):
             lbl_sugg.setObjectName('Dim')
         form.addRow('Предложение:', lbl_sugg)
 
-        self.edit = QLineEdit(self.suggestion)
-        self.edit.selectAll()
-        form.addRow('Новое имя:', self.edit)
+        if self.structured:
+            self._add_structured_fields(form)
+        else:
+            self.edit = QLineEdit(self.suggestion)
+            self.edit.selectAll()
+            form.addRow('Новое имя:', self.edit)
 
         layout.addLayout(form)
 
@@ -4343,7 +4432,10 @@ class RenameDialog(QDialog):
             note.setObjectName('Dim')
             layout.addWidget(note)
 
-        hint = QLabel('Ctrl+T — транслит + нормализация')
+        hint_text = 'Ctrl+T — транслит + нормализация'
+        if self.structured:
+            hint_text += '; списки пополняются автоматически'
+        hint = QLabel(hint_text)
         hint.setObjectName('Dim')
         layout.addWidget(hint)
 
@@ -4360,9 +4452,172 @@ class RenameDialog(QDialog):
         act.triggered.connect(self._translit)
         self.addAction(act)
 
-        self.edit.setFocus()
+        if self.structured:
+            self._init_structured_values()
+        else:
+            self.edit.setFocus()
+
+    # ---------- структурированное имя .gpx/.plt ----------
+
+    def _config_list(self, key: str) -> List[str]:
+        """Значения словаря из конфига (список или строки)."""
+        value = (self.config.get(key, [])
+                 if isinstance(self.config, dict) else [])
+        if isinstance(value, str):
+            parts = value.replace('[', ' ').replace(']', ' ').splitlines()
+            if len(parts) == 1:
+                parts = parts[0].split(',')
+        elif isinstance(value, (list, tuple)):
+            parts = list(value)
+        else:
+            parts = []
+        return [str(v).strip().strip('"\'') for v in parts
+                if str(v).strip().strip('"\'')]
+
+    def _make_part_combo(self, key: str, current: str,
+                         placeholder: str) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+        combo.addItems(self._config_list(key))
+        combo.lineEdit().setPlaceholderText(placeholder)
+        if current:
+            combo.setCurrentText(current)
+        else:
+            combo.setCurrentIndex(-1)
+        return combo
+
+    def _add_structured_fields(self, form: QFormLayout):
+        self.date_edit = QLineEdit()
+        self.date_edit.setPlaceholderText('ГГГГММДД')
+        self.date_edit.setMaxLength(8)
+        self.date_edit.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r'\d{0,8}'), self))
+        form.addRow('Дата:', self.date_edit)
+
+        self.group_combo = self._make_part_combo(
+            self.GROUP_KEY, '', 'например, Lisa')
+        form.addRow('Позывной группы:', self.group_combo)
+
+        self.number_edit = QLineEdit()
+        self.number_edit.setPlaceholderText('01')
+        self.number_edit.setMaxLength(4)
+        self.number_edit.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r'\d{0,4}'), self))
+        form.addRow('Номер группы:', self.number_edit)
+
+        self.callsign_combo = self._make_part_combo(
+            self.CALLSIGN_KEY, '', 'необязательно')
+        form.addRow('Позывной:', self.callsign_combo)
+
+        # «Итог» — не просто подпись: имя можно поправить здесь целиком.
+        # При изменении полей выше оно пересобирается автоматически.
+        self.preview = QLineEdit()
+        self.preview.setPlaceholderText('имя файла целиком')
+        self.preview.setToolTip(
+            'Итоговое имя файла. Можно ввести вручную — тогда поля выше '
+            'не проверяются. При изменении полей имя пересобирается.')
+        form.addRow('Итог:', self.preview)
+
+        self.date_edit.textChanged.connect(self._update_preview)
+        self.group_combo.currentTextChanged.connect(self._update_preview)
+        self.number_edit.textChanged.connect(self._update_preview)
+        self.callsign_combo.currentTextChanged.connect(self._update_preview)
+
+    def _init_structured_values(self):
+        """Заполняет части из предложения анализатора (или из имени)."""
+        known = self._config_list(self.GROUP_KEY)
+        parts = split_name_parts(Path(self.suggestion).stem, known)
+        if not parts['date']:
+            # Предложение могло не содержать дату, а в самом имени она есть.
+            parts = split_name_parts(self.path.stem, known)
+
+        self.date_edit.setText(parts['date'])
+        if parts['group']:
+            self.group_combo.setCurrentText(parts['group'])
+        self.number_edit.setText(parts['number'])
+        if parts['callsign']:
+            self.callsign_combo.setCurrentText(parts['callsign'])
+
+        self._update_preview()
+        if parts['date']:
+            self.group_combo.lineEdit().setFocus()
+            self.group_combo.lineEdit().selectAll()
+        else:
+            self.date_edit.setFocus()
+
+    def _update_preview(self):
+        self.preview.setText(self._build_name())
+
+    def _build_name(self) -> str:
+        return build_file_name(
+            self.date_edit.text(),
+            self.group_combo.currentText(),
+            self.number_edit.text(),
+            self.callsign_combo.currentText(),
+            self.path.suffix,
+        )
+
+    def _checked_manual_name(self, value: str) -> Optional[str]:
+        """Проверяет имя, введённое в «Итог» вручную.
+
+        Возвращает имя или None, если ввод пуст/содержит недопустимые
+        для имени файла символы (сообщение уже показано).
+        """
+        name = value.strip()
+        if not name or name in ('.', '..'):
+            QMessageBox.critical(self, 'Ошибка',
+                                 'Укажите итоговое имя файла')
+            self.preview.setFocus()
+            return None
+        if any(ch in name for ch in '/\\:*?"<>|'):
+            QMessageBox.critical(
+                self, 'Ошибка',
+                'Имя файла не должно содержать путь и символы\n'
+                '/ \\ : * ? " < > |')
+            self.preview.setFocus()
+            return None
+        return name
+
+    def _remember_part(self, key: str, value: str) -> bool:
+        """Добавляет имя в словарь, если его там ещё нет."""
+        if not value or not isinstance(self.config, dict):
+            return False
+        values = self._config_list(key)
+
+        def normalized(item: str) -> str:
+            if key == self.GROUP_KEY:
+                return normalize_group_name(item)
+            return normalize_callsign(clean_name_part(item))
+
+        if any(normalized(item).casefold() == value.casefold()
+               for item in values):
+            return False
+        values.append(value)
+        self.config[key] = values
+        return True
+
+    def _save_dictionaries(self):
+        # Без _path это конфиг из теста/вызывающего кода — на диск не пишем.
+        if not self.config.get('_path'):
+            return
+        try:
+            save_config(self.config)
+        except Exception:
+            pass
+
+    # ---------- транслит ----------
 
     def _translit(self):
+        if self.structured:
+            self.group_combo.setCurrentText(
+                normalize_group_name(self.group_combo.currentText()))
+            self.callsign_combo.setCurrentText(
+                normalize_callsign(
+                    clean_name_part(self.callsign_combo.currentText())))
+            self._update_preview()
+            return
+
         text = self.edit.text()
         new = transliterate(text)
         stem, dot, suffix = new.partition('.')
@@ -4373,7 +4628,46 @@ class RenameDialog(QDialog):
                 new = f'{date}_{callsign}{dot}{suffix}'
         self.edit.setText(new)
 
+    # ---------- применить ----------
+
     def _apply(self):
+        if self.structured:
+            group = normalize_group_name(self.group_combo.currentText())
+            callsign = normalize_callsign(
+                clean_name_part(self.callsign_combo.currentText()))
+            built = self._build_name()
+            value = self.preview.text().strip()
+
+            if value != built:
+                # «Итог» правили вручную — он и есть окончательное имя.
+                name = self._checked_manual_name(value)
+                if name is None:
+                    return
+            else:
+                date = self.date_edit.text().strip()
+                if len(date) != 8 or not date.isdigit():
+                    QMessageBox.critical(
+                        self, 'Ошибка',
+                        'Дата должна быть в формате ГГГГММДД (8 цифр)')
+                    self.date_edit.setFocus()
+                    return
+                if not group:
+                    QMessageBox.critical(self, 'Ошибка',
+                                         'Укажите позывной группы')
+                    self.group_combo.lineEdit().setFocus()
+                    return
+                name = built
+
+            self.result = name
+
+            remembered = self._remember_part(self.GROUP_KEY, group)
+            remembered = self._remember_part(self.CALLSIGN_KEY, callsign) \
+                or remembered
+            if remembered:
+                self._save_dictionaries()
+            self.accept()
+            return
+
         value = self.edit.text().strip()
         if not value:
             return

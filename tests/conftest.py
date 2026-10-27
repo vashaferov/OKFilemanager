@@ -56,6 +56,8 @@ def gui_config(tmp_path):
         'base_url': 'https://example.com/ftp',
         'help_visible_at_start': False,
         'first_run': False,
+        'group_names': [],
+        'callsigns': [],
         '_path': tmp_path / 'config.toml',
     }
 

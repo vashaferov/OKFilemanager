@@ -16,11 +16,15 @@ from pathlib import Path
 
 from ok_helper.analyzer import (
     analyze_file,
+    build_file_name,
+    clean_name_part,
     extract_date_from_gpx,
     human_size,
     is_m_gpx,
     normalize_callsign,
+    normalize_group_name,
     sanitize_callsign,
+    split_name_parts,
     validate_new_folder_name,
 )
 
@@ -808,4 +812,96 @@ class TestNormalizeFallbacks:
     @pytest.mark.parametrize('inp', ['_', '-', '__', '---'])
     def test_only_separators(self, inp):
         assert normalize_callsign(inp) == inp
+
+
+# ─────────────────────────────────────────────────────────────────
+# 18. Части имени: дата, группа, номер, позывной
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Части имени файла')
+class TestNameParts:
+    @pytest.mark.parametrize('stem,expected', [
+        ('20260917_Babushka',
+         {'date': '20260917', 'group': 'Babushka',
+          'number': '', 'callsign': ''}),
+        ('20260917_Lisa03',
+         {'date': '20260917', 'group': 'Lisa',
+          'number': '03', 'callsign': ''}),
+        ('20260917_Lisa03_Test',
+         {'date': '20260917', 'group': 'Lisa',
+          'number': '03', 'callsign': 'Test'}),
+        ('20260917_Lisa_03_Test',
+         {'date': '20260917', 'group': 'Lisa',
+          'number': '03', 'callsign': 'Test'}),
+        ('2026-09-17_11-55_бабушка',
+         {'date': '20260917', 'group': 'Babushka',
+          'number': '', 'callsign': ''}),
+        ('notes',
+         {'date': '', 'group': 'Notes',
+          'number': '', 'callsign': ''}),
+    ])
+    def test_split(self, stem, expected):
+        assert split_name_parts(stem) == expected
+
+    @pytest.mark.parametrize('date,group,number,callsign,expected', [
+        ('20260917', 'Lisa', '', '', '20260917_Lisa'),
+        ('20260917', 'lisa', '3', '', '20260917_Lisa03'),
+        ('20260917', 'lisa', '03', 'иванов', '20260917_Lisa03_Ivanov'),
+        ('2026-09-17', '  ', '', '', '20260917_'),
+    ])
+    def test_build(self, date, group, number, callsign, expected):
+        assert build_file_name(date, group, number, callsign) == expected
+
+    def test_build_keeps_suffix(self):
+        assert build_file_name('20260917', 'Lisa', '03', 'Test',
+                               '.GPX') == '20260917_Lisa03_Test.GPX'
+
+    @pytest.mark.parametrize('value,expected', [
+        ('  lisa  ', 'lisa'),
+        ('иванов', 'ivanov'),
+        ('Lisa 03', 'Lisa_03'),
+        ('a/b:c*d?', 'abcd'),
+        ('__Lisa__', 'Lisa'),
+        ('', ''),
+    ])
+    def test_clean_name_part(self, value, expected):
+        assert clean_name_part(value) == expected
+
+    def test_normalize_group_name(self):
+        assert normalize_group_name('lisa') == 'Lisa'
+        assert normalize_group_name('иванов') == 'Ivanov'
+        assert normalize_group_name('') == ''
+
+    def test_known_group_with_underscore(self):
+        parts = split_name_parts('20260917_North_Team_03_Test',
+                                 ['North_Team'])
+
+        assert parts == {'date': '20260917', 'group': 'North_Team',
+                         'number': '03', 'callsign': 'Test'}
+
+    def test_known_group_without_number(self):
+        parts = split_name_parts('20260917_North_Team', ['North_Team'])
+
+        assert parts == {'date': '20260917', 'group': 'North_Team',
+                         'number': '', 'callsign': ''}
+
+    def test_longest_known_group_wins(self):
+        parts = split_name_parts('20260917_North_Team_03',
+                                 ['North', 'North_Team'])
+
+        assert parts['group'] == 'North_Team'
+        assert parts['number'] == '03'
+
+    def test_known_group_with_glued_number_round_trips(self):
+        parts = split_name_parts('20260917_North_Team03_Test',
+                                 ['North_Team'])
+
+        assert parts == {'date': '20260917', 'group': 'North_Team',
+                         'number': '03', 'callsign': 'Test'}
+
+    def test_known_group_does_not_eat_longer_name(self):
+        parts = split_name_parts('20260917_Lisabel_Test', ['Lisa'])
+
+        assert parts['group'] == 'Lisabel'
+        assert parts['callsign'] == 'Test'
 

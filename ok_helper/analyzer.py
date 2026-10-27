@@ -76,6 +76,10 @@ _CALLSIGN_NUM_RE = re.compile(
     r'(?P<tail>(?:[_-].*)?)$'
 )
 
+# Группа и её номер одной частью: 'Lisa03' → base='Lisa', num='03'.
+_GROUP_NUM_RE = re.compile(
+    r'^(?P<base>[A-Za-z][A-Za-z0-9_-]*?)(?P<num>\d{1,4})$')
+
 # Правило 2 (страховка для позывных, не начинающихся с букв):
 #   1) base + ('_'|'-') + digits — с явным разделителем;
 #   2) pure-letter base + digits — без разделителя.
@@ -258,6 +262,126 @@ def _clean_rest(rest: str) -> Tuple[str, bool]:
     words = [w for w in re.split(r'[_-]+', rest.lower()) if w]
     is_placeholder = bool(words) and all(w in _STOPWORDS_LATIN for w in words)
     return rest, is_placeholder
+
+
+def clean_name_part(value: str) -> str:
+    """Готовит часть имени (группу или позывной) к записи в файл.
+
+    Пробелы и дефисы становятся разделителями, кириллица — латиницей,
+    всё недопустимое вырезается.
+    """
+    if not value:
+        return ''
+    text = transliterate(value.strip())
+    text = re.sub(r'[\s\-–—.]+', '_', text)
+    text = re.sub(r'[^A-Za-z0-9_-]', '', text)
+    text = re.sub(r'_+', '_', text).strip('_-')
+    return text
+
+
+def normalize_group_name(value: str) -> str:
+    """Имя группы: латиница, первая буква заглавная."""
+    cleaned = clean_name_part(value)
+    if not cleaned:
+        return ''
+    return cleaned[0].upper() + cleaned[1:]
+
+
+def split_name_parts(stem: str, known_groups=()) -> dict:
+    """Разбирает имя файла на дату, группу, номер и позывной.
+
+    Понимает и слитную запись ``Lisa03_Test``, и раздельную
+    ``Lisa_03_Test``. Возвращает пустые строки для отсутствующих частей.
+    Расширение в ``stem`` передавать не нужно.
+
+    ``known_groups`` — имена из словаря: они помогают разобрать группу
+    из нескольких слов (``North_Team_03_Test``), которую иначе нельзя
+    отличить от группы ``North`` с позывным ``Team``.
+    """
+    date_str, rest = _extract_date_and_rest(stem)
+    cleaned, _ = _clean_rest(rest if date_str else stem)
+
+    known = []
+    for value in known_groups or ():
+        name = normalize_group_name(value)
+        if name and name not in known:
+            known.append(name)
+
+    # Словарь знает группу целиком — он точнее эвристики ниже.
+    for name in sorted(known, key=len, reverse=True):
+        low_name = name.casefold()
+        low_cleaned = cleaned.casefold()
+        if not low_cleaned.startswith(low_name):
+            continue
+
+        after = cleaned[len(name):]
+        # Граница группы: конец имени, цифры номера или разделитель.
+        # Иначе 'Lisa' не должна съедать группу 'Lisabel'.
+        if after and not (after[0].isdigit() or after[0] == '_'):
+            continue
+        if after.startswith('_'):
+            after = after[1:]
+
+        tokens = [t for t in after.split('_') if t]
+        number = ''
+        if tokens and tokens[0].isdigit() and len(tokens[0]) <= 4:
+            number = tokens[0]
+            tokens = tokens[1:]
+        callsign = '_'.join(tokens)
+        return {
+            'date': date_str or '',
+            'group': name,
+            'number': number,
+            'callsign': normalize_callsign(callsign) if callsign else '',
+        }
+
+    tokens = [t for t in cleaned.split('_') if t]
+    group = number = callsign = ''
+    if tokens:
+        head = tokens[0]
+        tail = tokens[1:]
+        m = _GROUP_NUM_RE.match(head)
+        if m:
+            group = m.group('base')
+            number = m.group('num')
+        else:
+            group = head
+
+        # Раздельная запись: Lisa_03_Test — номер отдельным словом.
+        if not number and tail and tail[0].isdigit() and len(tail[0]) <= 4:
+            number = tail[0]
+            tail = tail[1:]
+
+        callsign = '_'.join(tail)
+
+    return {
+        'date': date_str or '',
+        'group': normalize_group_name(group),
+        'number': number,
+        'callsign': normalize_callsign(callsign) if callsign else '',
+    }
+
+
+def build_file_name(date: str, group: str, number: str = '',
+                    callsign: str = '', suffix: str = '') -> str:
+    """Собирает имя файла ``ГГГГММДД_ГруппаНомер_Позывной``.
+
+    Номер из одной цифры дополняется нулём (``3`` → ``03``), как и при
+    нормализации позывного. Пустой позывной не добавляет ``_``.
+    """
+    date = re.sub(r'\D', '', date or '')
+    group = normalize_group_name(group)
+    number = re.sub(r'\D', '', number or '')
+    if len(number) == 1:
+        number = number.zfill(2)
+    callsign = clean_name_part(callsign)
+    if callsign:
+        callsign = normalize_callsign(callsign)
+
+    stem = f'{date}_{group}{number}'
+    if callsign:
+        stem += f'_{callsign}'
+    return f'{stem}{suffix}'
 
 
 def _analyze_gpx_plt(stem: str, suffix: str) -> dict:

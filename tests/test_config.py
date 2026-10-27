@@ -23,6 +23,7 @@ from config import (
     _as_path,
     _read_toml,
     _soft_parse,
+    _string_list,
     _toml_value,
     config_path,
     legacy_config_path,
@@ -670,3 +671,64 @@ class TestSaveConfig:
 
         assert data['ftp_readonly'] is True
         assert data['watch_downloads'] is False
+
+
+# ─────────────────────────────────────────────────────────────────
+# 8. Словари переименования (списки в конфиге)
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Словари в конфиге')
+class TestConfigLists:
+    @pytest.mark.parametrize('value,expected', [
+        (['Lisa', 'Moscow'], ['Lisa', 'Moscow']),
+        ('["Lisa", "Moscow"]', ['Lisa', 'Moscow']),
+        ('Lisa\nMoscow\nLisa', ['Lisa', 'Moscow']),
+        ('  Lisa  , Moscow  ', ['Lisa', 'Moscow']),
+        (None, []),
+        ('', []),
+    ])
+    def test_string_list_normalization(self, value, expected):
+        assert _string_list(value) == expected
+
+    def test_defaults_are_empty(self, cfg_file):
+        cfg = load_config()
+
+        assert cfg['group_names'] == []
+        assert cfg['callsigns'] == []
+
+    def test_round_trip(self, cfg_file):
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update({
+            '_path': cfg_file,
+            'group_names': ['Lisa', 'Moscow'],
+            'callsigns': ['Ivanov', 'Petrov'],
+        })
+
+        save_config(cfg)
+        again = load_config()
+
+        assert again['group_names'] == ['Lisa', 'Moscow']
+        assert again['callsigns'] == ['Ivanov', 'Petrov']
+
+    def test_written_as_toml_array(self, cfg_file):
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update({
+            '_path': cfg_file,
+            'group_names': ['Lisa', 'Moscow'],
+            'callsigns': ['Ivanov'],
+        })
+
+        save_config(cfg)
+        text = cfg_file.read_text(encoding='utf-8')
+
+        assert 'group_names     = ["Lisa", "Moscow"]' in text
+        assert 'callsigns       = ["Ivanov"]' in text
+
+    def test_duplicates_removed_on_save(self, cfg_file):
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update({'_path': cfg_file,
+                    'group_names': ['Lisa', 'Lisa', 'Moscow']})
+
+        save_config(cfg)
+
+        assert load_config()['group_names'] == ['Lisa', 'Moscow']

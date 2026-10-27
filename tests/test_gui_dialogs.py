@@ -18,6 +18,7 @@ from pathlib import Path
 
 import allure
 import pytest
+from PySide6.QtCore import QEvent
 
 from ok_helper import gui
 from ok_helper.gpxkml import Content, Track, TrackPoint
@@ -39,6 +40,29 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def destroy_dialogs(qapp):
+    """Удаляет диалоги после каждого теста.
+
+    Диалоги подключают сигналы к своим же слотам через лямбды: C++ держит
+    ссылку на Python-замыкание, поэтому циклический сборщик такие объекты не
+    освобождает. Без явного deleteLater накопленные окна заставляют
+    QApplication.setStyleSheet() переполировывать их при каждом создании
+    MainWindow в соседнем модуле (общий прогон растягивается в разы).
+    """
+    yield
+    for widget in qapp.topLevelWidgets():
+        # Всплывающие списки QComboBox — окна, но у них есть родитель:
+        # они удалятся вместе с диалогом, трогать их отдельно нельзя.
+        if widget.parent() is not None:
+            continue
+        widget.close()
+        widget.setParent(None)
+        widget.deleteLater()
+    qapp.sendPostedEvents(None, QEvent.DeferredDelete)
+    qapp.processEvents()
+
+
 def ctrl_t_actions(dlg):
     return [a for a in dlg.actions()
             if a.shortcut().toString() == 'Ctrl+T']
@@ -58,7 +82,11 @@ class TestRenameDialog:
         dlg = RenameDialog(None, p)
 
         assert dlg.suggestion == '20260917_Babushka.gpx'
-        assert dlg.edit.text() == '20260917_Babushka.gpx'
+        assert dlg.date_edit.text() == '20260917'
+        assert dlg.group_combo.currentText() == 'Babushka'
+        assert dlg.number_edit.text() == ''
+        assert dlg.callsign_combo.currentText() == ''
+        assert dlg.preview.text() == '20260917_Babushka.gpx'
         assert dlg.result is None
 
     def test_suggestion_falls_back_to_current_name(self, qapp, tmp_path):
@@ -68,6 +96,8 @@ class TestRenameDialog:
         dlg = RenameDialog(None, p)
 
         assert dlg.suggestion == '20260923_Ivanov.gpx'
+        assert dlg.date_edit.text() == '20260923'
+        assert dlg.group_combo.currentText() == 'Ivanov'
 
     def test_path_is_kept(self, qapp, tmp_path):
         p = tmp_path / 'notes.txt'
@@ -81,35 +111,241 @@ class TestRenameDialog:
 
         assert len(ctrl_t_actions(RenameDialog(None, p))) == 1
 
-    def test_apply_sets_result(self, qapp, tmp_path):
+    def test_plain_file_keeps_single_name_field(self, qapp, tmp_path):
+        p = tmp_path / 'notes.txt'
+        p.write_text('')
+
+        dlg = RenameDialog(None, p)
+
+        assert dlg.structured is False
+        assert dlg.edit.text() == 'notes.txt'
+
+    def test_wpt_keeps_single_name_field(self, qapp, tmp_path):
+        """Формат .wpt — Waypoints_ГГГГММДД, поля частей ему не подходят."""
+        p = tmp_path / '20260917.wpt'
+        p.write_text('')
+
+        dlg = RenameDialog(None, p)
+
+        assert dlg.structured is False
+        assert dlg.edit.text() == 'Waypoints_20260917.wpt'
+
+    def test_m_gpx_keeps_single_name_field(self, qapp, tmp_path):
+        """<1-4 цифры>m.gpx не проверяются — оставляем единое поле."""
+        p = tmp_path / '100m.gpx'
+        p.write_text('')
+
+        dlg = RenameDialog(None, p)
+
+        assert dlg.structured is False
+        assert dlg.edit.text() == '100m.gpx'
+
+    # --- структурированные поля .gpx/.plt ---
+
+    def test_parts_are_split_from_name(self, qapp, tmp_path):
+        p = tmp_path / '20260917_Lisa_03_Test.gpx'
+        p.write_text('')
+
+        dlg = RenameDialog(None, p)
+
+        assert dlg.date_edit.text() == '20260917'
+        assert dlg.group_combo.currentText() == 'Lisa'
+        assert dlg.number_edit.text() == '03'
+        assert dlg.callsign_combo.currentText() == 'Test'
+
+    def test_dictionary_group_with_underscore_is_kept_whole(self, qapp,
+                                                           tmp_path):
+        p = tmp_path / '20260917_North_Team_03_Test.gpx'
+        p.write_text('')
+
+        dlg = RenameDialog(None, p, {'group_names': ['North_Team']})
+
+        assert dlg.group_combo.currentText() == 'North_Team'
+        assert dlg.number_edit.text() == '03'
+        assert dlg.callsign_combo.currentText() == 'Test'
+        assert dlg.preview.text() == '20260917_North_Team03_Test.gpx'
+
+    def test_apply_builds_name_from_parts(self, qapp, tmp_path):
         p = tmp_path / 'x.gpx'
         p.write_text('')
         dlg = RenameDialog(None, p)
-        dlg.edit.setText('20260923_Ivanov.gpx')
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('Ivanov')
 
         dlg._apply()
 
         assert dlg.result == '20260923_Ivanov.gpx'
 
-    def test_apply_strips_whitespace(self, qapp, tmp_path):
+    def test_apply_pads_one_digit_group_number(self, qapp, tmp_path):
         p = tmp_path / 'x.gpx'
         p.write_text('')
         dlg = RenameDialog(None, p)
-        dlg.edit.setText('  20260923_Ivanov.gpx  ')
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('lisa')
+        dlg.number_edit.setText('3')
+        dlg.callsign_combo.setCurrentText('иванов')
 
         dlg._apply()
 
-        assert dlg.result == '20260923_Ivanov.gpx'
+        assert dlg.result == '20260923_Lisa03_Ivanov.gpx'
 
-    def test_apply_ignores_empty_name(self, qapp, tmp_path):
+    def test_apply_without_callsign(self, qapp, tmp_path):
         p = tmp_path / 'x.gpx'
         p.write_text('')
         dlg = RenameDialog(None, p)
-        dlg.edit.setText('   ')
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('Lisa')
+        dlg.number_edit.setText('03')
+
+        dlg._apply()
+
+        assert dlg.result == '20260923_Lisa03.gpx'
+
+    def test_apply_requires_date(self, qapp, tmp_path, msgbox):
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.date_edit.setText('')
+        dlg.group_combo.setCurrentText('Lisa')
 
         dlg._apply()
 
         assert dlg.result is None
+        assert msgbox.kinds == ['critical']
+        assert 'ГГГГММДД' in msgbox.texts()[0]
+
+    def test_apply_requires_group(self, qapp, tmp_path, msgbox):
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('')
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert msgbox.kinds == ['critical']
+        assert 'группы' in msgbox.texts()[0]
+
+    def test_manual_result_is_used(self, qapp, tmp_path):
+        """«Итог» можно править вручную — он и станет новым именем."""
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('Lisa')
+        dlg.preview.setText('20260923_Custom_Test.gpx')
+
+        dlg._apply()
+
+        assert dlg.result == '20260923_Custom_Test.gpx'
+
+    def test_manual_result_skips_part_validation(self, qapp, tmp_path):
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.date_edit.setText('')
+        dlg.group_combo.setCurrentText('')
+        dlg.preview.setText('Track_01.gpx')
+
+        dlg._apply()
+
+        assert dlg.result == 'Track_01.gpx'
+
+    def test_manual_result_rejects_path_separators(self, qapp, tmp_path,
+                                                   msgbox):
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.preview.setText('sub/20260923_Lisa.gpx')
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert msgbox.kinds == ['critical']
+        assert 'путь' in msgbox.texts()[0]
+
+    def test_empty_result_is_rejected(self, qapp, tmp_path, msgbox):
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.preview.setText('   ')
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert msgbox.kinds == ['critical']
+        assert 'итоговое имя' in msgbox.texts()[0]
+
+    def test_preview_is_rebuilt_when_parts_change(self, qapp, tmp_path):
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.preview.setText('manual.gpx')
+
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('Lisa')
+
+        assert dlg.preview.text() == '20260923_Lisa.gpx'
+
+    # --- словари ---
+
+    def test_dictionaries_are_offered_in_combos(self, qapp, tmp_path):
+        p = tmp_path / '20260923_Lisa.gpx'
+        p.write_text('')
+        cfg = {'group_names': ['Lisa', 'Moscow'],
+               'callsigns': ['Ivanov', 'Petrov']}
+
+        dlg = RenameDialog(None, p, cfg)
+
+        assert [dlg.group_combo.itemText(i)
+                for i in range(dlg.group_combo.count())] == ['Lisa', 'Moscow']
+        assert [dlg.callsign_combo.itemText(i)
+                for i in range(dlg.callsign_combo.count())] == \
+            ['Ivanov', 'Petrov']
+
+    def test_typed_values_are_added_to_dictionaries(self, qapp, tmp_path):
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        cfg = {'group_names': ['Lisa'], 'callsigns': ['Ivanov']}
+        dlg = RenameDialog(None, p, cfg)
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('Moscow')
+        dlg.callsign_combo.setCurrentText('Petrov')
+
+        dlg._apply()
+
+        assert cfg['group_names'] == ['Lisa', 'Moscow']
+        assert cfg['callsigns'] == ['Ivanov', 'Petrov']
+
+    def test_dictionary_values_are_not_duplicated(self, qapp, tmp_path):
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        cfg = {'group_names': ['Lisa'], 'callsigns': ['Ivanov']}
+        dlg = RenameDialog(None, p, cfg)
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('Lisa')
+        dlg.callsign_combo.setCurrentText('Ivanov')
+
+        dlg._apply()
+
+        assert cfg['group_names'] == ['Lisa']
+        assert cfg['callsigns'] == ['Ivanov']
+
+    def test_dictionary_compares_normalized_values(self, qapp, tmp_path):
+        """«иванов» и «Ivanov» — одно и то же имя, дубль не нужен."""
+        p = tmp_path / 'x.gpx'
+        p.write_text('')
+        cfg = {'group_names': ['north team'], 'callsigns': ['иванов']}
+        dlg = RenameDialog(None, p, cfg)
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('North_Team')
+        dlg.callsign_combo.setCurrentText('Ivanov')
+
+        dlg._apply()
+
+        assert cfg['group_names'] == ['north team']
+        assert cfg['callsigns'] == ['иванов']
 
     # --- Ctrl+T ---
 
@@ -118,52 +354,111 @@ class TestRenameDialog:
         p = tmp_path / 'x.gpx'
         p.write_text('')
         dlg = RenameDialog(None, p)
-        dlg.edit.setText('20260923_иванов.gpx')
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('иванов')
 
         dlg._translit()
 
-        assert dlg.edit.text() == '20260923_Ivanov.gpx'
+        assert dlg.group_combo.currentText() == 'Ivanov'
+        assert dlg.preview.text() == '20260923_Ivanov.gpx'
 
     def test_translit_normalizes_number(self, qapp, tmp_path):
         p = tmp_path / 'x.gpx'
         p.write_text('')
         dlg = RenameDialog(None, p)
-        dlg.edit.setText('20260923_lisa_1.gpx')
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('lisa')
+        dlg.number_edit.setText('1')
 
         dlg._translit()
 
-        assert dlg.edit.text() == '20260923_Lisa01.gpx'
+        assert dlg.preview.text() == '20260923_Lisa01.gpx'
 
-    def test_translit_without_underscore(self, qapp, tmp_path):
+    def test_translit_callsign(self, qapp, tmp_path):
         p = tmp_path / 'x.gpx'
         p.write_text('')
         dlg = RenameDialog(None, p)
-        dlg.edit.setText('Ёжик.gpx')
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('Lisa')
+        dlg.callsign_combo.setCurrentText('петров')
 
         dlg._translit()
 
-        assert dlg.edit.text() == 'Yozhik.gpx'
-
-    def test_translit_keeps_date_with_dashes(self, qapp, tmp_path):
-        """Дата не в формате ГГГГММДД — только транслит."""
-        p = tmp_path / 'x.gpx'
-        p.write_text('')
-        dlg = RenameDialog(None, p)
-        dlg.edit.setText('2026-09-17_11-55_бабушка.gpx')
-
-        dlg._translit()
-
-        assert dlg.edit.text() == '2026-09-17_11-55_babushka.gpx'
+        assert dlg.callsign_combo.currentText() == 'Petrov'
 
     def test_translit_action_triggers_same_slot(self, qapp, tmp_path):
         p = tmp_path / 'x.gpx'
         p.write_text('')
         dlg = RenameDialog(None, p)
-        dlg.edit.setText('бабушка.gpx')
+        dlg.date_edit.setText('20260923')
+        dlg.group_combo.setCurrentText('бабушка')
 
         ctrl_t_actions(dlg)[0].trigger()
 
-        assert dlg.edit.text() == 'babushka.gpx'
+        assert dlg.group_combo.currentText() == 'Babushka'
+
+    # --- единое поле для прочих файлов ---
+
+    def test_plain_apply_sets_result(self, qapp, tmp_path):
+        p = tmp_path / 'notes.txt'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.edit.setText('20260923_Ivanov.txt')
+
+        dlg._apply()
+
+        assert dlg.result == '20260923_Ivanov.txt'
+
+    def test_plain_apply_strips_whitespace(self, qapp, tmp_path):
+        p = tmp_path / 'notes.txt'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.edit.setText('  20260923_Ivanov.txt  ')
+
+        dlg._apply()
+
+        assert dlg.result == '20260923_Ivanov.txt'
+
+    def test_plain_apply_ignores_empty_name(self, qapp, tmp_path):
+        p = tmp_path / 'notes.txt'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.edit.setText('   ')
+
+        dlg._apply()
+
+        assert dlg.result is None
+
+    def test_plain_translit_and_normalize(self, qapp, tmp_path):
+        p = tmp_path / 'notes.txt'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.edit.setText('20260923_lisa_1.txt')
+
+        dlg._translit()
+
+        assert dlg.edit.text() == '20260923_Lisa01.txt'
+
+    def test_plain_translit_without_underscore(self, qapp, tmp_path):
+        p = tmp_path / 'notes.txt'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.edit.setText('Ёжик.txt')
+
+        dlg._translit()
+
+        assert dlg.edit.text() == 'Yozhik.txt'
+
+    def test_plain_translit_keeps_dashed_date(self, qapp, tmp_path):
+        """Дата не в формате ГГГГММДД — только транслит."""
+        p = tmp_path / 'notes.txt'
+        p.write_text('')
+        dlg = RenameDialog(None, p)
+        dlg.edit.setText('2026-09-17_11-55_бабушка.txt')
+
+        dlg._translit()
+
+        assert dlg.edit.text() == '2026-09-17_11-55_babushka.txt'
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -642,6 +937,29 @@ class TestSettingsDialog:
         assert gui_config['log_visible'] is False
         assert gui_config['blocking_errors'] is True
 
+    # --- словари ---
+
+    def test_dictionaries_are_loaded_from_config(self, qapp, gui_config):
+        gui_config['group_names'] = ['Lisa', 'Moscow']
+        gui_config['callsigns'] = ['Ivanov']
+
+        dlg = SettingsDialog(None, gui_config)
+
+        assert dlg.group_names_edit.toPlainText() == 'Lisa\nMoscow'
+        assert dlg.callsigns_edit.toPlainText() == 'Ivanov'
+
+    def test_dictionaries_are_trimmed_and_deduplicated(self, qapp, gui_config,
+                                                       msgbox):
+        dlg = SettingsDialog(None, gui_config)
+        dlg.group_names_edit.setPlainText(' Lisa \n\nMoscow\nLisa\n')
+        dlg.callsigns_edit.setPlainText('  Petrov  \nIvanov')
+
+        dlg._save()
+
+        assert msgbox.calls == []
+        assert gui_config['group_names'] == ['Lisa', 'Moscow']
+        assert gui_config['callsigns'] == ['Petrov', 'Ivanov']
+
     def test_empty_ftp_path_becomes_root(self, qapp, gui_config, msgbox):
         dlg = SettingsDialog(None, gui_config)
         dlg.fields['ftp_path'].setText('   ')
@@ -689,7 +1007,8 @@ class TestSettingsTabs:
 
         names = [dlg.tabs.tabText(i) for i in range(dlg.tabs.count())]
 
-        assert names == ['Папки', 'Интерфейс', 'FTP', 'OziExplorer']
+        assert names == ['Папки', 'Интерфейс', 'Словари', 'FTP',
+                         'OziExplorer']
 
     @pytest.mark.parametrize('key,tab', [
         ('root_dir', 'Папки'),
@@ -717,6 +1036,8 @@ class TestSettingsTabs:
         ('ozi_wpt_combo', 'OziExplorer'),
         ('ozi_track_ask_cb', 'OziExplorer'),
         ('ozi_wpt_ask_cb', 'OziExplorer'),
+        ('group_names_edit', 'Словари'),
+        ('callsigns_edit', 'Словари'),
     ])
     def test_widgets_live_on_expected_tabs(self, qapp, gui_config, attr, tab):
         dlg = SettingsDialog(None, gui_config)
