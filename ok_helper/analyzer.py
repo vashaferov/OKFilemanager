@@ -26,7 +26,8 @@
     файла и берём дату из самой последней временной метки
     (тег <time> в треке).
 
-  • <1-4 цифры>m.gpx — исключение: валидация не проводится.
+  • <1-4 цифры>m.gpx и <1-2 цифры>km.gpx — исключение:
+    валидация не проводится.
 
   • .wpt — только в формате Waypoints_ГГГГММДД.
 
@@ -43,8 +44,9 @@ from .translit import transliterate
 _LATIN_CALLSIGN_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 _FILENAME_RE = re.compile(r'^(\d{8})_(.+)$')
 
-# <1-4 цифры>m.gpx — «метровый» суффикс.
-_GPX_M_SUFFIX_RE = re.compile(r'(?<!\d)\d{1,4}m$', re.IGNORECASE)
+# <1-4 цифры>m.gpx / <1-2 цифры>km.gpx — суффикс дистанции.
+_GPX_SIZE_SUFFIX_RE = re.compile(
+    r'(?<!\d)(?:\d{1,4}m|\d{1,2}km)$', re.IGNORECASE)
 
 # Waypoints_ГГГГММДД — единственный допустимый формат .wpt.
 _WPT_NAME_RE = re.compile(r'^Waypoints_(\d{8})$', re.IGNORECASE)
@@ -100,9 +102,13 @@ def _ok() -> dict:
 
 
 def is_m_gpx(path: Path) -> bool:
-    """True, если path — это *.gpx с суффиксом <1-4 цифры>m перед расширением."""
+    """True, если path — это *.gpx с суффиксом дистанции перед расширением.
+
+    Под исключение попадают имена вида ``100m.gpx`` (<1-4 цифры>m)
+    и ``10km.gpx`` (<1-2 цифры>km).
+    """
     return (path.suffix.lower() == '.gpx'
-            and bool(_GPX_M_SUFFIX_RE.search(path.stem)))
+            and bool(_GPX_SIZE_SUFFIX_RE.search(path.stem)))
 
 
 def validate_new_folder_name(name: str) -> Tuple[bool, str]:

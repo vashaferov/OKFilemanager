@@ -46,6 +46,8 @@ DEFAULT_CONFIG = {
     'tree_column_widths': '',
     # Показывать панель журнала (док внизу окна).
     'log_visible': True,
+    # Показывать панель заметок к папкам.
+    'notes_visible': True,
     # Высота панели журнала в пикселях.
     'log_dock_height': 180,
     # Показывать предсказуемые отказы (не тот формат, нет папки)
@@ -83,7 +85,7 @@ _LIST_KEYS = ('group_names', 'callsigns')
 
 # Логические настройки: при чтении приводятся к bool.
 _BOOL_KEYS = ('watch_downloads', 'ftp_readonly', 'help_visible_at_start',
-              'first_run', 'log_visible', 'blocking_errors',
+              'first_run', 'log_visible', 'notes_visible', 'blocking_errors',
               'ozi_track_ask', 'ozi_wpt_ask')
 
 # Режимы загрузки точек (см. ok_helper.ozi.OZI_WPT_MODES).
@@ -318,6 +320,7 @@ def save_config(cfg: dict):
     help_at_start = bools['help_visible_at_start']
     first_run = bools['first_run']
     log_visible = bools['log_visible']
+    notes_visible = bools['notes_visible']
     blocking_errors = bools['blocking_errors']
     try:
         log_dock_height = int(cfg.get('log_dock_height', 180))
@@ -437,11 +440,13 @@ def save_config(cfg: dict):
         '# --- Состояние интерфейса ---',
         '# Пишется автоматически при закрытии окна; можно удалить —',
         '# тогда окно откроется с размерами по умолчанию.',
+        '# log_visible / notes_visible — показывать ли панели внизу.',
         '',
         f'window_geometry     = {_toml_value("window_geometry", window_geometry)}',
         f'splitter_state      = {_toml_value("splitter_state", splitter_state)}',
         f'tree_column_widths  = {_toml_value("tree_column_widths", tree_column_widths)}',
         f'log_visible         = {_toml_value("log_visible", log_visible)}',
+        f'notes_visible       = {_toml_value("notes_visible", notes_visible)}',
         f'log_dock_height     = {log_dock_height}',
         f'blocking_errors     = {_toml_value("blocking_errors", blocking_errors)}',
         '',

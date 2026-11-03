@@ -468,7 +468,7 @@ class TestExtractDateFunction:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 8. Исключение: <1-4 цифры>m.gpx — валидация не проводится
+# 8. Исключение: <1-4 цифры>m.gpx / <1-2 цифры>km.gpx
 # ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.story('Исключение <1-4>m.gpx')
@@ -483,6 +483,10 @@ class TestMGpxException:
         'track_5M.gpx',
         '1m.GPX',
         '_100m.gpx',
+        '1km.gpx',
+        '12km.gpx',
+        '20260923_10km.gpx',
+        '5KM.GPX',
     ])
     def test_skips_validation(self, tmp_path, name):
         info = analyze_file(touch(tmp_path / name))
@@ -491,8 +495,10 @@ class TestMGpxException:
 
     @pytest.mark.parametrize('name', [
         'm.gpx',
+        'km.gpx',
         '12345m.gpx',
         '123456m.gpx',
+        '123km.gpx',
         'track.gpx',
         'track_100ms.gpx',
         'track_m100.gpx',
@@ -667,7 +673,7 @@ class TestValidateNewFolderName:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 14. is_m_gpx — исключение <1-4 цифры>m.gpx
+# 14. is_m_gpx — исключение <1-4 цифры>m.gpx / <1-2 цифры>km.gpx
 # ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.story('is_m_gpx')
@@ -676,12 +682,15 @@ class TestIsMGpx:
         '1m.gpx', '12m.gpx', '100m.gpx', '9999m.gpx',
         '20260923_100m.gpx', 'track_100m.gpx',
         '100M.GPX', '100m.Gpx',
+        '1km.gpx', '12km.gpx', 'track_5km.gpx',
+        '10KM.GPX', '50km.Gpx',
     ])
     def test_true(self, name):
         assert is_m_gpx(Path(name)) is True
 
     @pytest.mark.parametrize('name', [
-        'm.gpx', '12345m.gpx', 'track.gpx', 'track_100ms.gpx',
+        'm.gpx', 'km.gpx', '12345m.gpx', '123km.gpx',
+        'track.gpx', 'track_100ms.gpx',
         'track_m100.gpx', '100m.plt', '100m.wpt', '100m', '100',
     ])
     def test_false(self, name):

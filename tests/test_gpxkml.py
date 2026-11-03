@@ -448,7 +448,8 @@ class TestWriteWpt:
         assert fields[14] == '-777.0'
 
     def test_comma_in_description_is_replaced(self, lines):
-        assert 'точка  с запятой' in lines[4]
+        # Запятая — пробелом, кириллическая «с» — латинской «c».
+        assert 'точка  c запятой' in lines[4]
 
     def test_read_back_by_our_parser(self, tmp_path):
         """Наш же разбор .wpt должен вернуть те же точки."""
@@ -463,7 +464,8 @@ class TestWriteWpt:
         assert back[0].altitude_m == pytest.approx(200.5, abs=0.01)
         # Запятая в тексте заменена пробелом: она сломала бы разбор
         # строки по запятым, а символ 209 в cp1251 — это буква «С».
-        assert back[0].description == 'точка  с запятой'
+        # Кириллическая «с» записана латинской «c».
+        assert back[0].description == 'точка  c запятой'
         assert back[1].altitude_m == ALTITUDE_UNKNOWN
 
     def test_empty_list_writes_header_only(self, tmp_path):

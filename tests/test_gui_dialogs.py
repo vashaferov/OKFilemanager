@@ -19,6 +19,7 @@ from pathlib import Path
 import allure
 import pytest
 from PySide6.QtCore import QEvent
+from PySide6.QtGui import QColor
 
 from ok_helper import gui
 from ok_helper.gpxkml import Content, Track, TrackPoint
@@ -29,8 +30,16 @@ from ok_helper.gui import (
     OziLoadDialog,
     RenameDialog,
     SettingsDialog,
+    WaypointEditDialog,
+    WptEditorDialog,
 )
-from ok_helper.wpt import Waypoint
+from ok_helper.wpt import (
+    ALTITUDE_UNKNOWN,
+    Waypoint,
+    WptRecord,
+    read_wpt,
+    read_wpt_file,
+)
 
 
 pytestmark = [
@@ -482,8 +491,8 @@ class TestNewFolderDialog:
                               gui_config['root_dir_resolved'])
 
         assert dlg.tracks_cb is not None
-        assert dlg.tracks_cb.isChecked() is False
-        assert dlg.with_10_tracks is False
+        assert dlg.tracks_cb.isChecked() is True
+        assert dlg.with_10_tracks is True
 
     @pytest.mark.smoke
     def test_nested_dir_has_empty_name_and_no_checkbox(self, qapp, gui_config):
@@ -579,6 +588,17 @@ class TestNewFolderDialog:
         dlg._apply()
 
         assert dlg.with_10_tracks is True
+
+    def test_apply_respects_unchecked_ten_tracks(self, qapp, gui_config):
+        """Флаг включён по умолчанию, но его можно снять."""
+        root = gui_config['root_dir_resolved']
+        dlg = NewFolderDialog(None, gui_config, root)
+        dlg.edit.setText('2026-09-23_Moscow')
+        dlg.tracks_cb.setChecked(False)
+
+        dlg._apply()
+
+        assert dlg.with_10_tracks is False
 
     def test_ten_tracks_stays_false_without_checkbox(self, qapp, gui_config):
         sub = gui_config['root_dir_resolved'] / 'sub'
@@ -1518,7 +1538,7 @@ class TestHelpDialog:
     @pytest.mark.parametrize('key', [
         'F1', 'F2', 'F5', 'Ctrl+F5', 'Ctrl+N', 'Ctrl+O', 'Ctrl+X',
         'Ctrl+Y', 'F10', 'F12', 'Delete', 'Ctrl+E', 'Ctrl+L',
-        'Ctrl+1', 'Ctrl+2', 'Ctrl+D', 'Ctrl+Shift+O',
+        'Ctrl+1', 'Ctrl+2', 'Ctrl+D',
     ])
     def test_help_lists_documented_hotkeys(self, key):
         """Справка должна перечислять клавиши из README."""
@@ -1543,3 +1563,629 @@ class TestHelpDialog:
     def test_help_has_no_ozi_api_setting_pointer(self):
         """Справка ссылалась на отсутствующий пункт Configuration → OziAPI."""
         assert 'Configuration' not in HelpDialog.HELP_TEXT
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6. Редактор файла точек .wpt (контекстное меню файла)
+# ─────────────────────────────────────────────────────────────────
+
+WPT_HEADER = ('OziExplorer Waypoint File Version 1.1\r\n'
+              'WGS 84\r\n'
+              'Reserved 2\r\n'
+              'garmin\r\n')
+WPT_LINE_1 = ('1,Первая,56.1,60.1,46325.2740203,0,1,3,0,255,'
+              'Комментарий,0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+WPT_LINE_2 = ('2,Вторая,56.2,60.2,46325.2747481,7,1,3,0,255,'
+              ',0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+
+
+def make_wpt(tmp_path, lines=(WPT_LINE_1, WPT_LINE_2)):
+    src = tmp_path / 'Waypoints_20261030.wpt'
+    text = WPT_HEADER + ''.join(line + '\r\n' for line in lines)
+    src.write_bytes(text.encode('cp1251'))
+    return src
+
+
+@pytest.mark.story('Правка одной точки .wpt')
+class TestWaypointEditDialog:
+    def test_fields_are_prefilled(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+
+        dlg = WaypointEditDialog(None, record)
+
+        assert dlg.name_edit.text() == 'Первая'
+        assert dlg.lat_edit.text() == '56.100000'
+        assert dlg.lon_edit.text() == '60.100000'
+        assert dlg.alt_edit.text() == ''
+        assert dlg.date_edit.text() == gui._format_wpt_date(record.date)
+        assert dlg.description_edit.text() == 'Комментарий'
+        assert dlg.symbol_spin.value() == 0
+
+    @pytest.mark.smoke
+    def test_apply_updates_record(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg.name_edit.setText('Новая')
+        dlg.lat_edit.setText('56,5')
+        dlg.lon_edit.setText('60.5')
+        dlg.alt_edit.setText('250')
+        dlg.description_edit.setText('Пометка, и запятая')
+        dlg.symbol_spin.setValue(12)
+
+        dlg._apply()
+
+        assert dlg.result is record
+        assert record.name == 'Новая'
+        assert record.lat == pytest.approx(56.5)
+        assert record.lon == pytest.approx(60.5)
+        assert record.altitude_m == pytest.approx(250.0)
+        assert record.description == 'Пометка; и запятая'
+        assert record.symbol == 12
+
+    @pytest.mark.smoke
+    def test_apply_replaces_cyrillic_s(self, qapp):
+        """Кириллическая «с» в имени и описании становится латинской."""
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg.name_edit.setText('Следы')
+        dlg.description_edit.setText('сгущёнка')
+
+        dlg._apply()
+
+        assert record.name == 'Cледы'
+        assert record.description == 'cгущёнка'
+
+    def test_empty_name_is_rejected(self, qapp, msgbox):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+        dlg.name_edit.setText('   ')
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert 'critical' in msgbox.kinds
+
+    @pytest.mark.parametrize('value', ['', 'широта', '91', '-91'])
+    def test_bad_latitude_is_rejected(self, qapp, msgbox, value):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+        dlg.lat_edit.setText(value)
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert 'critical' in msgbox.kinds
+
+    @pytest.mark.parametrize('value', ['', 'долгота', '181', '-181'])
+    def test_bad_longitude_is_rejected(self, qapp, msgbox, value):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+        dlg.lon_edit.setText(value)
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert 'critical' in msgbox.kinds
+
+    def test_bad_altitude_is_rejected(self, qapp, msgbox):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+        dlg.alt_edit.setText('высоко')
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert 'critical' in msgbox.kinds
+
+    def test_empty_altitude_means_unknown(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        record.altitude_m = 100.0
+        dlg = WaypointEditDialog(None, record)
+        dlg.alt_edit.setText('')
+
+        dlg._apply()
+
+        assert record.altitude_ft == ALTITUDE_UNKNOWN
+
+    def test_bad_date_is_rejected(self, qapp, msgbox):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+        dlg.date_edit.setText('вчера')
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert 'critical' in msgbox.kinds
+
+    def test_unchanged_date_is_kept_exactly(self, qapp):
+        """Правка имени не должна пересчитывать дату OziExplorer."""
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg.name_edit.setText('Только имя')
+
+        dlg._apply()
+
+        assert record.fields[4] == '46325.2740203'
+
+    def test_date_can_be_changed(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg.date_edit.setText('31.10.2026 12:30')
+
+        dlg._apply()
+
+        assert gui._format_wpt_date(record.date) == '31.10.2026 12:30'
+
+    # ---------- цвет точки (фон) ----------
+
+    def test_color_list_has_presets_and_custom(self, qapp):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        items = [dlg.color_combo.itemText(i)
+                 for i in range(dlg.color_combo.count())]
+
+        assert items == ['Красный', 'Морской волны', 'Зелёный', 'Жёлтый',
+                         'Кастомный…']
+
+    def test_color_is_prefilled_from_background(self, qapp):
+        """Основной цвет — цвет фона, поле 9 (COLORREF: BGR, а не RGB)."""
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        assert dlg._color == QColor(255, 0, 0)
+        assert dlg.color_combo.currentText() == 'Красный'
+
+    def test_preset_color_is_selected(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        record.fields[9] = '65535'          # жёлтый
+
+        dlg = WaypointEditDialog(None, record)
+
+        assert dlg.color_combo.currentText() == 'Жёлтый'
+        assert dlg._color == QColor(255, 255, 0)
+
+    def test_missing_color_means_default(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        record.fields[9] = ''
+
+        dlg = WaypointEditDialog(None, record)
+
+        assert dlg._color is None
+        assert dlg.color_combo.currentIndex() == -1
+
+    def test_choosing_preset_sets_color(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+
+        dlg.color_combo.setCurrentIndex(1)      # Морской волны
+
+        assert dlg._color == QColor(0, 255, 255)
+        dlg._apply()
+        assert record.fields[9] == str(16776960)
+
+    def test_custom_color_selects_custom_item(self, qapp, monkeypatch):
+        monkeypatch.setattr(gui.QColorDialog, 'getColor',
+                            lambda *a, **kw: QColor(1, 2, 3))
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        dlg.color_combo.setCurrentIndex(dlg._custom_index())
+
+        assert dlg._color == QColor(1, 2, 3)
+        assert dlg.color_combo.currentText() == 'Кастомный (#010203)'
+
+    def test_custom_cancel_restores_previous_item(self, qapp, monkeypatch):
+        monkeypatch.setattr(gui.QColorDialog, 'getColor',
+                            lambda *a, **kw: QColor())
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        dlg.color_combo.setCurrentIndex(dlg._custom_index())
+
+        assert dlg._color == QColor(255, 0, 0)
+        assert dlg.color_combo.currentText() == 'Красный'
+
+    def test_unknown_color_is_shown_as_custom(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        record.fields[9] = str(0x00FF00)        # салатовый, не из списка
+
+        dlg = WaypointEditDialog(None, record)
+
+        assert dlg.color_combo.currentText() == 'Кастомный (#00FF00)'
+
+    def test_color_is_written_as_colorref(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg._set_color(QColor(0, 255, 0))
+
+        dlg._apply()
+
+        # Зелёный в COLORREF — 0x0000FF00, а не 0x0000FF.
+        assert record.fields[9] == str(0x00FF00)
+        assert record.color == 0x00FF00
+
+    def test_color_can_be_reset_to_default(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg._set_color(None)
+
+        dlg._apply()
+
+        assert record.fields[9] == ''
+        assert record.color == gui.DEFAULT
+        assert dlg.color_combo.currentIndex() == -1
+
+    def test_text_color_is_forced_black(self, qapp):
+        """Цвет текста не редактируется: при сохранении он чёрный."""
+        record = WptRecord.from_line(WPT_LINE_1)
+        record.fields[8] = '128'
+        dlg = WaypointEditDialog(None, record)
+
+        dlg._apply()
+
+        assert record.fore_color == 0
+        assert record.fields[8] == '0'
+
+    def test_text_color_already_black_keeps_raw(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+
+        dlg._apply()
+
+        assert record.raw == WPT_LINE_1
+
+    def test_color_picker_sets_color(self, qapp, monkeypatch):
+        monkeypatch.setattr(gui.QColorDialog, 'getColor',
+                            lambda *a, **kw: QColor(1, 2, 3))
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        dlg._pick_color()
+
+        assert dlg._color == QColor(1, 2, 3)
+        assert dlg.color_combo.currentText() == 'Кастомный (#010203)'
+
+    def test_color_picker_cancel_keeps_color(self, qapp, monkeypatch):
+        monkeypatch.setattr(gui.QColorDialog, 'getColor',
+                            lambda *a, **kw: QColor())
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        dlg._pick_color()
+
+        assert dlg._color == QColor(255, 0, 0)
+        assert dlg.color_combo.currentText() == 'Красный'
+
+    def test_apply_without_changes_keeps_raw_line(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+
+        dlg._apply()
+
+        assert dlg.result is record
+        assert record.raw == WPT_LINE_1
+
+    def test_new_record_gets_all_fields(self, qapp):
+        record = WptRecord.new(name='', lat=0.0, lon=0.0)
+        dlg = WaypointEditDialog(None, record, is_new=True)
+        dlg.name_edit.setText('Точка')
+        dlg.lat_edit.setText('56.9')
+        dlg.lon_edit.setText('60.8')
+
+        dlg._apply()
+
+        assert len(record.to_line().split(',')) == 25
+        assert record.name == 'Точка'
+
+
+@pytest.mark.story('Форматы координат')
+class TestCoordFormats:
+    @pytest.mark.parametrize('text, expected', [
+        ('56.909284', 56.909284),
+        ('56,909284', 56.909284),
+        ('-56.909284', -56.909284),
+        ('56° 54.557′', 56.90928333),
+        ('56 54.557', 56.90928333),
+        ('N 56 54.557', 56.90928333),
+        ('56°54′33.4″', 56.90927778),
+        ('56 54 33.4', 56.90927778),
+        ('S 56 54 33.4', -56.90927778),
+        ('56 54 33.4 W', -56.90927778),
+    ])
+    def test_parse_all_formats(self, text, expected):
+        assert gui._parse_wpt_coord(text) == pytest.approx(expected, abs=1e-6)
+
+    @pytest.mark.parametrize('text', ['', 'широта', '56 61', '56 54 61',
+                                      '56 54 33 12'])
+    def test_bad_coordinate_is_rejected(self, text):
+        assert gui._parse_wpt_coord(text) is None
+
+    def test_format_decimal(self):
+        assert gui._format_wpt_coord(56.909284) == '56.909284'
+        assert (gui._format_wpt_coord(-56.909284, gui.WPT_COORD_DECIMAL)
+                == '-56.909284')
+
+    def test_format_degrees_and_minutes(self):
+        assert (gui._format_wpt_coord(56.909284, gui.WPT_COORD_DM)
+                == '56° 54.557′')
+
+    def test_format_degrees_minutes_seconds(self):
+        assert (gui._format_wpt_coord(56.909284, gui.WPT_COORD_DMS)
+                == '56° 54′ 33.4″')
+
+    def test_format_rounds_up_minutes(self):
+        """59.9999′ при округлении не должно остаться минутами."""
+        assert (gui._format_wpt_coord(56.9999999, gui.WPT_COORD_DM)
+                == '57° 0.000′')
+
+    def test_dialog_has_three_formats(self, qapp):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        items = [dlg.format_combo.itemText(i)
+                 for i in range(dlg.format_combo.count())]
+
+        assert items == ['Десятичные градусы', 'Градусы и минуты',
+                         'Градусы, минуты и секунды']
+        assert dlg.lat_edit.text() == '56.100000'
+
+    def test_switch_format_reformats_fields(self, qapp):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        dlg.format_combo.setCurrentIndex(gui.WPT_COORD_DM)
+
+        assert dlg.lat_edit.text() == '56° 6.000′'
+        assert dlg.lon_edit.text() == '60° 6.000′'
+
+        dlg.format_combo.setCurrentIndex(gui.WPT_COORD_DMS)
+
+        assert dlg.lat_edit.text() == '56° 6′ 0.0″'
+        assert dlg.lon_edit.text() == '60° 6′ 0.0″'
+
+    def test_placeholders_follow_format(self, qapp):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+
+        dlg.format_combo.setCurrentIndex(gui.WPT_COORD_DM)
+
+        assert '°' in dlg.lat_edit.placeholderText()
+
+    def test_apply_accepts_degrees_minutes(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg.lat_edit.setText('56° 54.557′')
+        dlg.lon_edit.setText('E 60 49.105')
+
+        dlg._apply()
+
+        assert record.lat == pytest.approx(56.90928333, abs=1e-6)
+        assert record.lon == pytest.approx(60.81841667, abs=1e-6)
+
+    def test_apply_accepts_degrees_minutes_seconds(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg.lat_edit.setText('56 54 33.4')
+        dlg.lon_edit.setText('60 49 6.3 E')
+
+        dlg._apply()
+
+        assert record.lat == pytest.approx(56.90927778, abs=1e-6)
+        assert record.lon == pytest.approx(60.81841667, abs=1e-6)
+
+    def test_southern_hemisphere_is_negative(self, qapp):
+        record = WptRecord.from_line(WPT_LINE_1)
+        dlg = WaypointEditDialog(None, record)
+        dlg.lat_edit.setText('S 56 54 33.4')
+
+        dlg._apply()
+
+        assert record.lat == pytest.approx(-56.90927778, abs=1e-6)
+
+    def test_bad_minutes_are_rejected(self, qapp, msgbox):
+        dlg = WaypointEditDialog(None, WptRecord.from_line(WPT_LINE_1))
+        dlg.lat_edit.setText('56 61 0')
+
+        dlg._apply()
+
+        assert dlg.result is None
+        assert 'critical' in msgbox.kinds
+
+
+@pytest.mark.story('Редактор файла .wpt')
+class TestWptEditorDialog:
+    def test_loads_points_and_columns(self, qapp, tmp_path):
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+
+        assert dlg.table.rowCount() == 2
+        assert dlg.table.columnCount() == 6
+        assert dlg.table.item(0, 1).text() == 'Первая'
+        assert dlg.table.item(1, 1).text() == 'Вторая'
+        assert dlg.title.text().startswith('Waypoints_20261030.wpt')
+
+    def test_height_and_date_columns_are_gone(self, qapp, tmp_path):
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+
+        headers = [dlg.table.horizontalHeaderItem(i).text()
+                   for i in range(dlg.table.columnCount())]
+
+        assert headers == ['№', 'Имя', 'Широта', 'Долгота', 'Цвет',
+                           'Описание']
+
+    def test_color_column_shows_color_name(self, qapp, tmp_path):
+        """Готовый цвет выводится названием, а не кодом."""
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+
+        assert dlg.table.item(0, 4).text() == 'Красный'
+        assert not dlg.table.item(0, 4).icon().isNull()
+
+    def test_default_color_column_is_empty(self, qapp, tmp_path):
+        line = ('1,Первая,56.1,60.1,46325.2740203,0,1,3,0,,Комментарий,'
+                '0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+        dlg = WptEditorDialog(None, make_wpt(tmp_path, lines=(line,)))
+
+        assert dlg.table.item(0, 4).text() == '—'
+        assert dlg.table.item(0, 4).toolTip().startswith('Цвет по умолчанию')
+
+    def test_custom_color_column_keeps_hex(self, qapp, tmp_path):
+        src = make_wpt(tmp_path)
+        dlg = WptEditorDialog(None, src)
+        dlg.records[0].color = 0x00FF00        # не из готовых
+
+        dlg._refresh()
+
+        assert dlg.table.item(0, 4).text() == '#00FF00'
+        assert not dlg.table.item(0, 4).icon().isNull()
+
+    # ---------- замена «с» на «c» в окне ----------
+
+    def test_normalize_replaces_cyrillic_s(self, qapp, tmp_path, msgbox):
+        line = ('1,Следы,56.1,60.1,46325.274,0,1,3,0,255,'
+                'конфеты,0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+        src = make_wpt(tmp_path, lines=(line,))
+        dlg = WptEditorDialog(None, src)
+
+        dlg._normalize_text()
+
+        assert dlg.table.item(0, 1).text() == 'Cледы'
+        assert 'Заменено в точках: 1' in msgbox.texts()[-1]
+        # Пока не нажали «Сохранить», файл не менялся.
+        assert read_wpt(src)[0].name == 'Следы'
+
+        dlg._save()
+
+        assert read_wpt(src)[0].name == 'Cледы'
+
+    def test_normalize_nothing_to_do_reports(self, qapp, tmp_path, msgbox):
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+
+        dlg._normalize_text()
+
+        assert msgbox.kinds == ['information']
+        assert 'нет' in msgbox.texts()[0]
+
+    def test_normalize_keeps_selection(self, qapp, tmp_path, msgbox):
+        line_1 = ('1,Следы,56.1,60.1,46325.274,0,1,3,0,255,'
+                  'конфеты,0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+        line_2 = ('2,Вторая,56.2,60.2,46325.274,0,1,3,0,255,'
+                  'поворот,0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+        dlg = WptEditorDialog(None, make_wpt(tmp_path,
+                                             lines=(line_1, line_2)))
+        dlg.table.selectRow(1)
+
+        dlg._normalize_text()
+
+        assert dlg.table.currentRow() == 1
+        assert dlg.table.item(1, 1).text() == 'Вторая'
+
+    def test_empty_file_has_no_rows(self, qapp, tmp_path):
+        dlg = WptEditorDialog(None, make_wpt(tmp_path, lines=()))
+
+        assert dlg.table.rowCount() == 0
+        assert dlg.records == []
+
+    def test_add_appends_record(self, qapp, tmp_path, monkeypatch):
+        class FakeEdit:
+            def __init__(self, parent, record, is_new=False):
+                record.name = 'Добавлена'
+                record.lat = 56.3
+                record.lon = 60.3
+                self.result = record
+
+            def exec(self):
+                return gui.QDialog.Accepted
+
+        monkeypatch.setattr(gui, 'WaypointEditDialog', FakeEdit)
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+
+        dlg._add()
+
+        assert dlg.table.rowCount() == 3
+        assert dlg.records[-1].name == 'Добавлена'
+        assert dlg.table.item(2, 1).text() == 'Добавлена'
+
+    def test_cancelled_add_changes_nothing(self, qapp, tmp_path, monkeypatch):
+        class FakeEdit:
+            def __init__(self, parent, record, is_new=False):
+                self.result = None
+
+            def exec(self):
+                return gui.QDialog.Rejected
+
+        monkeypatch.setattr(gui, 'WaypointEditDialog', FakeEdit)
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+
+        dlg._add()
+
+        assert len(dlg.records) == 2
+
+    def test_delete_removes_selected(self, qapp, tmp_path, msgbox):
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+        dlg.table.selectRow(0)
+
+        dlg._delete()
+
+        assert len(dlg.records) == 1
+        assert dlg.records[0].name == 'Вторая'
+        assert 'question' in msgbox.kinds
+
+    def test_delete_can_be_cancelled(self, qapp, tmp_path, msgbox):
+        msgbox.answer = 'No'
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+        dlg.table.selectRow(0)
+
+        dlg._delete()
+
+        assert len(dlg.records) == 2
+
+    def test_move_changes_order(self, qapp, tmp_path):
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+        dlg.table.selectRow(0)
+
+        dlg._move(1)
+
+        assert [record.name for record in dlg.records] == [
+            'Вторая', 'Первая']
+        assert dlg.table.currentRow() == 1
+
+    def test_move_at_border_does_nothing(self, qapp, tmp_path):
+        dlg = WptEditorDialog(None, make_wpt(tmp_path))
+        dlg.table.selectRow(0)
+
+        dlg._move(-1)
+
+        assert [record.name for record in dlg.records] == [
+            'Первая', 'Вторая']
+
+    def test_save_writes_changes_to_file(self, qapp, tmp_path):
+        src = make_wpt(tmp_path)
+        dlg = WptEditorDialog(None, src)
+        dlg.records[0].name = 'Добавлена'
+
+        dlg._save()
+
+        assert dlg.saved is True
+        assert read_wpt(src)[0].name == 'Добавлена'
+        assert src.read_bytes().startswith(WPT_HEADER.encode('cp1251'))
+
+    def test_save_keeps_cp1251(self, qapp, tmp_path):
+        src = make_wpt(tmp_path)
+        dlg = WptEditorDialog(None, src)
+        dlg.records[0].name = 'Ёлка'
+
+        dlg._save()
+
+        raw = src.read_bytes()
+        assert not raw.startswith(b'\xef\xbb\xbf')
+        assert 'Ёлка' in raw.decode('cp1251')
+
+    def test_save_continues_numbering_untouched_lines(self, qapp, tmp_path):
+        """Правка описания не меняет форматирование координат."""
+        src = make_wpt(tmp_path)
+        before = src.read_text(encoding='cp1251').splitlines()
+        dlg = WptEditorDialog(None, src)
+        dlg.records[1].description = 'Другое'
+
+        dlg._save()
+
+        after = src.read_text(encoding='cp1251').splitlines()
+        assert after[4] == before[4]
+        assert 'Другое' in after[5]
+
+    def test_read_wpt_file_roundtrip_window(self, qapp, tmp_path):
+        """Окно не теряет записи при открытии и сохранении без правок."""
+        src = make_wpt(tmp_path)
+        before = src.read_bytes()
+
+        dlg = WptEditorDialog(None, src)
+        dlg._save()
+
+        assert src.read_bytes() == before
+        assert len(read_wpt_file(src).records) == 2

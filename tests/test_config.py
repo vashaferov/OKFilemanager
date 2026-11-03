@@ -317,6 +317,7 @@ class TestLoadConfig:
         assert cfg['splitter_state'] == ''
         assert cfg['tree_column_widths'] == ''
         assert cfg['log_visible'] is True
+        assert cfg['notes_visible'] is True
         assert cfg['blocking_errors'] is False
 
     def test_ui_state_is_read_from_file(self, cfg_file):
@@ -326,6 +327,7 @@ class TestLoadConfig:
             "splitter_state = 'aabb'\n"
             "tree_column_widths = '300,80,120'\n"
             "log_visible = false\n"
+            "notes_visible = false\n"
             "blocking_errors = true\n",
             encoding='utf-8')
 
@@ -335,6 +337,7 @@ class TestLoadConfig:
         assert cfg['splitter_state'] == 'aabb'
         assert cfg['tree_column_widths'] == '300,80,120'
         assert cfg['log_visible'] is False
+        assert cfg['notes_visible'] is False
         assert cfg['blocking_errors'] is True
 
     def test_creates_config_file(self, cfg_file):
@@ -585,6 +588,7 @@ class TestSaveConfig:
             'splitter_state': 'aabbcc',
             'tree_column_widths': '300,80,120',
             'log_visible': False,
+            'notes_visible': False,
             'blocking_errors': True,
         })
 
@@ -595,6 +599,7 @@ class TestSaveConfig:
                     'tree_column_widths'):
             assert again[key] == cfg[key], key
         assert again['log_visible'] is False
+        assert again['notes_visible'] is False
         assert again['blocking_errors'] is True
 
     def test_invalid_theme_is_written_as_auto(self, cfg_file):

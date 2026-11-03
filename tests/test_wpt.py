@@ -17,6 +17,7 @@
   story   = задаётся маркером @pytest.mark.story на каждом классе.
 """
 
+from datetime import datetime
 from pathlib import Path
 
 import allure
@@ -26,11 +27,19 @@ from ok_helper import wpt
 from ok_helper.wpt import (
     ALTITUDE_UNKNOWN,
     DEFAULT,
+    METERS_IN_FOOT,
+    WPT_FIELD_COUNT,
     Waypoint,
+    WptRecord,
+    datetime_to_delphi,
     decode_wpt,
+    delphi_to_datetime,
+    escape_text,
+    normalize_text,
     parse_line,
     parse_wpt,
     read_wpt,
+    read_wpt_file,
 )
 
 
@@ -335,6 +344,309 @@ class TestAsApi:
 
 REAL_FILES = sorted(Path(r'D:\LA\Треки').rglob('Waypoints_*.wpt')) \
     if Path(r'D:\LA\Треки').is_dir() else []
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6. Запись .wpt (редактор точек)
+# ─────────────────────────────────────────────────────────────────
+
+def sample_file(tmp_path, extra: str = '', encoding: str = 'cp1251'):
+    src = tmp_path / 'Waypoints_20261030.wpt'
+    text = (HEADER
+            + '1,Первая,56.1,60.1,46325.2740203,0,1,3,0,255,'
+              'Комментарий,0,0,0,-777,6,0,17,0,10.0,2,,,,300\r\n'
+            + '2,Вторая,56.2,60.2,46325.2747481,7,1,3,0,255,'
+              ',0,0,0,-777,6,0,17,0,10.0,2,,,,300\r\n'
+            + extra)
+    src.write_bytes(text.encode(encoding))
+    return src
+
+
+@pytest.mark.story('Запись файла')
+class TestWptFile:
+    def test_roundtrip_is_byte_identical(self, tmp_path):
+        """Неизменённый файл пишется байт в байт."""
+        line = ('1,BVP,  56.423073,  61.877189,46105.7564356,  0, 1, 3,'
+                '         0,       255,Поворот, 0, 0,    0,   -777, 6, 0,17,'
+                '0,10.0,2,,,,300')
+        src = tmp_path / 'Waypoints.wpt'
+        src.write_bytes(HEADER.encode('cp1251') + line.encode('cp1251')
+                        + b'\r\n')
+        wpt_file = read_wpt_file(src)
+
+        wpt_file.save(src)
+
+        assert src.read_bytes() == (HEADER.encode('cp1251')
+                                    + line.encode('cp1251') + b'\r\n')
+
+    def test_header_encoding_and_newline_are_kept(self, tmp_path):
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+
+        assert wpt_file.encoding == 'cp1251'
+        assert wpt_file.newline == '\r\n'
+        assert wpt_file.header[0].startswith('OziExplorer Waypoint File')
+        assert len(wpt_file.records) == 2
+
+    def test_modified_line_is_rewritten(self, tmp_path):
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+        wpt_file.records[0].description = 'Новый поворот'
+        wpt_file.save(src)
+
+        lines = src.read_text(encoding='cp1251').splitlines()
+        assert 'Новый поворот' in lines[4]
+        assert 'Вторая' in lines[5]
+
+    def test_untouched_line_is_not_rewritten(self, tmp_path):
+        """Правка одной точки не меняет форматирование другой."""
+        src = sample_file(tmp_path)
+        before = src.read_text(encoding='cp1251').splitlines()
+        wpt_file = read_wpt_file(src)
+        wpt_file.records[0].name = 'Изменена'
+        wpt_file.save(src)
+        after = src.read_text(encoding='cp1251').splitlines()
+
+        assert after[1] == before[1]
+        assert after[0] == before[0]
+
+    def test_new_record_has_all_fields(self, tmp_path):
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+
+        record = wpt_file.new_record(name='Точка', lat=56.3, lon=60.3)
+
+        assert len(record.to_line().split(',')) == WPT_FIELD_COUNT
+        assert record.name == 'Точка'
+        assert record.lat == pytest.approx(56.3)
+        assert record.lon == pytest.approx(60.3)
+        assert record.altitude_ft == ALTITUDE_UNKNOWN
+
+    def test_new_record_keeps_file_style(self, tmp_path):
+        """Новая точка повторяет символ и оформление последней записи."""
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+
+        record = wpt_file.new_record(name='Точка')
+
+        assert record.symbol == wpt_file.records[-1].symbol
+        assert record.fields[6] == wpt_file.records[-1].fields[6]
+
+    def test_added_record_is_read_back(self, tmp_path):
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+        wpt_file.records.append(
+            wpt_file.new_record(name='Новая', lat=56.4, lon=60.4))
+        wpt_file.save(src)
+
+        points = read_wpt(src)
+
+        assert len(points) == 3
+        assert points[-1].name == 'Новая'
+        assert points[-1].lat == pytest.approx(56.4)
+
+    def test_utf8_bom_is_kept(self, tmp_path):
+        src = sample_file(tmp_path, encoding='utf-8-sig')
+        wpt_file = read_wpt_file(src)
+        wpt_file.records[0].name = 'Ёлка'
+        wpt_file.save(src)
+
+        raw = src.read_bytes()
+        assert raw.startswith(b'\xef\xbb\xbf')
+        assert read_wpt(src)[0].name == 'Ёлка'
+
+    def test_header_is_added_when_missing(self, tmp_path):
+        src = tmp_path / 'plain.wpt'
+        src.write_text('1,A,55.0,37.0\r\n', encoding='cp1251')
+        wpt_file = read_wpt_file(src)
+        wpt_file.save(src)
+
+        assert src.read_text(encoding='cp1251').splitlines()[0].startswith(
+            'OziExplorer Waypoint File')
+
+    def test_unparsed_lines_are_kept(self, tmp_path):
+        src = sample_file(tmp_path, extra='мусор\r\n')
+        wpt_file = read_wpt_file(src)
+        wpt_file.records[0].name = 'Изменена'
+        wpt_file.save(src)
+
+        assert 'мусор' in src.read_text(encoding='cp1251').splitlines()
+
+    def test_comma_in_text_does_not_split_fields(self, tmp_path):
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+        wpt_file.records[0].name = 'A,B'
+        wpt_file.records[0].description = 'ул. Мира, д. 5'
+
+        line = wpt_file.records[0].to_line()
+
+        assert len(line.split(',')) == WPT_FIELD_COUNT
+        assert wpt_file.records[0].name == 'A;B'
+        assert wpt_file.records[0].description == 'ул. Мира; д. 5'
+
+    def test_colors_use_colorref(self):
+        """Поля 8/9 — Windows COLORREF (BGR), «по умолчанию» — -1."""
+        record = WptRecord.from_line(REAL_LINE)
+
+        assert record.fore_color == 0
+        assert record.back_color == 255
+
+        record.back_color = 0x00FF00          # зелёный: B=0, G=255, R=0
+
+        assert record.fields[9] == '65280'
+
+    def test_default_color_is_written_as_empty(self):
+        record = WptRecord.from_line(REAL_LINE)
+
+        record.fore_color = DEFAULT
+
+        assert record.fields[8] == ''
+        assert record.fore_color == DEFAULT
+
+    def test_main_color_is_background(self):
+        """«Цвет точки» — это фон подписи; текст отдельно не задаётся."""
+        record = WptRecord.from_line(REAL_LINE)
+
+        assert record.color == record.back_color == 255
+
+        record.color = 0x00FF00
+
+        assert record.fields[9] == '65280'
+        assert record.fields[8] == '0'
+
+    def test_new_record_has_black_text(self):
+        template = WptRecord.from_line(REAL_LINE)
+        template.fore_color = 128
+
+        record = WptRecord.new(template, name='Точка')
+
+        assert record.fore_color == 0
+        assert record.fields[8] == '0'
+        assert record.back_color == template.back_color
+
+    def test_altitude_is_stored_in_feet(self, tmp_path):
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+
+        wpt_file.records[0].altitude_m = 100.0
+
+        assert wpt_file.records[0].altitude_ft == pytest.approx(
+            100.0 / METERS_IN_FOOT)
+        assert wpt_file.records[0].altitude_m == pytest.approx(100.0)
+
+    def test_date_conversion(self):
+        moment = datetime(2026, 10, 30, 12, 30)
+
+        value = datetime_to_delphi(moment)
+        restored = delphi_to_datetime(value)
+
+        assert restored is not None
+        assert abs((restored - moment).total_seconds()) < 1
+
+    def test_unknown_date_is_none(self):
+        assert delphi_to_datetime(DEFAULT) is None
+        assert delphi_to_datetime('') is None
+        assert delphi_to_datetime('мусор') is None
+
+
+# ─────────────────────────────────────────────────────────────────
+# 7. Кириллическая «с» → латинская «c» в имени и описании
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Замена кириллической «с»')
+class TestNormalizeText:
+    """В cp1251 заглавная «С» — байт 0xD1, которым OziExplorer пишет
+    запятую, и в его окне такая буква выглядит разделителем. Латинская
+    «c» на глаз не отличается, но такого совпадения не даёт."""
+
+    def test_lowercase_is_replaced(self):
+        assert normalize_text('следы') == 'cледы'
+
+    def test_uppercase_is_replaced(self):
+        assert normalize_text('СНТ') == 'CНТ'
+
+    def test_other_cyrillic_letters_are_kept(self):
+        assert normalize_text('Камера на повороте') == 'Камера на повороте'
+
+    def test_latin_c_is_kept(self):
+        assert normalize_text('camera') == 'camera'
+
+    def test_escape_text_normalizes_and_replaces_comma(self):
+        assert escape_text('СНТ, дом') == 'CНТ; дом'
+
+    def test_name_setter_normalizes(self):
+        record = WptRecord.from_line(REAL_LINE)
+
+        record.name = 'Следы и конфеты'
+
+        assert record.name == 'Cледы и конфеты'
+        assert record.fields[1] == 'Cледы и конфеты'
+
+    def test_description_setter_normalizes(self):
+        record = WptRecord.from_line(REAL_LINE)
+
+        record.description = 'Смена района'
+
+        assert record.description == 'Cмена района'
+        assert record.fields[10] == 'Cмена района'
+
+    def test_read_keeps_text_as_is(self, tmp_path):
+        """Чтение файл не меняет — замену делает редактор."""
+        src = tmp_path / 'Waypoints.wpt'
+        line = ('1,Следы,56.1,60.1,46325.274,0,1,3,0,255,'
+                'конфеты и сгущёнка,0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+        src.write_bytes(HEADER.encode('cp1251') + line.encode('cp1251'))
+
+        record = read_wpt_file(src).records[0]
+
+        assert record.name == 'Следы'
+        assert record.description == 'конфеты и сгущёнка'
+        assert record.raw is not None
+
+    def test_normalize_text_fields_normalizes_record(self, tmp_path):
+        src = tmp_path / 'Waypoints.wpt'
+        line = ('1,Следы,56.1,60.1,46325.274,0,1,3,0,255,'
+                'конфеты и сгущёнка,0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+        src.write_bytes(HEADER.encode('cp1251') + line.encode('cp1251'))
+        record = read_wpt_file(src).records[0]
+
+        assert record.normalize_text_fields() is True
+
+        assert record.name == 'Cледы'
+        assert record.description == 'конфеты и cгущёнка'
+        assert record.raw is None
+        assert record.normalize_text_fields() is False
+
+    def test_save_writes_latin_c_and_keeps_encoding(self, tmp_path):
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+        wpt_file.records[0].name = 'СНТ Липовское'
+        wpt_file.save(src)
+
+        raw = src.read_bytes()
+        assert 'CНТ Липовcкое'.encode('cp1251') in raw
+        assert read_wpt(src)[0].name == 'CНТ Липовcкое'
+
+    def test_existing_cyrillic_is_fixed_after_normalization(self, tmp_path):
+        """normalize_text_fields() исправляет строку, и она уходит в файл."""
+        src = tmp_path / 'Waypoints.wpt'
+        line = ('1,Следы,56.1,60.1,46325.274,0,1,3,0,255,'
+                'конфеты,0,0,0,-777,6,0,17,0,10.0,2,,,,300')
+        src.write_bytes(HEADER.encode('cp1251') + line.encode('cp1251'))
+        wpt_file = read_wpt_file(src)
+        wpt_file.records[0].normalize_text_fields()
+
+        wpt_file.save(src)
+
+        assert 'Cледы'.encode('cp1251') in src.read_bytes()
+        assert 'Следы'.encode('cp1251') not in src.read_bytes()
+
+    def test_record_without_s_keeps_raw_line(self, tmp_path):
+        src = sample_file(tmp_path)
+        wpt_file = read_wpt_file(src)
+
+        assert wpt_file.records[0].raw is not None
+        assert wpt_file.records[1].raw is not None
 
 
 @pytest.mark.slow

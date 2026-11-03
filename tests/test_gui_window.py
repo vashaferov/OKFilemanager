@@ -391,10 +391,13 @@ class TestTabToolbar:
         visible = self._visible(window, 'files')
         for label in ('Вверх', 'Обновить', 'Исправить все', 'Папка',
                       'Переименовать', 'Переместить', 'Копировать имя',
-                      'На FTP', 'В проводнике', 'В OziExplorer',
-                      'Проверить загрузки'):
+                      'На FTP', 'В проводнике', 'Проверить загрузки'):
             assert label in visible
         assert self._visible(window, 'ftp') == []
+        # Редактор точек .wpt и открытие в OziExplorer доступны из
+        # контекстного меню файла, отдельных кнопок на панели нет.
+        assert 'Точки .wpt' not in visible
+        assert 'В OziExplorer' not in visible
 
     def test_ftp_tab_shows_ftp_actions(self, window):
         window._update_toolbar_for_tab(1)
@@ -408,9 +411,20 @@ class TestTabToolbar:
     def test_log_action_is_common(self, window):
         window._update_toolbar_for_tab(0)
         assert window.log_action.isVisible() is True
+        assert window.notes_action.isVisible() is True
 
         window._update_toolbar_for_tab(1)
         assert window.log_action.isVisible() is True
+        assert window.notes_action.isVisible() is True
+
+    def test_panel_actions_live_in_bottom_bar(self, window):
+        texts = [a.text() for a in window.bottom_bar.actions() if a.text()]
+
+        assert texts == ['Заметки', 'Журнал']
+        assert window.log_action not in window._toolbar_groups['files']
+        assert window.log_action not in window._toolbar_groups['ftp']
+        assert window.notes_action not in window._toolbar_groups['files']
+        assert window.notes_action not in window._toolbar_groups['ftp']
 
     def test_switching_tab_switches_toolbar(self, window, monkeypatch):
         monkeypatch.setattr(gui.MainWindow, 'ftp_load',
@@ -893,7 +907,8 @@ class TestContextMenu:
         menu = self.open_menu(window, monkeypatch, menus,
                               files / '2026-09-23_Moscow')
 
-        assert menu.items == ['Сделать корнем дерева', 'Раскрыть / скрыть',
+        assert menu.items == ['Сделать корнем дерева', 'Заметка к папке…',
+                              'Раскрыть / скрыть',
                               'Копировать имя', 'Копировать путь',
                               'Показать в проводнике']
         assert menu.separators == 1
@@ -942,6 +957,76 @@ class TestContextMenu:
         menu = self.open_menu(window, monkeypatch, menus, files / 'notes.txt')
 
         assert 'Открыть в OziExplorer' not in menu.items
+
+    def test_wpt_file_menu_has_editor(self, window, files, monkeypatch,
+                                      menus):
+        src = files / 'Waypoints_20261030.wpt'
+        src.write_text('1,A,56.0,60.0\r\n', encoding='cp1251')
+        window.rebuild_tree()
+
+        menu = self.open_menu(window, monkeypatch, menus, src)
+
+        assert 'Редактировать точки…' in menu.items
+
+    def test_non_wpt_menu_has_no_editor(self, window, files, monkeypatch,
+                                        menus):
+        menu = self.open_menu(window, monkeypatch, menus,
+                              files / 'track.plt')
+
+        assert 'Редактировать точки…' not in menu.items
+
+    def test_wpt_editor_action_opens(self, window, files, monkeypatch, menus):
+        called = []
+        monkeypatch.setattr(gui.MainWindow, 'on_edit_wpt',
+                            lambda self: called.append(True))
+        src = files / 'Waypoints_20261030.wpt'
+        src.write_text('1,A,56.0,60.0\r\n', encoding='cp1251')
+        window.rebuild_tree()
+
+        menu = self.open_menu(window, monkeypatch, menus, src)
+        menu.signals['Редактировать точки…'].emit()
+
+        assert called == [True]
+
+    def test_wpt_menu_has_no_normalizer(self, window, files, monkeypatch,
+                                        menus):
+        """Замена «с» на «c» теперь в окне редактора, не в меню."""
+        src = files / 'Waypoints_20261030.wpt'
+        src.write_text('1,A,56.0,60.0\r\n', encoding='cp1251')
+        window.rebuild_tree()
+
+        menu = self.open_menu(window, monkeypatch, menus, src)
+
+        assert 'Заменить «с» на «c»…' not in menu.items
+
+    @pytest.mark.parametrize('name', ['100m.gpx', '10km.gpx'])
+    def test_has_move_from_10_tracks(self, window, files, monkeypatch, menus,
+                                     name):
+        src = files / '2026-09-23_Moscow' / '10-Tracks' / name
+        src.write_text('')
+        window.rebuild_tree()
+
+        menu = self.open_menu(window, monkeypatch, menus, src)
+
+        assert 'Переместить из 10-Tracks' in menu.items
+
+    def test_no_move_from_10_tracks_outside(self, window, files, monkeypatch,
+                                            menus):
+        menu = self.open_menu(window, monkeypatch, menus,
+                              files / '2026-09-23_Moscow' / '100m.gpx')
+
+        assert 'Переместить из 10-Tracks' not in menu.items
+
+    def test_no_move_from_10_tracks_for_other_gpx(self, window, files,
+                                                  monkeypatch, menus):
+        src = (files / '2026-09-23_Moscow' / '10-Tracks'
+               / '20260923_Ivanov.gpx')
+        src.write_text('')
+        window.rebuild_tree()
+
+        menu = self.open_menu(window, monkeypatch, menus, src)
+
+        assert 'Переместить из 10-Tracks' not in menu.items
 
     def test_ozi_menu_action_opens(self, window, files, monkeypatch, menus):
         called = []
@@ -1078,13 +1163,16 @@ class TestLogAndStatus:
 
         assert 'неизвестный уровень' in log_text(window)
 
-    def test_log_from_worker_thread_is_deferred(self, window, timers):
+    def test_log_from_worker_thread_is_deferred(self, window, qapp):
         thread = threading.Thread(target=window.log, args=('из потока',))
         thread.start()
         thread.join()
 
-        assert timers.calls, 'log из другого потока должен уйти в QTimer'
         assert 'из потока' not in log_text(window)
+        for _ in range(3):
+            qapp.processEvents()
+
+        assert 'из потока' in log_text(window)
 
     def test_clear_log(self, window):
         window.log('что-то')
@@ -1267,6 +1355,55 @@ class TestUiState:
             assert restored.log_frame.isVisibleTo(restored) is False
         finally:
             destroy(qapp, restored)
+
+    def test_toggle_notes_hides_panel(self, window):
+        assert window.notes_action.isChecked() is True
+        assert window.notes_frame.isVisibleTo(window) is True
+
+        window.notes_action.setChecked(False)
+
+        assert window.notes_frame.isVisibleTo(window) is False
+        assert window.config['notes_visible'] is False
+        assert 'заметок: скрыта' in log_text(window)
+
+    def test_toggle_notes_shows_panel_back(self, window):
+        window.notes_action.setChecked(False)
+
+        window.notes_action.setChecked(True)
+
+        assert window.notes_frame.isVisibleTo(window) is True
+        assert window.config['notes_visible'] is True
+
+    def test_show_notes_panel_checks_action(self, window):
+        window.notes_action.setChecked(False)
+
+        window.show_notes_panel()
+
+        assert window.notes_action.isChecked() is True
+        assert window.notes_frame.isVisibleTo(window) is True
+        assert window.config['notes_visible'] is True
+
+    def test_notes_hidden_state_survives_restart(self, qapp, gui_config, files,
+                                                observers, msgbox):
+        win = gui.MainWindow(gui_config, gui_config['root_dir_resolved'])
+        win.notes_action.setChecked(False)
+        destroy(qapp, win)
+
+        restored = gui.MainWindow(gui_config, gui_config['root_dir_resolved'])
+        try:
+            assert restored.notes_action.isChecked() is False
+            assert restored.notes_frame.isVisibleTo(restored) is False
+        finally:
+            destroy(qapp, restored)
+
+    def test_both_panels_can_be_hidden(self, window):
+        window.log_action.setChecked(False)
+        window.notes_action.setChecked(False)
+
+        assert window.log_frame.isVisibleTo(window) is False
+        assert window.notes_frame.isVisibleTo(window) is False
+        # Кнопки возврата остаются на месте.
+        assert window.bottom_bar.isVisibleTo(window) is True
 
     def test_notice_is_hidden_at_start(self, window):
         assert window.notice_bar.isVisibleTo(window) is False
@@ -1857,6 +1994,40 @@ class TestMove:
         window.on_move()
 
         assert '[ОШБ] Перенос' in log_text(window)
+
+    def test_moves_from_10_tracks_to_parent(self, window, files):
+        src = files / '2026-09-23_Moscow' / '10-Tracks' / '10km.gpx'
+        src.write_text('')
+        window.rebuild_tree()
+        select(window, src)
+
+        window.on_move_from_10_tracks()
+
+        assert not src.exists()
+        assert (files / '2026-09-23_Moscow' / '10km.gpx').is_file()
+        assert '[ПЕРЕНОС] 10km.gpx' in log_text(window)
+
+    def test_move_from_10_tracks_keeps_existing(self, window, files, msgbox):
+        src = files / '2026-09-23_Moscow' / '10-Tracks' / '100m.gpx'
+        src.write_text('')
+        window.rebuild_tree()
+        select(window, src)
+
+        window.on_move_from_10_tracks()
+
+        assert src.is_file()
+        assert msgbox.kinds == ['critical']
+
+    def test_move_from_10_tracks_requires_ten_tracks(self, window, files,
+                                                     msgbox):
+        src = files / '2026-09-23_Moscow' / '100m.gpx'
+        select(window, src)
+
+        window.on_move_from_10_tracks()
+
+        assert src.is_file()
+        assert msgbox.kinds == ['information']
+        assert '10-Tracks' in msgbox.texts()[0]
 
 
 @pytest.mark.story('Копирование имени (Ctrl+Y)')
@@ -2832,8 +3003,9 @@ class TestFtpAutofill:
 
         assert calls == ['2026-09-23_Moscow']
 
-    def test_already_connected_folder_is_skipped(self, window, files,
-                                                 monkeypatch):
+    def test_already_connected_folder_is_reloaded(self, window, files,
+                                                  monkeypatch):
+        """Повторный переход на вкладку FTP перечитывает листинг."""
         calls = []
         monkeypatch.setattr(gui.MainWindow, 'ftp_load',
                             lambda self, folder: calls.append(folder))
@@ -2843,7 +3015,34 @@ class TestFtpAutofill:
 
         window._on_tab_changed(1)
 
-        assert calls == []
+        assert calls == ['2026-09-23_Moscow']
+
+    def test_same_folder_refreshed_from_server(self, window, files,
+                                               monkeypatch):
+        """Даже та же папка при переходе запрашивается заново."""
+        calls = []
+        monkeypatch.setattr(gui.MainWindow, 'ftp_load',
+                            lambda self, folder: calls.append(folder))
+        select(window, files / '2026-09-23_Moscow' / '100m.gpx')
+        window._on_tab_changed(1)
+        window._on_tab_changed(0)
+        window._on_tab_changed(1)
+
+        assert calls == ['2026-09-23_Moscow', '2026-09-23_Moscow']
+
+    def test_follow_off_refreshes_current_path(self, window, files,
+                                               monkeypatch):
+        """Без слежения обновляется папка, указанная в поле «Путь»."""
+        calls = []
+        monkeypatch.setattr(gui.MainWindow, 'ftp_load',
+                            lambda self, folder: calls.append(folder))
+        window.follow_checkbox.setChecked(False)
+        window.ftp_path_edit.setText('2026-09-23_Moscow')
+
+        window._on_tab_changed(1)
+
+        assert calls == ['2026-09-23_Moscow']
+        assert 'Автоподстановка' not in log_text(window)
 
     def test_follow_toggle_is_logged(self, window):
         window._on_follow_changed(False)
@@ -3247,6 +3446,37 @@ class TestWatchdog:
         window._on_fs_event(None)
 
         assert timers.calls and timers.calls[0][0] == 0
+
+    def test_fs_event_from_worker_thread_is_queued(self, window, qapp,
+                                                   timers):
+        """Watchdog зовёт из своего потока: вызов должен дойти до GUI.
+
+        Раньше QTimer.singleShot вызывался прямо в потоке watchdog, где
+        нет цикла событий, и новые файлы не появлялись до «Обновить».
+        """
+        worker = threading.Thread(target=window._on_fs_event, args=(None,))
+        worker.start()
+        worker.join()
+
+        assert timers.calls == []
+        for _ in range(3):
+            qapp.processEvents()
+
+        assert timers.calls and timers.calls[0][0] == 0
+
+    def test_download_event_from_worker_thread_is_queued(self, window, qapp,
+                                                         timers, tmp_path):
+        path = tmp_path / 'new_100m.gpx'
+        worker = threading.Thread(target=window._on_download_event,
+                                  args=(path,))
+        worker.start()
+        worker.join()
+
+        assert timers.calls == []
+        for _ in range(3):
+            qapp.processEvents()
+
+        assert any(ms == 1200 for ms, _ in timers.calls)
 
     def test_schedule_refresh_is_debounced(self, window, timers):
         window._schedule_refresh()
@@ -3808,3 +4038,123 @@ class TestSettings:
         window.apply_theme()
 
         assert window.tree_model._theme_name == 'dark'
+
+
+# ─────────────────────────────────────────────────────────────────
+# 16. Заметки к папкам
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.story('Заметки к папкам')
+class TestNotes:
+    def test_notes_dock_is_tabbed_with_log(self, window):
+        assert window.notes_dock.windowTitle() == 'Заметки'
+        assert window.notes_dock in window.tabifiedDockWidgets(
+            window.log_dock)
+
+    def test_note_follows_selected_folder(self, window, files):
+        folder = files / '2026-09-23_Moscow'
+        window.notes.set(folder, 'проверить трек')
+
+        select(window, folder)
+
+        assert window._note_folder == folder.resolve()
+        assert window.note_edit.toPlainText() == 'проверить трек'
+        assert window.note_delete_btn.isEnabled() is True
+
+    def test_file_selection_shows_parent_folder_note(self, window, files):
+        folder = files / '2026-09-23_Moscow'
+        window.notes.set(folder, 'заметка папки')
+
+        select(window, folder / '100m.gpx')
+
+        assert window._note_folder == folder.resolve()
+        assert window.note_edit.toPlainText() == 'заметка папки'
+
+    def test_save_writes_note_and_logs(self, window, files):
+        folder = files / '2026-09-23_Moscow'
+        select(window, folder)
+        window.note_edit.setPlainText('новый текст')
+
+        window.on_save_note()
+
+        assert window.notes.get(folder) == 'новый текст'
+        assert window.note_save_btn.isEnabled() is False
+        assert 'Сохранено' in log_text(window)
+
+    def test_switching_folder_saves_automatically(self, window, files):
+        folder = files / '2026-09-23_Moscow'
+        select(window, window.tree_root)
+        window.note_edit.setPlainText('заметка корня')
+
+        select(window, folder)
+
+        assert window.notes.get(window.tree_root) == 'заметка корня'
+        assert window.note_edit.toPlainText() == ''
+
+    def test_delete_clears_note(self, window, files):
+        folder = files / '2026-09-23_Moscow'
+        window.notes.set(folder, 'удалить меня')
+        select(window, folder)
+
+        window.on_delete_note()
+
+        assert window.notes.get(folder) == ''
+        assert window.note_edit.toPlainText() == ''
+
+    def test_blank_text_save_removes_note(self, window, files):
+        folder = files / '2026-09-23_Moscow'
+        window.notes.set(folder, 'было')
+        select(window, folder)
+
+        window.note_edit.setPlainText('   ')
+        window.on_save_note()
+
+        assert window.notes.get(folder) == ''
+
+    def test_search_dialog_filters_by_text(self, window, files, tmp_path):
+        first = files / '2026-09-23_Moscow'
+        second = tmp_path / 'other'
+        second.mkdir()
+        window.notes.set(first, 'проверить трек')
+        window.notes.set(second, 'позвонить координатору')
+
+        dlg = gui.NotesSearchDialog(window, window.notes)
+        dlg.search_edit.setText('трек')
+
+        assert dlg.results.count() == 1
+        assert dlg.selected_path() == first.resolve()
+        assert 'трек' in dlg.preview.toPlainText()
+
+    def test_search_dialog_empty_result(self, window, files):
+        window.notes.set(files, 'заметка')
+        dlg = gui.NotesSearchDialog(window, window.notes)
+
+        dlg.search_edit.setText('нет-такого-слова')
+
+        assert dlg.results.count() == 0
+        assert dlg.open_btn.isEnabled() is False
+        assert 'Ничего не найдено' in dlg.status_label.text()
+
+    def test_go_to_note_folder_outside_tree_changes_root(
+            self, window, tmp_path):
+        outside = tmp_path / 'outside'
+        outside.mkdir()
+
+        window.go_to_note_folder(outside)
+
+        assert window.tree_root == outside.resolve()
+        assert window._note_folder == outside.resolve()
+
+    def test_context_menu_has_note_action(self, window, files,
+                                          monkeypatch, menus):
+        folder = files / '2026-09-23_Moscow'
+        window.tree_view.setCurrentIndex(
+            window.tree_model.indexFromItem(
+                window.tree_model.find_item(folder)))
+        monkeypatch.setattr(window.tree_view, 'indexAt',
+                            lambda pos: window.tree_model.indexFromItem(
+                                window.tree_model.find_item(folder)))
+
+        window.on_tree_context_menu(QPoint(0, 0))
+
+        assert 'Заметка к папке…' in menus.instances[-1].items

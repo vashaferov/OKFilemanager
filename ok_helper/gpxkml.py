@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 from ok_helper.wpt import (ALTITUDE_UNKNOWN, DEFAULT, METERS_IN_FOOT,
-                           Waypoint)
+                           Waypoint, normalize_text)
 
 # Форматы, которые разбирает этот модуль.
 GPX_KML_SUFFIXES = ('.gpx', '.kml')
@@ -500,9 +500,11 @@ def _file_text(value: str) -> str:
     Справка предлагает писать вместо неё символ 209, но в cp1251 этот
     байт — буква «С», и живой русский текст от служебного символа не
     отличить (об этом же написано в ``ok_helper/wpt.py``), поэтому
-    заменяем запятую пробелом: поле остаётся читаемым.
+    заменяем запятую пробелом: поле остаётся читаемым. Кириллическая
+    «с» заменяется латинской: в окне OziExplorer заглавная «С» (байт
+    0xD1) выглядит как запятая-разделитель.
     """
-    return str(value or '').replace(',', ' ')
+    return normalize_text(str(value or '')).replace(',', ' ')
 
 
 def _to_feet(altitude_m: float) -> float:

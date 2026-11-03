@@ -14,6 +14,7 @@
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,18 +31,18 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QFontMetrics, QIcon, QImage,
-    QKeySequence, QPainter, QPen, QRegularExpressionValidator,
+    QKeySequence, QPainter, QPen, QPixmap, QRegularExpressionValidator,
     QStandardItem, QStandardItemModel,
     QTextBlockFormat, QTextCharFormat, QTextCursor, QTextOption,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDockWidget, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLayout, QLineEdit, QMainWindow,
-    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
-    QSizePolicy, QSpinBox, QSplitter,
-    QStyle, QToolButton, QStatusBar, QTabWidget, QToolBar, QTreeView,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox,
+    QDialog, QDialogButtonBox, QDockWidget, QFileDialog, QFormLayout, QFrame,
+    QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLayout,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QPushButton, QRadioButton, QSizePolicy, QSpinBox,
+    QSplitter, QStyle, QTableWidget, QTableWidgetItem, QToolButton,
+    QStatusBar, QTabWidget, QToolBar, QTreeView, QVBoxLayout, QWidget,
 )
 
 from config import config_path, save_config
@@ -60,11 +61,16 @@ from ok_helper.ftp import (
 from ok_helper.gpxkml import GpxKmlError, read_gpx_kml
 from ok_helper.handlers import DirHandler, DownloadsHandler
 from ok_helper.kmz import KmzError, kmz_to_kml
+from ok_helper.notes import NotesStore, notes_path_for
 from ok_helper.ozi import (
     OZI_API_DOWNLOAD_URL, OZI_FILE_SUFFIXES, OZI_PARSE_ACTION,
     OZI_TRACK_MAX, OZI_WPT_DEFAULT_MODE, OZI_WPT_MODES, api_plan,
     extract_bundled_api, open_in_oziexplorer)
 from ok_helper.translit import transliterate
+from ok_helper.wpt import (
+    ALTITUDE_UNKNOWN, DEFAULT, METERS_IN_FOOT, WptRecord, datetime_to_delphi,
+    delphi_to_datetime, read_wpt_file,
+)
 
 from watchdog.observers import Observer
 
@@ -79,7 +85,7 @@ KMZ_TO_KML_HINT = 'можно конвертировать в .kml'
 
 # Ключи ввода-вывода состояния интерфейса в конфиге.
 UI_STATE_KEYS = ('window_geometry', 'splitter_state', 'tree_column_widths',
-                 'log_visible')
+                 'log_visible', 'notes_visible')
 
 # Отступ журнала под отметку времени: продолжение длинной записи
 # переносится с этим отступом, а не под цифрами времени.
@@ -163,6 +169,193 @@ def _clamp_track_num(value) -> int:
     except (TypeError, ValueError):
         return 1
     return min(max(num, 1), OZI_TRACK_MAX)
+
+
+# Дата точки .wpt в интерфейсе: OziExplorer хранит TDateTime, а человеку
+# удобнее привычные «ДД.ММ.ГГГГ ЧЧ:ММ». Пустое поле — «сейчас».
+WPT_DATE_FORMAT = '%d.%m.%Y %H:%M'
+WPT_DATE_FORMATS = (
+    '%d.%m.%Y %H:%M', '%d.%m.%Y', '%d.%m.%y %H:%M', '%d.%m.%y',
+    '%Y-%m-%d %H:%M', '%Y-%m-%d',
+)
+
+
+def _format_wpt_date(value) -> str:
+    moment = delphi_to_datetime(value)
+    return moment.strftime(WPT_DATE_FORMAT) if moment else ''
+
+
+def _parse_wpt_date(text: str) -> Optional[datetime]:
+    """Дата из поля ввода; пустая строка — текущий момент."""
+    value = text.strip()
+    if not value:
+        return datetime.now()
+    for fmt in WPT_DATE_FORMATS:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+# Форматы ввода координат в карточке точки.
+WPT_COORD_DECIMAL = 0
+WPT_COORD_DM = 1
+WPT_COORD_DMS = 2
+WPT_COORD_FORMATS = (
+    'Десятичные градусы',
+    'Градусы и минуты',
+    'Градусы, минуты и секунды',
+)
+
+# Буквы полушарий: латинские и русские (С — север, Ю — юг, З — запад,
+# В — восток). Знак координаты определяется по ним.
+_HEMISPHERE_SIGNS = {
+    'N': 1, 'S': -1, 'E': 1, 'W': -1,
+    'С': 1, 'Ю': -1, 'З': -1, 'В': 1,
+}
+
+_COORD_NUMBER_RE = re.compile(r'[-+]?\d+(?:[.,]\d+)?')
+
+
+def _format_wpt_coord(value: float, mode: int = WPT_COORD_DECIMAL) -> str:
+    """Координата в выбранном формате: 56.909284, 56° 54.557′ или 56° 54′ 33.4″."""
+    sign = '-' if float(value) < 0 else ''
+    total = abs(float(value))
+    degrees = int(total)
+    rest = (total - degrees) * 60
+    if mode == WPT_COORD_DM:
+        minutes = round(rest, 3)
+        if minutes >= 60:
+            degrees += 1
+            minutes = 0.0
+        return f'{sign}{degrees}\u00b0 {minutes:.3f}\u2032'
+    if mode == WPT_COORD_DMS:
+        minutes = int(rest)
+        seconds = round((rest - minutes) * 60, 1)
+        if seconds >= 60:
+            seconds = 0.0
+            minutes += 1
+        if minutes >= 60:
+            minutes = 0
+            degrees += 1
+        return f'{sign}{degrees}\u00b0 {minutes}\u2032 {seconds:.1f}\u2033'
+    return f'{sign}{total:.6f}'
+
+
+def _parse_wpt_coord(text: str) -> Optional[float]:
+    """Координата в любом из трёх форматов.
+
+    Понимает десятичные градусы (``56.909284``), градусы и минуты
+    (``56° 54.557′``) и градусы, минуты и секунды (``56° 54′ 33.4″``).
+    Запятая — десятичный разделитель, полушарие можно указать буквой
+    (N/S/E/W или С/Ю/З/В) до или после числа.
+    """
+    value = str(text).strip()
+    if not value:
+        return None
+
+    sign = 1
+    match = re.match(r'^([NSEWnsewСсЮюЗзВв])\s*(.+)$', value)
+    if match:
+        sign = _HEMISPHERE_SIGNS[match.group(1).upper()]
+        value = match.group(2).strip()
+    else:
+        match = re.search(r'\s*([NSEWnsewСсЮюЗзВв])\s*$', value)
+        if match:
+            sign = _HEMISPHERE_SIGNS[match.group(1).upper()]
+            value = value[:match.start()].strip()
+
+    numbers = _COORD_NUMBER_RE.findall(value)
+    if not numbers or len(numbers) > 3:
+        return None
+    try:
+        parts = [float(number.replace(',', '.')) for number in numbers]
+    except ValueError:
+        return None
+
+    degrees = parts[0]
+    if len(parts) >= 2:
+        if not 0 <= parts[1] < 60:
+            return None
+        degrees += parts[1] / 60
+    if len(parts) == 3:
+        if not 0 <= parts[2] < 60:
+            return None
+        degrees += parts[2] / 3600
+
+    # Полушарие задаёт сторону: знак перед градусами при этом не мешает.
+    if sign < 0:
+        return -abs(degrees)
+    return degrees
+
+
+def _color_from_wpt(value) -> Optional[QColor]:
+    """Цвет точки из поля .wpt (Windows COLORREF: 0x00BBGGRR).
+
+    None — «по умолчанию»: в файле это -1 или пустое поле.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        return None
+    return QColor(number & 0xFF, (number >> 8) & 0xFF, (number >> 16) & 0xFF)
+
+
+def _color_to_wpt(color: Optional[QColor]) -> int:
+    """COLORREF для .wpt; «по умолчанию» — -1."""
+    if color is None or not color.isValid():
+        return DEFAULT
+    return (color.red() | (color.green() << 8) | (color.blue() << 16))
+
+
+def _color_icon(color: Optional[QColor], size: int = 16) -> QIcon:
+    """Образец цвета: сплошной квадрат или перечёркнутый — «по умолчанию»."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    if color is None:
+        painter.fillRect(0, 0, size, size, QColor('#ffffff'))
+        painter.setPen(QColor('#c0392b'))
+        painter.drawLine(0, size - 1, size - 1, 0)
+    else:
+        painter.fillRect(0, 0, size, size, color)
+    painter.setPen(QColor('#808080'))
+    painter.drawRect(0, 0, size - 1, size - 1)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _color_label(color: Optional[QColor]) -> str:
+    """Подпись цвета для кнопки и таблицы."""
+    return 'по умолчанию' if color is None else color.name().upper()
+
+
+# Готовые цвета точки в редакторе .wpt — это цвет фона подписи (поле 9).
+# Значения совпадают с теми, что встречаются в файлах OziExplorer:
+# 255 — красный, 16776960 — морской волны, 32768 — зелёный, 65535 — жёлтый.
+WPT_COLOR_PRESETS = (
+    ('Красный', QColor(255, 0, 0)),
+    ('Морской волны', QColor(0, 255, 255)),
+    ('Зелёный', QColor(0, 128, 0)),
+    ('Жёлтый', QColor(255, 255, 0)),
+)
+
+# Пункт списка для произвольного цвета: открывает палитру Qt.
+WPT_CUSTOM_COLOR = 'Кастомный…'
+
+
+def _color_name(color: Optional[QColor]) -> str:
+    """Название готового цвета; для кастомного — #RRGGBB, для пустого — «—»."""
+    if color is None:
+        return '—'
+    value = _color_to_wpt(color)
+    for name, preset in WPT_COLOR_PRESETS:
+        if _color_to_wpt(preset) == value:
+            return name
+    return color.name().upper()
 
 
 def _std_icon(sp: QStyle.StandardPixmap) -> QIcon:
@@ -1477,9 +1670,21 @@ class WrapToolBar(QWidget):
 # ====================== главное окно ======================
 
 class MainWindow(QMainWindow):
+    # События файловой системы приходят из потока watchdog. Там нет
+    # цикла событий Qt, поэтому QTimer.singleShot из обработчика не
+    # срабатывает. Сигналы доставляют вызов в поток GUI.
+    _fs_changed = Signal()
+    _download_added = Signal(object)
+    _log_message = Signal(str, str)
+
     def __init__(self, config: dict, initial_dir: Path):
         super().__init__()
         self.config = config
+        # Заметки к папкам живут рядом с конфигом. В тестах путь
+        # считается от config['_path'], чтобы не трогать %APPDATA%.
+        self.notes = NotesStore(notes_path_for(config))
+        self._note_folder: Optional[Path] = None
+        self._note_loading = False
         self.tree_root = initial_dir.resolve()
         self.watch_dir = self.tree_root
         self.observer: Optional[Observer] = None
@@ -1499,6 +1704,9 @@ class MainWindow(QMainWindow):
         self.ftp_loading = False
 
         self._refresh_pending = False
+        self._fs_changed.connect(self._queue_refresh)
+        self._download_added.connect(self._handle_new_download)
+        self._log_message.connect(self._append_log)
 
         self.setWindowTitle('ok-filemanager')
         # Иконка на самом окне: тесты и превью создают QApplication
@@ -1510,7 +1718,12 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._build_toolbar()
+        self._build_bottom_bar()
         self._build_statusbar()
+
+        if self.notes.load_error:
+            self.log(f'[ЗАМЕТКИ] Не прочитать {self.notes.path}: '
+                     f'{self.notes.load_error}', 'warn')
 
         self.apply_theme()
 
@@ -1558,6 +1771,87 @@ class MainWindow(QMainWindow):
         self._build_files_tab()
         self._build_ftp_tab()
         self._build_log_dock()
+        self._build_notes_dock()
+
+        # Заметки живут в той же нижней области, что и журнал: панели
+        # переключаются вкладками, поэтому низ окна не разрастается.
+        self.tabifyDockWidget(self.log_dock, self.notes_dock)
+        self.log_dock.raise_()
+
+    def _build_notes_dock(self):
+        """Панель заметки к выбранной папке — вкладка рядом с журналом."""
+        dock = QDockWidget('Заметки', self)
+        dock.setObjectName('NotesDock')
+        dock.setAllowedAreas(Qt.BottomDockWidgetArea)
+        dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.notes_dock = dock
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(8, 4, 8, 8)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        header.addWidget(QLabel('Папка:'))
+        self.note_path_label = QLabel('—')
+        self.note_path_label.setObjectName('Dim')
+        self.note_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # Длинный путь не должен распирать нижнюю панель по ширине:
+        # полностью он виден в подсказке.
+        self.note_path_label.setSizePolicy(QSizePolicy.Ignored,
+                                           QSizePolicy.Preferred)
+        self.note_path_label.setMinimumWidth(0)
+        header.addWidget(self.note_path_label, 1)
+
+        self.note_count_label = QLabel('')
+        self.note_count_label.setObjectName('Dim')
+        header.addWidget(self.note_count_label)
+        layout.addLayout(header)
+
+        self.note_edit = QPlainTextEdit()
+        self.note_edit.setPlaceholderText(
+            'Заметка к выбранной папке. Текст сохраняется кнопкой '
+            '«Сохранить» или при переходе к другой папке.')
+        self.note_edit.setTabChangesFocus(True)
+        self.note_edit.textChanged.connect(self._update_note_actions)
+        layout.addWidget(self.note_edit, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+
+        self.note_save_btn = QPushButton('Сохранить')
+        self.note_save_btn.setObjectName('Accent')
+        self.note_save_btn.setToolTip('Сохранить заметку (Ctrl+Enter)')
+        self.note_save_btn.clicked.connect(self.on_save_note)
+        row.addWidget(self.note_save_btn)
+
+        self.note_delete_btn = QPushButton('Удалить')
+        self.note_delete_btn.setToolTip('Удалить заметку у этой папки')
+        self.note_delete_btn.clicked.connect(self.on_delete_note)
+        row.addWidget(self.note_delete_btn)
+
+        row.addStretch(1)
+        self.note_search_btn = QPushButton('Поиск по всем заметкам…')
+        self.note_search_btn.setToolTip('Найти заметку среди всех папок '
+                                        '(Ctrl+Shift+F)')
+        self.note_search_btn.clicked.connect(self.open_notes_search)
+        row.addWidget(self.note_search_btn)
+
+        layout.addLayout(row)
+        dock.setWidget(content)
+        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        self.notes_frame = dock
+
+        # Ctrl+Enter внутри заметки — сохранить, не уходя с панели.
+        save_shortcut = QAction(self)
+        save_shortcut.setShortcut(QKeySequence('Ctrl+Return'))
+        save_shortcut.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        save_shortcut.triggered.connect(self.on_save_note)
+        self.note_edit.addAction(save_shortcut)
+        self._note_save_shortcut = save_shortcut
+
+        self._update_note_actions()
 
     def _build_log_dock(self):
         """Журнал — сворачиваемая панель внизу, а не колонка слева.
@@ -1650,6 +1944,10 @@ class MainWindow(QMainWindow):
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(
             self.on_tree_context_menu)
+        # Заметка внизу следует за выделенной папкой. Для файла
+        # показываем заметку его папки — она и есть целевая.
+        self.tree_view.selectionModel().currentChanged.connect(
+            self._on_tree_current_changed)
 
         header = self.tree_view.header()
         header.setSectionResizeMode(
@@ -1889,10 +2187,13 @@ class MainWindow(QMainWindow):
             return default
 
     def _restore_ui_state(self):
-        """Возвращает видимость и высоту панели журнала."""
+        """Возвращает видимость панелей журнала и заметок."""
         self._apply_log_visible(
             self._cfg_bool(self.config, 'log_visible', True))
         self._commit_log_visibility()
+        self._apply_notes_visible(
+            self._cfg_bool(self.config, 'notes_visible', True))
+        self._commit_notes_visibility()
 
     def _restore_tree_columns(self):
         """Возвращает сохранённые ширины колонок дерева файлов.
@@ -1934,26 +2235,35 @@ class MainWindow(QMainWindow):
             pass
 
     def _dock_height(self) -> int:
-        """Текущая высота панели журнала; 0 — панель скрыта."""
-        dock = getattr(self, 'log_dock', None)
-        if dock is None:
-            return 0
-        try:
-            if not dock.isVisible():
+        """Текущая высота нижней панели; 0 — панель скрыта.
+
+        Журнал и заметки живут в одной области вкладками, поэтому
+        сохраняем высоту той панели, которая сейчас показана.
+        """
+        for name in ('log_dock', 'notes_dock'):
+            dock = getattr(self, name, None)
+            if dock is None:
+                continue
+            try:
+                if not dock.isVisible():
+                    continue
+                return int(dock.height())
+            except RuntimeError:
+                # C++-объект уже удалён (окно закрыто) — высоты нет.
                 return 0
-            return int(dock.height())
-        except RuntimeError:
-            # C++-объект уже удалён (окно закрыто) — высоты нет.
-            return 0
+        return 0
 
     def _restore_log_dock_height(self):
-        """Возвращает сохранённую высоту панели журнала."""
+        """Возвращает сохранённую высоту нижней панели."""
         dock = getattr(self, 'log_dock', None)
         if dock is None:
             return
         try:
             if not dock.isVisible():
-                return
+                # Активна вкладка заметок — высоту задаём ей.
+                dock = getattr(self, 'notes_dock', None)
+                if dock is None or not dock.isVisible():
+                    return
         except RuntimeError:
             return
         try:
@@ -2004,7 +2314,41 @@ class MainWindow(QMainWindow):
 
     def on_toggle_log(self, checked: bool):
         self._apply_log_visible(bool(checked))
+        if checked:
+            self.log_dock.raise_()
         self.log(f'[i] Панель журнала: {"показана" if checked else "скрыта"}',
+                 'info')
+
+    def _apply_notes_visible(self, visible: bool):
+        """Показывает или прячет панель заметок внизу."""
+        dock = getattr(self, 'notes_dock', None)
+        if dock is not None:
+            try:
+                dock.setVisible(bool(visible))
+            except RuntimeError:
+                return
+            if visible:
+                self._restore_log_dock_height()
+        self.config['notes_visible'] = bool(visible)
+
+    def _commit_notes_visibility(self):
+        """Синхронизирует переключатель «Заметки» с состоянием панели."""
+        action = getattr(self, 'notes_action', None)
+        frame = getattr(self, 'notes_frame', None)
+        if action is None or frame is None:
+            return
+        visible = frame.isVisibleTo(self)
+        if action.isChecked() == visible:
+            return
+        action.blockSignals(True)
+        action.setChecked(visible)
+        action.blockSignals(False)
+
+    def on_toggle_notes(self, checked: bool):
+        self._apply_notes_visible(bool(checked))
+        if checked:
+            self.notes_dock.raise_()
+        self.log(f'[i] Панель заметок: {"показана" if checked else "скрыта"}',
                  'info')
 
     # ---------- журнал: копирование и сохранение ----------
@@ -2065,6 +2409,8 @@ class MainWindow(QMainWindow):
         self._act(m_edit, 'Исправить все', 'Ctrl+F5', self.on_fix_all,
                   QStyle.SP_DialogApplyButton)
         m_edit.addSeparator()
+        self._act(m_edit, 'Поиск по заметкам…', 'Ctrl+Shift+F',
+                  self.open_notes_search, QStyle.SP_FileDialogContentsView)
         self._act(m_edit, 'Копировать журнал', 'Ctrl+Shift+L',
                   self.on_copy_log)
         self._act(m_edit, 'Сохранить журнал в файл…', None, self.on_save_log,
@@ -2116,10 +2462,12 @@ class MainWindow(QMainWindow):
         self._act(m_view, 'Вкладка «FTP»', 'Ctrl+2',
                   lambda: self.tabs.setCurrentIndex(1))
         m_view.addSeparator()
-        # Ctrl+L висит на самом переключателе в тулбаре; здесь — без
-        # второго сочетания, иначе Qt считает shortcut неоднозначным.
+        # Ctrl+L висит на самом переключателе в нижней полосе; здесь —
+        # без второго сочетания, иначе Qt считает shortcut неоднозначным.
         self._act(m_view, 'Показать / скрыть журнал', None,
                   lambda: self.log_action.toggle())
+        self._act(m_view, 'Показать панель заметок', None,
+                  self.show_notes_panel)
 
     def _act(self, menu: QMenu, text: str, shortcut: Optional[str], slot,
              icon: Optional[QStyle.StandardPixmap] = None):
@@ -2192,16 +2540,10 @@ class MainWindow(QMainWindow):
         add('files', 'В проводнике', self.on_reveal_selected,
             'Открыть папку с выделением файла (Ctrl+E)',
             QStyle.SP_DirOpenIcon)
-        ozi_action = add('files', 'В OziExplorer', self.on_open_in_ozi,
-                         'Открыть выделенный файл в OziExplorer '
-                         '(Ctrl+Shift+O)',
-                         QStyle.SP_FileDialogContentsView)
-        ozi_action.setShortcut(QKeySequence('Ctrl+Shift+O'))
         sep('files')
         add('files', 'Проверить загрузки', self.on_check_downloads,
             'Проверить папку загрузок и предложить перенос (Ctrl+D)',
             QStyle.SP_DialogOpenButton)
-        sep('files')
 
         # --- вкладка «FTP» ---
         add('ftp', 'Подключиться', self.on_ftp_connect,
@@ -2220,26 +2562,53 @@ class MainWindow(QMainWindow):
             'ftp', 'Удалить', self.on_ftp_delete_selected,
             'Удалить выделенный файл на сервере (Del)',
             QStyle.SP_TrashIcon)
-        sep('ftp')
-
-        # Переключатель панели журнала — общий для обеих вкладок;
-        # состояние сохраняется в конфиге.
-        self.log_action = QAction('Журнал', self)
-        self.log_action.setCheckable(True)
-        self.log_action.setToolTip('Показать или скрыть панель журнала (Ctrl+L)')
-        self.log_action.setShortcut(QKeySequence('Ctrl+L'))
-        self.log_action.toggled.connect(self.on_toggle_log)
-        tb.add_action(self.log_action)
-        self.addAction(self.log_action)
 
         self._update_toolbar_for_tab(self.tabs.currentIndex())
         self._sync_ftp_actions()
+
+    def _build_bottom_bar(self):
+        """Нижняя панель с переключателями «Заметки» и «Журнал».
+
+        Кнопки живут внизу, рядом с самими панелями: даже когда обе
+        панели скрыты, нижняя полоса остаётся и панели можно вернуть.
+        """
+        bar = QToolBar('Панели', self)
+        bar.setObjectName('BottomBar')
+        bar.setMovable(False)
+        bar.setFloatable(False)
+        bar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        bar.setIconSize(QSize(16, 16))
+        self.bottom_bar = bar
+        self.addToolBar(Qt.BottomToolBarArea, bar)
+
+        self.notes_action = QAction('Заметки', self)
+        self.notes_action.setCheckable(True)
+        self.notes_action.setChecked(
+            self._cfg_bool(self.config, 'notes_visible', True))
+        self.notes_action.setToolTip(
+            'Показать или скрыть панель заметок (Ctrl+M)')
+        self.notes_action.setShortcut(QKeySequence('Ctrl+M'))
+        self.notes_action.toggled.connect(self.on_toggle_notes)
+        bar.addAction(self.notes_action)
+        self.addAction(self.notes_action)
+
+        self.log_action = QAction('Журнал', self)
+        self.log_action.setCheckable(True)
+        self.log_action.setChecked(
+            self._cfg_bool(self.config, 'log_visible', True))
+        self.log_action.setToolTip(
+            'Показать или скрыть панель журнала (Ctrl+L)')
+        self.log_action.setShortcut(QKeySequence('Ctrl+L'))
+        self.log_action.toggled.connect(self.on_toggle_log)
+        bar.addAction(self.log_action)
+        self.addAction(self.log_action)
 
     def _update_toolbar_for_tab(self, idx: int):
         """Показывает в шапке действия активной вкладки.
 
         «Файлы» и «FTP» работают с разными объектами, поэтому набор
-        кнопок переключается: общим остаётся только «Журнал».
+        кнопок переключается. Переключатели панелей «Журнал» и
+        «Заметки» живут отдельно, в нижней полосе.
         """
         groups = getattr(self, '_toolbar_groups', None)
         if not groups:
@@ -2348,7 +2717,10 @@ class MainWindow(QMainWindow):
         if threading.current_thread() is threading.main_thread():
             self._append_log(msg, level)
         else:
-            QTimer.singleShot(0, lambda: self._append_log(msg, level))
+            # Фоновые задачи (FTP, watchdog) пишут в журнал из своего
+            # потока. QTimer там не сработает — сигнал доставит запись
+            # в поток GUI.
+            self._log_message.emit(msg, level)
 
     def _append_log(self, msg: str, level: str):
         name = resolve_theme(self.config.get('theme', 'auto'))
@@ -2397,6 +2769,186 @@ class MainWindow(QMainWindow):
     def on_clear_log(self):
         self.log_edit.clear()
         self.log('Журнал очищен', 'info')
+
+    # ---------- заметки к папкам ----------
+    @staticmethod
+    def _note_folder_for(path: Optional[Path]) -> Optional[Path]:
+        """Папка, к которой относится выделение.
+
+        Для файла — его родительская папка: заметка всегда хранится у
+        папки, а не у отдельного файла.
+        """
+        if path is None:
+            return None
+        if path.is_dir():
+            return path
+        return path.parent
+
+    def _on_tree_current_changed(self, current: QModelIndex,
+                                 _previous: QModelIndex):
+        """Переключает заметку на папку выделенного элемента."""
+        folder = self._note_folder_for(self._path_from_index(current))
+        if folder is not None:
+            self._set_note_folder(folder)
+
+    def _set_note_folder(self, folder: Path, force: bool = False):
+        """Показывает заметку папки, сохраняя правки прежней.
+
+        Правки сохраняются автоматически при переходе: иначе смена
+        выделения в дереве молча теряла бы введённый текст.
+        """
+        try:
+            folder = Path(folder).resolve()
+        except (OSError, RuntimeError):
+            return
+        if not folder.is_dir():
+            folder = folder.parent
+
+        if (not force and self._note_folder is not None
+                and folder == self._note_folder):
+            return
+
+        if self._note_folder is not None:
+            if folder == self._note_folder:
+                # Принудительное перечитывание той же папки не должно
+                # выбрасывать несохранённые правки.
+                if not self._save_note(silent=True):
+                    return
+            elif not self._save_note(silent=True):
+                self.show_notice(
+                    'Не удалось сохранить заметку предыдущей папки — '
+                    'панель оставлена на ней.', 'error')
+                return
+
+        self._note_folder = folder
+        text = self.notes.get(folder)
+        self._note_loading = True
+        try:
+            self.note_edit.setPlainText(text)
+        finally:
+            self._note_loading = False
+
+        self.note_path_label.setText(str(folder))
+        self.note_path_label.setToolTip(str(folder))
+        self._update_note_actions()
+
+    def _update_note_actions(self):
+        """Включает кнопки по состоянию заметки и наличию изменений."""
+        folder = self._note_folder
+        if folder is None:
+            self.note_save_btn.setEnabled(False)
+            self.note_delete_btn.setEnabled(False)
+        else:
+            text = self.note_edit.toPlainText()
+            stored = self.notes.get(folder)
+            changed = text != stored
+            # Пробелы без текста — это не новая заметка, а пустое поле.
+            meaningful = bool(text.strip()) or bool(stored.strip())
+            self.note_save_btn.setEnabled(changed and meaningful)
+            self.note_delete_btn.setEnabled(meaningful)
+
+        self.note_count_label.setText(f'Заметок: {len(self.notes)}')
+
+    def _save_note(self, silent: bool = False) -> bool:
+        """Сохраняет текст текущей панели. True — запись удалась."""
+        folder = self._note_folder
+        if folder is None or self._note_loading:
+            return False
+        try:
+            changed = self.notes.set(folder, self.note_edit.toPlainText())
+        except OSError as e:
+            self.log(f'[ЗАМЕТКИ] Не сохранить: {e}', 'error')
+            if not silent:
+                self._show_notice_or_box(
+                    'Заметки', f'Не сохранить заметку: {e}', 'error')
+            self._update_note_actions()
+            return False
+        if changed and not silent:
+            self.log(f'[ЗАМЕТКИ] Сохранено: {folder}', 'ok')
+        self._update_note_actions()
+        return True
+
+    def on_save_note(self):
+        """Кнопка «Сохранить» на панели заметок."""
+        if self._note_folder is None:
+            return
+        self._save_note(silent=False)
+
+    def on_delete_note(self):
+        """Удаляет заметку текущей папки (с подтверждением)."""
+        folder = self._note_folder
+        if folder is None:
+            return
+        if not self.notes.get(folder).strip() \
+                and not self.note_edit.toPlainText().strip():
+            return
+        answer = QMessageBox.question(
+            self, 'Удалить заметку',
+            f'Удалить заметку к папке?\n{folder}')
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            changed = self.notes.remove(folder)
+        except OSError as e:
+            self.log(f'[ЗАМЕТКИ] Не удалить: {e}', 'error')
+            self._show_notice_or_box(
+                'Заметки', f'Не удалить заметку: {e}', 'error')
+            return
+        self._note_loading = True
+        try:
+            self.note_edit.clear()
+        finally:
+            self._note_loading = False
+        if changed:
+            self.log(f'[ЗАМЕТКИ] Удалена: {folder}', 'ok')
+        self._update_note_actions()
+
+    def show_notes_panel(self):
+        """Открывает вкладку заметок в нижней панели."""
+        self._apply_notes_visible(True)
+        self._commit_notes_visibility()
+        self.notes_dock.raise_()
+        self.note_edit.setFocus()
+
+    def focus_note_for_folder(self, folder: Path):
+        """Переходит к папке и открывает её заметку."""
+        self.go_to_note_folder(folder)
+        self.show_notes_panel()
+
+    def go_to_note_folder(self, folder: Path):
+        """Переходит в дереве к папке из результата поиска заметок."""
+        try:
+            folder = Path(folder).resolve()
+        except (OSError, RuntimeError):
+            return
+        if not folder.is_dir():
+            self.show_notice(f'Папки больше нет: {folder}', 'warn')
+            return
+
+        if folder.is_relative_to(self.tree_root):
+            item = self.tree_model.find_item(folder)
+            if item is not None:
+                index = self.tree_model.indexFromItem(item)
+                parent = index.parent()
+                while parent.isValid():
+                    self.tree_view.setExpanded(parent, True)
+                    parent = parent.parent()
+                self._select_path(folder)
+                self.tree_view.scrollTo(index)
+                self._set_note_folder(folder, force=True)
+                return
+
+        # Папка вне текущего дерева: делаем её корнем — заметка
+        # откроется вместе с содержимым.
+        self.set_tree_root(folder)
+
+    def open_notes_search(self):
+        """Окно поиска по всем заметкам."""
+        dlg = NotesSearchDialog(self, self.notes)
+        if dlg.exec() == QDialog.Accepted:
+            folder = dlg.selected_path()
+            if folder is not None:
+                self.focus_note_for_folder(folder)
 
     # ---------- watchdog ----------
     def _start_watch(self):
@@ -2621,7 +3173,7 @@ class MainWindow(QMainWindow):
 
     def _on_download_event(self, path: Path):
         """Вызывается из потока watchdog — уходим в главный поток."""
-        QTimer.singleShot(0, lambda: self._handle_new_download(path))
+        self._download_added.emit(path)
 
     def _handle_new_download(self, path: Path):
         if path in self._seen_downloads:
@@ -2704,6 +3256,13 @@ class MainWindow(QMainWindow):
         self.rebuild_tree()
 
     def _on_fs_event(self, _path: Optional[Path]):
+        # Обработчик watchdog работает в своём потоке: QTimer там не
+        # сработает (нет цикла событий). Сигнал доставит обновление
+        # в поток GUI.
+        self._fs_changed.emit()
+
+    @Slot()
+    def _queue_refresh(self):
         QTimer.singleShot(0, self._schedule_refresh)
 
     def _schedule_refresh(self):
@@ -2732,6 +3291,8 @@ class MainWindow(QMainWindow):
         self._select_path(selected)
         self.path_edit.setText(str(self.tree_root))
         self.update_status()
+        folder = self._note_folder_for(self._selected_path()) or self.tree_root
+        self._set_note_folder(folder)
 
     def _select_path(self, path: Optional[Path]) -> bool:
         """Делает элемент path текущим и выделенным.
@@ -2839,6 +3400,9 @@ class MainWindow(QMainWindow):
         if path.is_dir():
             a = menu.addAction('Сделать корнем дерева')
             a.triggered.connect(lambda: self.set_tree_root(path))
+            a_note = menu.addAction('Заметка к папке…')
+            a_note.triggered.connect(
+                lambda: self.focus_note_for_folder(path))
             a2 = menu.addAction('Раскрыть / скрыть')
             a2.triggered.connect(
                 lambda: self.tree_view.setExpanded(
@@ -2854,6 +3418,16 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction('Переименовать…', self.on_rename)
             menu.addAction('Переместить…', self.on_move)
+            # Быстрый перенос из 10-Tracks в основную папку — для
+            # файлов с суффиксом дистанции (100m.gpx / 10km.gpx):
+            # из 10-Tracks их нельзя отправить на FTP.
+            if (is_m_gpx(path)
+                    and self._ten_tracks_parent(path) is not None):
+                menu.addAction('Переместить из 10-Tracks',
+                               self.on_move_from_10_tracks)
+            # Редактор точек — только для файлов .wpt.
+            if path.suffix.lower() == '.wpt':
+                menu.addAction('Редактировать точки…', self.on_edit_wpt)
             # Распаковка KMZ в KML — только для файлов .kmz.
             if path.suffix.lower() == '.kmz':
                 menu.addAction('KMZ → KML', self.on_kmz_to_kml)
@@ -2924,6 +3498,7 @@ class MainWindow(QMainWindow):
         self.path_edit.setText(str(p))
         self.scan_dir(p)
         self.update_status()
+        self._set_note_folder(p, force=True)
 
         if (self.tabs.currentIndex() == 1
                 and self.follow_checkbox.isChecked()):
@@ -3037,32 +3612,35 @@ class MainWindow(QMainWindow):
         self._update_toolbar_for_tab(idx)
         if idx != 1:
             return
-        if not self.follow_checkbox.isChecked():
-            return
 
-        start: Optional[Path] = None
-        sel = self._selected_path()
-        if sel is not None:
-            start = sel.parent if sel.is_file() else sel
-        if start is None:
-            start = self.tree_root
+        folder = self.ftp_path_edit.text().strip()
 
-        folder, found = find_target_folder(start)
-        if not found:
-            self.log(
-                f'[FTP] Автоподстановка: начиная от «{start}» не найдено '
-                f'имя вида ГГГГ-ММ-ДД_Место. Выделите нужную папку или '
-                f'введите путь вручную.', 'warn')
-            return
-        if folder == self.ftp_folder and self.ftp_connected:
-            return
-        if folder == self.ftp_path_edit.text().strip() and self.ftp_loading:
-            return
+        if self.follow_checkbox.isChecked():
+            start: Optional[Path] = None
+            sel = self._selected_path()
+            if sel is not None:
+                start = sel.parent if sel.is_file() else sel
+            if start is None:
+                start = self.tree_root
 
-        self.ftp_path_edit.setText(folder)
-        self.log(f'[FTP] Автоподстановка папки: {folder} '
-                 f'(источник: {start})', 'cfg')
-        self.ftp_load(folder)
+            found_folder, found = find_target_folder(start)
+            if found:
+                folder = found_folder
+                self.ftp_path_edit.setText(folder)
+                self.log(f'[FTP] Автоподстановка папки: {folder} '
+                         f'(источник: {start})', 'cfg')
+            else:
+                self.log(
+                    f'[FTP] Автоподстановка: начиная от «{start}» не найдено '
+                    f'имя вида ГГГГ-ММ-ДД_Место. Выделите нужную папку или '
+                    f'введите путь вручную.', 'warn')
+
+        # Переход на вкладку всегда перечитывает листинг с сервера,
+        # даже если эта папка уже открыта: пока мы были на «Файлах»,
+        # содержимое могло измениться. Если слежение выключено,
+        # обновляем папку из поля «Путь».
+        if folder:
+            self.ftp_load(folder)
 
     def _on_follow_changed(self, checked: bool):
         self.log(f'[FTP] Слежение за папкой из «Файлы»: '
@@ -3145,6 +3723,56 @@ class MainWindow(QMainWindow):
             self.log(f'[ОШБ] Перенос: {e}', 'error')
             return
         self.rebuild_tree()
+
+    @staticmethod
+    def _ten_tracks_parent(path: Path) -> Optional[Path]:
+        """Папка уровнем выше, если path лежит прямо в «10-Tracks»."""
+        folder = path.parent
+        if folder.name.lower() != '10-tracks':
+            return None
+        parent = folder.parent
+        if parent == folder:
+            return None
+        return parent
+
+    def on_move_from_10_tracks(self):
+        """Переносит файл из 10-Tracks в основную папку (уровнем выше).
+
+        Доступно для .gpx с суффиксом дистанции (``100m.gpx``,
+        ``10km.gpx``): такие файлы готовы к отправке на FTP, но из
+        папки 10-Tracks отправка запрещена.
+        """
+        if self._warn_wrong_tab('Переместить из 10-Tracks'):
+            return
+        p = self._selected_path()
+        if p is None or not p.is_file():
+            QMessageBox.information(self, 'Перемещение', 'Выберите файл')
+            return
+        if not is_m_gpx(p):
+            QMessageBox.information(
+                self, 'Перемещение',
+                'Действие доступно только для файлов вида '
+                '<1-4 цифры>m.gpx и <1-2 цифры>km.gpx')
+            return
+        dst_dir = self._ten_tracks_parent(p)
+        if dst_dir is None:
+            QMessageBox.information(
+                self, 'Перемещение',
+                'Файл должен лежать в папке 10-Tracks')
+            return
+        dst = dst_dir / p.name
+        if dst.exists():
+            QMessageBox.critical(self, 'Ошибка',
+                                 f'Уже существует: {dst.name}')
+            return
+        try:
+            shutil.move(str(p), str(dst))
+            self.log(f'[ПЕРЕНОС] {p.name} -> {dst_dir}', 'ok')
+        except OSError as e:
+            self.log(f'[ОШБ] Перенос: {e}', 'error')
+            return
+        self.rebuild_tree()
+        self._select_path(dst)
 
     def on_kmz_to_kml(self):
         """Распаковывает выбранный .kmz в одноимённый .kml.
@@ -3236,6 +3864,31 @@ class MainWindow(QMainWindow):
         if p is None or not p.is_file():
             return
         self.open_path(p)
+
+    def on_edit_wpt(self):
+        """Редактор точек выбранного файла .wpt.
+
+        Изменённые строки пишутся в файл, остальные остаются как были —
+        вместе с кодировкой и заголовком OziExplorer.
+        """
+        if self._warn_wrong_tab('Редактировать точки .wpt'):
+            return
+        p = self._selected_path()
+        if p is None or not p.is_file() or p.suffix.lower() != '.wpt':
+            QMessageBox.information(self, 'Точки .wpt',
+                                    'Выберите файл .wpt')
+            return
+        try:
+            dlg = WptEditorDialog(self, p)
+        except OSError as e:
+            self.log(f'[ОШБ] Чтение {p.name}: {e}', 'error')
+            self._show_notice_or_box('Точки .wpt',
+                                     f'Не удалось прочитать файл: {e}')
+            return
+        if dlg.exec() != QDialog.Accepted or not dlg.saved:
+            return
+        self.log(f'[WPT] {p.name}: сохранено точек {len(dlg.records)}', 'ok')
+        self.rebuild_tree()
 
     def on_open_in_ozi(self):
         """Открывает выделенный файл в OziExplorer.
@@ -3749,12 +4402,131 @@ class MainWindow(QMainWindow):
 
     # ---------- close ----------
     def closeEvent(self, event):
+        self._save_note(silent=True)
         self._save_ui_state()
         self._stop_watch()
         self._stop_downloads_watch()
         super().closeEvent(event)
 
 # ====================== диалоги ======================
+
+class NotesSearchDialog(QDialog):
+    """Поиск по всем заметкам к папкам.
+
+    Список фильтруется по мере ввода: ищем и по тексту заметки, и по
+    пути папки. Двойной клик или «Перейти» возвращает выбранную папку
+    в MainWindow, где она открывается в дереве.
+    """
+
+    def __init__(self, parent, store: NotesStore):
+        super().__init__(parent)
+        self.setWindowTitle('Поиск по заметкам')
+        self.setMinimumSize(620, 420)
+        self.resize(820, 520)
+        self.store = store
+        self._matches = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        hint = QLabel(
+            'Поиск идёт по тексту заметок и по пути папки. '
+            'Двойной клик по результату открывает папку в дереве.')
+        hint.setObjectName('Dim')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText(
+            'Например: проверить трек или 2026-09-23_Moscow')
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self.refresh)
+        self.search_edit.returnPressed.connect(self._accept_selected)
+        layout.addWidget(self.search_edit)
+
+        split = QSplitter(Qt.Horizontal)
+        self.results = QListWidget()
+        self.results.setAlternatingRowColors(True)
+        self.results.currentItemChanged.connect(self._show_current)
+        self.results.itemDoubleClicked.connect(
+            lambda _item: self._accept_selected())
+        split.addWidget(self.results)
+
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText('Текст заметки')
+        split.addWidget(self.preview)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        layout.addWidget(split, 1)
+
+        self.status_label = QLabel('')
+        self.status_label.setObjectName('Dim')
+        layout.addWidget(self.status_label)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.open_btn = QPushButton('Перейти')
+        self.open_btn.setObjectName('Accent')
+        self.open_btn.setToolTip('Открыть папку выбранной заметки')
+        self.open_btn.clicked.connect(self._accept_selected)
+        buttons.addWidget(self.open_btn)
+        close_btn = QPushButton('Закрыть')
+        close_btn.clicked.connect(self.reject)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        self.refresh()
+        self.search_edit.setFocus()
+
+    def refresh(self):
+        """Перечитывает результаты под текущий запрос."""
+        self._matches = self.store.search(self.search_edit.text())
+        self.results.clear()
+
+        for match in self._matches:
+            item = QListWidgetItem(
+                f'{match.path.name}  —  {match.snippet or "без текста"}')
+            item.setData(Qt.UserRole, str(match.path))
+            item.setToolTip(f'{match.path}\n\n{match.text}')
+            self.results.addItem(item)
+
+        if not len(self.store):
+            self.status_label.setText('Заметок пока нет')
+        elif not self._matches:
+            self.status_label.setText('Ничего не найдено')
+        else:
+            self.status_label.setText(
+                f'Найдено: {len(self._matches)} из {len(self.store)}')
+
+        if self._matches:
+            self.results.setCurrentRow(0)
+        else:
+            self.preview.clear()
+        self.open_btn.setEnabled(bool(self._matches))
+
+    def _show_current(self, current: Optional[QListWidgetItem],
+                      _previous: Optional[QListWidgetItem]):
+        """Показывает полный текст выбранной заметки."""
+        if current is None:
+            self.preview.clear()
+            return
+        path = current.data(Qt.UserRole)
+        self.preview.setPlainText(self.store.get(Path(path)) if path else '')
+
+    def selected_path(self) -> Optional[Path]:
+        """Папка выбранного результата или None."""
+        item = self.results.currentItem()
+        if item is None:
+            return None
+        value = item.data(Qt.UserRole)
+        return Path(value) if value else None
+
+    def _accept_selected(self):
+        if self.selected_path() is not None:
+            self.accept()
+
 
 class SettingsDialog(QDialog):
     def __init__(self, parent, config: dict):
@@ -4167,8 +4939,9 @@ class HelpDialog(QDialog):
   Ctrl+Y    Копировать имя выделенного (без расширения)
   Ctrl+Shift+C  Копировать полный путь
   Ctrl+E    Показать файл в проводнике
-  Ctrl+Shift+O  Открыть файл в OziExplorer
   Ctrl+L    Показать / скрыть панель журнала
+  Ctrl+M    Показать панель заметок
+  Ctrl+Shift+F  Поиск по всем заметкам
   Ctrl+D    Проверить папку загрузок
   Ctrl+1    Вкладка «Файлы»
   Ctrl+2    Вкладка «FTP»
@@ -4189,14 +4962,37 @@ class HelpDialog(QDialog):
                            переместить, копировать имя или путь,
                            показать в проводнике, открыть в OziExplorer
 
+Точки .wpt:
+  Пункт «Редактировать точки…» в контекстном меню файла .wpt
+  открывает редактор точек OziExplorer. В окне — таблица точек: имя,
+  координаты, цвет и описание.
+  Кнопки «Добавить…», «Изменить…», «Удалить», «Выше», «Ниже»;
+  изменения пишутся в файл кнопкой «Сохранить». Координаты в карточке
+  можно вводить в десятичных градусах (56.909284), градусах и минутах
+  (56° 54.557′) или градусах, минутах и секундах (56° 54′ 33.4″);
+  список «Формат координат» переключает показ, а принять можно любой
+  формат. Полушарие — буквой N/S/E/W или С/Ю/З/В. В карточке точки
+  «Цвет» выбирается из списка: красный, морской волны, зелёный, жёлтый,
+  а пункт «Кастомный…» открывает палитру. Цвет задаёт фон подписи; цвет
+  текста всегда чёрный. Кнопка «Сбросить» возвращает цвет OziExplorer
+  по умолчанию.
+  Неизменённые строки остаются как были — вместе с заголовком,
+  кодировкой (ANSI/cp1251 или UTF-8) и переводами строк.
+  Запятые в имени и описании записываются как «;»: запятая разделила
+  бы поля файла. Пустая высота в карточке означает «неизвестна».
+  Кнопка «Заменить «с» на «c»» в окне редактора заменяет кириллическую
+  «с» латинской (заглавную «С» — на «C») в именах и описаниях всех
+  точек. В cp1251 заглавная «С» — это байт 0xD1, которым OziExplorer
+  записывает запятую, и в его окне буква выглядит разделителем. Замена
+  делается в памяти: в файл она попадает по кнопке «Сохранить».
+
 KMZ → KML:
   В контекстном меню файла .kmz. Делает копию с расширением .zip,
   извлекает из неё .kml под именем исходного файла и удаляет
   промежуточный .zip — остаются только .kmz и .kml.
 
 OziExplorer:
-  Кнопка «В OziExplorer» на панели (Ctrl+Shift+O) и пункт
-  «Открыть в OziExplorer» в контекстном меню файла форматов
+  Пункт «Открыть в OziExplorer» в контекстном меню файла форматов
   .gpx, .kml, .plt, .wpt, .map.
   OziExplorer открывает каждую команду в новом окне — чтобы файл
   грузился в уже открытое окно, используется OziAPI.dll. Она лежит
@@ -4242,13 +5038,29 @@ OziExplorer:
   папка загрузок, oziexp.exe, OziAPI.dll) справа есть кнопка «…» —
   выбрать папку или файл в системном диалоге.
 
-Журнал слева:
-  Панель можно показать или скрыть панель журнала кнопкой «Журнал»
-  на панели инструментов (Ctrl+L) — состояние запоминается между
-  запусками. Журнал сам прокручивается вниз только если вы уже
-  внизу, поэтому чтение истории не срывается. Ctrl+Shift+L копирует
-  журнал целиком, «Правка → Сохранить журнал в файл…» пишет его
-  в .txt.
+Журнал внизу:
+  Панель можно показать или скрыть кнопкой «Журнал» в нижней полосе
+  окна (Ctrl+L) — состояние запоминается между запусками. Журнал сам
+  прокручивается вниз только если вы уже внизу, поэтому чтение истории
+  не срывается. Ctrl+Shift+L копирует журнал целиком,
+  «Правка → Сохранить журнал в файл…» пишет его в .txt.
+
+Заметки к папкам:
+  У каждой папки может быть своя текстовая заметка. Панель «Заметки»
+  находится внизу, в одной области с журналом (вкладки «Журнал» и
+  «Заметки»). Кнопки «Заметки» и «Журнал» — в нижней полосе окна:
+  каждую панель можно скрыть отдельно; Ctrl+M открывает/скрывает
+  заметки, Ctrl+L — журнал. Состояние запоминается.
+  Выберите папку в дереве — её заметка появится в редакторе. Для
+  файла показывается заметка его папки. Текст сохраняется кнопкой
+  «Сохранить» (Ctrl+Enter в поле заметки) или автоматически при
+  переходе к другой папке; «Удалить» очищает заметку.
+  Пункт «Заметка к папке…» есть и в контекстном меню папки.
+  Поиск по всем заметкам — кнопка «Поиск по всем заметкам…» на
+  панели, «Правка → Поиск по заметкам…» или Ctrl+Shift+F. Искать
+  можно по тексту заметки и по пути папки; двойной клик по
+  результату открывает папку в дереве.
+  Заметки хранятся рядом с конфигом в notes.json.
 
 Размеры окна, разделитель и ширины колонок запоминаются в конфиге
 при закрытии окна.
@@ -4278,7 +5090,9 @@ FTP — автоподстановка пути:
   Если он включён, при переходе на вкладку FTP сервис ищет вверх по
   дереву папку вида ГГГГ-ММ-ДД_Место от выделенного элемента (или от
   корня, если ничего не выделено). Если находит — подставляет её в
-  путь FTP и грузит листинг.
+  путь FTP и грузит листинг. Каждый переход на вкладку FTP заново
+  читает листинг с сервера (даже если папка уже открыта); при
+  выключенном слежении обновляется папка из поля «Путь».
 
 FTP — ссылка на папку:
   На вкладке FTP под путём показывается ссылка на корневую папку:
@@ -4310,7 +5124,10 @@ FTP — ссылка на папку:
       трогается: Lisa01_1 → Lisa01_1;
     – дата может быть взята из содержимого .gpx (последняя <time>),
       если её нет в имени;
-    – имена вида <1-4 цифры>m.gpx (100m.gpx) не проверяются.
+    – имена вида <1-4 цифры>m.gpx (100m.gpx) и <1-2 цифры>km.gpx
+      (10km.gpx) не проверяются; файл такого вида из папки 10-Tracks
+      переносится в основную папку пунктом контекстного меню
+      «Переместить из 10-Tracks».
 
   .wpt — только Waypoints_ГГГГММДД.
   Остальные расширения не проверяются.
@@ -4318,7 +5135,7 @@ FTP — ссылка на папку:
 FTP — что можно отправить:
   • .plt — с корректным именем;
   • .wpt — только Waypoints_ГГГГММДД;
-  • .gpx — только <1-4 цифры>m.gpx;
+  • .gpx — только <1-4 цифры>m.gpx или <1-2 цифры>km.gpx;
   • файлы из папки 10-Tracks не отправляются;
   • папка назначения обязательна (залить в корень нельзя).
 
@@ -4675,6 +5492,505 @@ class RenameDialog(QDialog):
         self.accept()
 
 
+class WaypointEditDialog(QDialog):
+    """Одна точка файла .wpt: имя, координаты, высота, дата, описание, цвет."""
+
+    def __init__(self, parent, record: WptRecord, is_new: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle('Новая точка' if is_new else 'Редактирование точки')
+        self.setMinimumWidth(560)
+        self.record = record
+        self.is_new = is_new
+        self.result: Optional[WptRecord] = None
+
+        altitude = ('' if record.altitude_ft == ALTITUDE_UNKNOWN
+                    else f'{record.altitude_m:.1f}')
+        self._initial = {
+            'name': record.name,
+            'lat': _format_wpt_coord(record.lat),
+            'lon': _format_wpt_coord(record.lon),
+            'altitude': altitude,
+            'date': _format_wpt_date(record.date),
+            'description': record.description,
+            'symbol': max(int(record.symbol), 0),
+            'color': record.color,
+            'fore_color': record.fore_color,
+        }
+        # Основной цвет точки — цвет фона подписи. Текст всегда чёрный.
+        self._color = _color_from_wpt(record.color)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self.name_edit = QLineEdit(self._initial['name'])
+        form.addRow('Имя:', self.name_edit)
+
+        # Координаты можно вводить в любом из трёх форматов; список лишь
+        # переключает, как они показаны в полях.
+        self.coord_format = WPT_COORD_DECIMAL
+
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(WPT_COORD_FORMATS)
+        self.format_combo.setToolTip(
+            'Формат показа координат; вводить можно в любом из трёх')
+        self.format_combo.currentIndexChanged.connect(
+            self._change_coord_format)
+        form.addRow('Формат координат:', self.format_combo)
+
+        self.lat_edit = QLineEdit(self._initial['lat'])
+        form.addRow('Широта:', self.lat_edit)
+
+        self.lon_edit = QLineEdit(self._initial['lon'])
+        form.addRow('Долгота:', self.lon_edit)
+        self._update_coord_placeholders()
+
+        self.alt_edit = QLineEdit(self._initial['altitude'])
+        self.alt_edit.setPlaceholderText('пусто — высота неизвестна')
+        form.addRow('Высота, м:', self.alt_edit)
+
+        self.date_edit = QLineEdit(self._initial['date'])
+        self.date_edit.setPlaceholderText('ДД.ММ.ГГГГ ЧЧ:ММ')
+        form.addRow('Дата и время:', self.date_edit)
+
+        self.description_edit = QLineEdit(self._initial['description'])
+        form.addRow('Описание:', self.description_edit)
+
+        self.symbol_spin = QSpinBox()
+        self.symbol_spin.setRange(0, 999)
+        self.symbol_spin.setValue(self._initial['symbol'])
+        self.symbol_spin.setToolTip('Номер символа OziExplorer (0 — по умолчанию)')
+        form.addRow('Символ:', self.symbol_spin)
+
+        self._add_color_row(form, 'Цвет:')
+
+        layout.addLayout(form)
+
+        hint = QLabel('Координаты можно вводить в десятичных градусах, '
+                      'градусах с минутами или с минутами и секундами. '
+                      'Цвет задаётся фоном подписи, текст всегда чёрный. '
+                      'Запятые в имени и описании сохраняются как «;», '
+                      'кириллическая «с» — как латинская «c». '
+                      'Пустая высота — «неизвестна».')
+        hint.setObjectName('Dim')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText('Применить')
+        buttons.button(QDialogButtonBox.Cancel).setText('Отмена')
+        buttons.accepted.connect(self._apply)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.name_edit.setFocus()
+        self.name_edit.selectAll()
+
+    # ---------- координаты ----------
+
+    def _update_coord_placeholders(self):
+        if self.coord_format == WPT_COORD_DM:
+            lat_hint, lon_hint = ('например, 56° 54.557′',
+                                  'например, 60° 49.105′')
+        elif self.coord_format == WPT_COORD_DMS:
+            lat_hint, lon_hint = ('например, 56° 54′ 33.4″',
+                                  'например, 60° 49′ 6.3″')
+        else:
+            lat_hint, lon_hint = ('например, 56.909284',
+                                  'например, 60.818415')
+        self.lat_edit.setPlaceholderText(lat_hint)
+        self.lon_edit.setPlaceholderText(lon_hint)
+
+    def _change_coord_format(self, index: int):
+        """Переформатирует введённые координаты в выбранный вид."""
+        self.coord_format = index
+        for edit in (self.lat_edit, self.lon_edit):
+            value = _parse_wpt_coord(edit.text())
+            if value is not None:
+                edit.setText(_format_wpt_coord(value, index))
+        self._update_coord_placeholders()
+
+    # ---------- цвет ----------
+
+    def _add_color_row(self, form: QFormLayout, label: str) -> QComboBox:
+        """Строка формы: список готовых цветов фона и сброс к умолчанию."""
+        combo = QComboBox()
+        self.color_combo = combo
+        combo.setMinimumWidth(220)
+        combo.setToolTip('Цвет фона подписи точки; текст всегда чёрный')
+        for name, preset in WPT_COLOR_PRESETS:
+            combo.addItem(_color_icon(preset), name)
+        combo.addItem(_color_icon(None), WPT_CUSTOM_COLOR)
+
+        reset = QPushButton('Сбросить')
+        reset.setToolTip('Вернуть цвет OziExplorer по умолчанию')
+        reset.clicked.connect(lambda _checked=False: self._set_color(None))
+
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(6)
+        row_layout.addWidget(combo, 1)
+        row_layout.addWidget(reset)
+        form.addRow(label, row)
+
+        # Показываем цвет записи и подключаем обработчик только после
+        # заполнения списка, иначе выбор пункта вызвал бы палитру.
+        self._color = _color_from_wpt(self.record.color)
+        self._set_color(self._color)
+        combo.currentIndexChanged.connect(self._on_color_index)
+        return combo
+
+    def _custom_index(self) -> int:
+        return len(WPT_COLOR_PRESETS)
+
+    def _preset_index(self, color: QColor) -> int:
+        """Пункт списка для цвета; «кастомный», если он не из готовых."""
+        value = _color_to_wpt(color)
+        for index, (_name, preset) in enumerate(WPT_COLOR_PRESETS):
+            if _color_to_wpt(preset) == value:
+                return index
+        return self._custom_index()
+
+    def _set_color(self, color: Optional[QColor]):
+        """Показывает цвет в списке: готовый пункт, «кастомный» или пусто."""
+        self._color = color
+        combo = self.color_combo
+        custom = self._custom_index()
+        combo.blockSignals(True)
+        try:
+            if color is None:
+                combo.setCurrentIndex(-1)
+                combo.setItemText(custom, WPT_CUSTOM_COLOR)
+                combo.setItemIcon(custom, _color_icon(None))
+            else:
+                index = self._preset_index(color)
+                combo.setCurrentIndex(index)
+                if index == custom:
+                    combo.setItemText(
+                        custom, f'Кастомный ({color.name().upper()})')
+                    combo.setItemIcon(custom, _color_icon(color))
+        finally:
+            combo.blockSignals(False)
+
+    def _on_color_index(self, index: int):
+        if index < 0:
+            self._color = None
+            return
+        if index == self._custom_index():
+            self._pick_color()
+            return
+        self._color = QColor(WPT_COLOR_PRESETS[index][1])
+
+    def _pick_color(self):
+        """Палитра для «кастомного» пункта; отмена возвращает прежний выбор."""
+        initial = self._color or QColor('#ffffff')
+        chosen = QColorDialog.getColor(initial, self, 'Цвет')
+        if chosen.isValid():
+            self._set_color(chosen)
+        else:
+            self._set_color(self._color)
+
+    def _apply(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.critical(self, 'Ошибка', 'Укажите имя точки')
+            self.name_edit.setFocus()
+            return
+
+        lat = _parse_wpt_coord(self.lat_edit.text())
+        if lat is None or not -90 <= lat <= 90:
+            QMessageBox.critical(self, 'Ошибка',
+                                 'Широта должна быть числом от -90 до 90')
+            self.lat_edit.setFocus()
+            return
+
+        lon = _parse_wpt_coord(self.lon_edit.text())
+        if lon is None or not -180 <= lon <= 180:
+            QMessageBox.critical(self, 'Ошибка',
+                                 'Долгота должна быть числом от -180 до 180')
+            self.lon_edit.setFocus()
+            return
+
+        altitude_text = self.alt_edit.text().strip()
+        altitude_m = None
+        if altitude_text:
+            try:
+                altitude_m = float(altitude_text.replace(',', '.'))
+            except ValueError:
+                QMessageBox.critical(
+                    self, 'Ошибка',
+                    'Высота должна быть числом в метрах или пустой')
+                self.alt_edit.setFocus()
+                return
+
+        date_text = self.date_edit.text().strip()
+        moment = None
+        if date_text != self._initial['date']:
+            moment = _parse_wpt_date(date_text)
+            if moment is None:
+                QMessageBox.critical(
+                    self, 'Ошибка',
+                    'Дата должна быть в формате ДД.ММ.ГГГГ ЧЧ:ММ')
+                self.date_edit.setFocus()
+                return
+
+        # Меняем только тронутые поля: строка файла, которую открыли и
+        # применили без правок, должна остаться байт в байт.
+        record = self.record
+        if name != record.name:
+            record.name = name
+        if lat != record.lat:
+            record.lat = lat
+        if lon != record.lon:
+            record.lon = lon
+        if altitude_text != self._initial['altitude']:
+            record.altitude_ft = (ALTITUDE_UNKNOWN if altitude_m is None
+                                  else altitude_m / METERS_IN_FOOT)
+        if moment is not None:
+            record.date = datetime_to_delphi(moment)
+        description = self.description_edit.text().strip()
+        if description != record.description:
+            record.description = description
+        if self.symbol_spin.value() != self._initial['symbol']:
+            record.symbol = self.symbol_spin.value()
+        color = _color_to_wpt(self._color)
+        if color != self._initial['color']:
+            record.color = color
+        # Текст подписи всегда чёрный, даже если в файле был другой цвет.
+        if record.fore_color != 0:
+            record.fore_color = 0
+
+        self.result = record
+        self.accept()
+
+
+class WptEditorDialog(QDialog):
+    """Редактор файла точек OziExplorer (.wpt).
+
+    Показывает точки файла и позволяет добавлять, править, удалять и
+    переставлять их. Неизменённые строки пишутся обратно байт в байт —
+    вместе с исходной кодировкой, заголовком и переводами строк.
+    """
+
+    COLUMNS = ('№', 'Имя', 'Широта', 'Долгота', 'Цвет', 'Описание')
+
+    def __init__(self, parent, path: Path):
+        super().__init__(parent)
+        self.setWindowTitle('Точки OziExplorer')
+        self.resize(980, 560)
+        self.setMinimumSize(720, 380)
+        self.path = Path(path)
+        self.wpt = read_wpt_file(self.path)
+        self.saved = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.title = QLabel()
+        self.title.setObjectName('Heading')
+        self.title.setWordWrap(True)
+        layout.addWidget(self.title)
+
+        self.table = QTableWidget(0, len(self.COLUMNS), self)
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.doubleClicked.connect(lambda _index: self._edit())
+        self.table.itemSelectionChanged.connect(self._sync_buttons)
+
+        header = self.table.horizontalHeader()
+        for column in range(len(self.COLUMNS) - 1):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(self.COLUMNS) - 1,
+                                    QHeaderView.Stretch)
+        layout.addWidget(self.table, 1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        self.add_btn = QPushButton('Добавить…')
+        self.add_btn.clicked.connect(self._add)
+        actions.addWidget(self.add_btn)
+        self.edit_btn = QPushButton('Изменить…')
+        self.edit_btn.clicked.connect(self._edit)
+        actions.addWidget(self.edit_btn)
+        self.delete_btn = QPushButton('Удалить')
+        self.delete_btn.clicked.connect(self._delete)
+        actions.addWidget(self.delete_btn)
+        actions.addSpacing(12)
+        self.up_btn = QPushButton('Выше')
+        self.up_btn.clicked.connect(lambda: self._move(-1))
+        actions.addWidget(self.up_btn)
+        self.down_btn = QPushButton('Ниже')
+        self.down_btn.clicked.connect(lambda: self._move(1))
+        actions.addWidget(self.down_btn)
+        actions.addSpacing(12)
+        self.normalize_btn = QPushButton('Заменить «с» на «c»')
+        self.normalize_btn.setToolTip(
+            'Заменить кириллическую «с» латинской «c» в именах и '
+            'описаниях всех точек')
+        self.normalize_btn.clicked.connect(self._normalize_text)
+        actions.addWidget(self.normalize_btn)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        hint = QLabel('Двойной клик по строке — изменить точку, в том числе '
+                      'цвет. Изменения попадут в файл по кнопке '
+                      '«Сохранить». Кириллическая «с» в имени и описании '
+                      'записывается латинской «c».')
+        hint.setObjectName('Dim')
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText('Сохранить')
+        buttons.button(QDialogButtonBox.Save).setObjectName('Accent')
+        buttons.button(QDialogButtonBox.Cancel).setText('Отмена')
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._refresh()
+
+    @property
+    def records(self) -> List[WptRecord]:
+        return self.wpt.records
+
+    # ---------- таблица ----------
+
+    def _update_title(self):
+        count = len(self.records)
+        self.title.setText(f'{self.path.name} — точек: {count}')
+        self.title.setToolTip(str(self.path))
+
+    def _refresh(self, select: Optional[int] = None):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self.records))
+        for row, record in enumerate(self.records):
+            color = _color_from_wpt(record.color)
+            values = (
+                str(row + 1),
+                record.name,
+                _format_wpt_coord(record.lat),
+                _format_wpt_coord(record.lon),
+                _color_name(color),
+                record.description,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in (0, 2, 3):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                elif column == 4:
+                    item.setIcon(_color_icon(color))
+                    item.setToolTip('Цвет по умолчанию (как в OziExplorer)'
+                                    if color is None else value)
+                self.table.setItem(row, column, item)
+        self.table.blockSignals(False)
+
+        if select is not None and 0 <= select < len(self.records):
+            self.table.selectRow(select)
+        elif self.records:
+            self.table.selectRow(0)
+        self._sync_buttons()
+        self._update_title()
+
+    def _selected_row(self) -> int:
+        row = self.table.currentRow()
+        if 0 <= row < len(self.records):
+            return row
+        return -1
+
+    def _sync_buttons(self):
+        row = self._selected_row()
+        has_selection = row >= 0
+        self.edit_btn.setEnabled(has_selection)
+        self.delete_btn.setEnabled(has_selection)
+        self.up_btn.setEnabled(has_selection and row > 0)
+        self.down_btn.setEnabled(has_selection
+                                 and row < len(self.records) - 1)
+
+    # ---------- действия ----------
+
+    def _add(self):
+        dlg = WaypointEditDialog(self, self.wpt.new_record(), is_new=True)
+        if dlg.exec() != QDialog.Accepted or dlg.result is None:
+            return
+        self.records.append(dlg.result)
+        self._refresh(select=len(self.records) - 1)
+
+    def _edit(self):
+        row = self._selected_row()
+        if row < 0:
+            return
+        dlg = WaypointEditDialog(self, self.records[row])
+        if dlg.exec() != QDialog.Accepted or dlg.result is None:
+            return
+        self._refresh(select=row)
+
+    def _delete(self):
+        row = self._selected_row()
+        if row < 0:
+            return
+        point = self.records[row]
+        name = point.name or 'без имени'
+        if QMessageBox.question(
+                self, 'Удаление точки',
+                f'Удалить точку «{name}»?') != QMessageBox.Yes:
+            return
+        del self.records[row]
+        self._refresh(select=min(row, len(self.records) - 1))
+
+    def _move(self, delta: int):
+        row = self._selected_row()
+        target = row + delta
+        if row < 0 or not 0 <= target < len(self.records):
+            return
+        self.records[row], self.records[target] = (
+            self.records[target], self.records[row])
+        self._refresh(select=target)
+
+    def _normalize_text(self):
+        """Меняет в именах и описаниях «с»/«С» на латинские «c»/«C».
+
+        Работает в памяти: файл перепишется по кнопке «Сохранить», так
+        что замену можно отменить, просто закрыв окно.
+        """
+        current = self._selected_row()
+        count = 0
+        for record in self.records:
+            if record.normalize_text_fields():
+                count += 1
+        self._refresh(select=current if current >= 0 else None)
+        if not count:
+            QMessageBox.information(
+                self, 'Замена «с» на «c»',
+                'Кириллической «с» в именах и описаниях нет.')
+            return
+        QMessageBox.information(
+            self, 'Замена «с» на «c»',
+            f'Заменено в точках: {count}.\n'
+            'Изменения попадут в файл по кнопке «Сохранить».')
+
+    def _save(self):
+        try:
+            self.wpt.save(self.path)
+        except OSError as e:
+            QMessageBox.critical(self, 'Ошибка',
+                                 f'Не удалось сохранить файл:\n{e}')
+            return
+        self.saved = True
+        self.accept()
+
+
 class NewFolderDialog(QDialog):
     def __init__(self, parent, config: dict, default_dir: Path):
         super().__init__(parent)
@@ -4718,7 +6034,10 @@ class NewFolderDialog(QDialog):
 
         if is_root:
             self.tracks_cb = QCheckBox('Создать внутри 10-Tracks')
-            self.tracks_cb.setChecked(False)
+            # По умолчанию новая папка создаётся вместе с 10-Tracks:
+            # в неё обычно складывают скачанные треки.
+            self.tracks_cb.setChecked(True)
+            self.with_10_tracks = True
             layout.addWidget(self.tracks_cb)
         else:
             self.tracks_cb = None

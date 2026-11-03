@@ -84,7 +84,7 @@ def is_uploadable(path: Path, info: Optional[dict] = None) -> bool:
 
 
 def upload_extensions_hint() -> str:
-    return '*.plt, *.wpt, *<1-4 цифры>m.gpx'
+    return '*.plt, *.wpt, *<1-4 цифры>m.gpx, *<1-2 цифры>km.gpx'
 
 
 def upload_reason_for(path: Path, info: Optional[dict] = None) -> str:
@@ -94,7 +94,8 @@ def upload_reason_for(path: Path, info: Optional[dict] = None) -> str:
     if is_in_10_tracks(path):
         return 'файлы из папки «10-Tracks» на FTP не отправляются'
     if suf == '.gpx':
-        return 'для .gpx разрешены только имена вида <1-4 цифры>m.gpx'
+        return ('для .gpx разрешены только имена вида '
+                '<1-4 цифры>m.gpx или <1-2 цифры>km.gpx')
     if info is None:
         info = analyze_file(path)
     return info['reason'] or 'имя не соответствует требованиям'

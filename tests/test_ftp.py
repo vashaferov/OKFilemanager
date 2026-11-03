@@ -285,6 +285,10 @@ class TestIsUploadable:
         '20260917_9999m.gpx',
         'track_5M.gpx',
         '_100m.gpx',
+        '10km.gpx',
+        '99km.gpx',
+        '20260917_10km.gpx',
+        'track_5KM.gpx',
     ])
     def test_gpx_with_m_suffix(self, tmp_path, name):
         p = touch(tmp_path / name)
@@ -299,7 +303,9 @@ class TestIsUploadable:
         '2026-09-17_11-55_бабушка.gpx',
         'track.gpx',
         'm.gpx',
+        'km.gpx',
         '12345m.gpx',
+        '100km.gpx',
         'track_100ms.gpx',
         'track_m100.gpx',
         '2026-09-23 Безымянный трек.gpx',
@@ -421,11 +427,14 @@ class TestUploadMatrix:
     @pytest.mark.parametrize('name,expected', [
         ('1m.gpx',                      True),
         ('100m.gpx',                    True),
+        ('10km.gpx',                    True),
+        ('20260917_10km.gpx',           True),
         ('20260917_9999m.gpx',          True),
         ('20260917_lisa_1.gpx',         False),
-        ('20260917_Ivanov.gpx',         False),  # .gpx — только *m.gpx
+        ('20260917_Ivanov.gpx',         False),  # .gpx — только *m/*km.gpx
         ('track.gpx',                   False),
         ('12345m.gpx',                  False),
+        ('100km.gpx',                   False),
         ('20260923_Ivanov.plt',         True),
         ('20260923_ivanov.plt',         False),  # нужен F5/F7
         ('20260923_Иванов.plt',         False),  # нужен F5/F7
