@@ -2397,6 +2397,8 @@ class MainWindow(QMainWindow):
         self._act(m_edit, 'Переименовать…', 'F2', self.on_rename)
         self._act(m_edit, 'Переместить…', 'Ctrl+X', self.on_move,
                   QStyle.SP_FileDialogToParent)
+        self._act(m_edit, 'Удалить…', None, self.on_delete_selected,
+                  QStyle.SP_TrashIcon)
         self._act(m_edit, 'Копировать имя', 'Ctrl+Y', self.on_copy_name)
         self._act(m_edit, 'Копировать путь', 'Ctrl+Shift+C',
                   self.on_copy_path)
@@ -2530,6 +2532,8 @@ class MainWindow(QMainWindow):
         add('files', 'Переместить', self.on_move,
             'Переместить в другую папку (Ctrl+X)',
             QStyle.SP_FileDialogToParent)
+        add('files', 'Удалить', self.on_delete_selected,
+            'Удалить выделенный локальный файл', QStyle.SP_TrashIcon)
         add('files', 'Копировать имя', self.on_copy_name,
             'Скопировать имя в буфер обмена (Ctrl+Y)',
             QStyle.SP_FileIcon)
@@ -3418,6 +3422,7 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction('Переименовать…', self.on_rename)
             menu.addAction('Переместить…', self.on_move)
+            menu.addAction('Удалить…', self.on_delete_selected)
             # Быстрый перенос из 10-Tracks в основную папку — для
             # файлов с суффиксом дистанции (100m.gpx / 10km.gpx):
             # из 10-Tracks их нельзя отправить на FTP.
@@ -3723,6 +3728,34 @@ class MainWindow(QMainWindow):
             self.log(f'[ОШБ] Перенос: {e}', 'error')
             return
         self.rebuild_tree()
+
+    def on_delete_selected(self):
+        """Удаляет выделенный локальный файл после подтверждения."""
+        if self._warn_wrong_tab('Удалить'):
+            return
+        p = self._selected_path()
+        if p is None:
+            QMessageBox.information(self, 'Удаление', 'Выберите файл')
+            return
+        if not p.is_file():
+            QMessageBox.information(
+                self, 'Удаление', 'Удаление папок не поддерживается')
+            return
+        if QMessageBox.question(
+                self, 'Подтверждение',
+                f'Удалить файл безвозвратно?\n{p}'
+        ) != QMessageBox.Yes:
+            return
+        try:
+            p.unlink()
+        except OSError as e:
+            self.log(f'[ОШБ] Удалить {p.name}: {e}', 'error')
+            self._show_notice_or_box(
+                'Удаление', f'Не удалить {p.name}: {e}', 'error')
+            return
+        self.log(f'[УДАЛЕНИЕ] Удалён: {p}', 'ok')
+        self.rebuild_tree()
+        self._select_path(p.parent)
 
     @staticmethod
     def _ten_tracks_parent(path: Path) -> Optional[Path]:
@@ -4959,8 +4992,13 @@ class HelpDialog(QDialog):
                            пункт «Открыть» в этом меню
   Enter на папке         — сделать корнем дерева
   Правый клик            — контекстное меню: открыть, переименовать,
-                           переместить, копировать имя или путь,
+                           переместить, удалить, копировать имя или путь,
                            показать в проводнике, открыть в OziExplorer
+
+Удаление локального файла:
+  Кнопка «Удалить» на вкладке «Файлы» или пункт «Удалить…» в
+  контекстном меню. Удаляется только файл, после подтверждения;
+  папки не удаляются, FTP не затрагивается.
 
 Точки .wpt:
   Пункт «Редактировать точки…» в контекстном меню файла .wpt

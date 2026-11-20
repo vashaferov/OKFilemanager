@@ -390,8 +390,9 @@ class TestTabToolbar:
 
         visible = self._visible(window, 'files')
         for label in ('Вверх', 'Обновить', 'Исправить все', 'Папка',
-                      'Переименовать', 'Переместить', 'Копировать имя',
-                      'На FTP', 'В проводнике', 'Проверить загрузки'):
+                      'Переименовать', 'Переместить', 'Удалить',
+                      'Копировать имя', 'На FTP', 'В проводнике',
+                      'Проверить загрузки'):
             assert label in visible
         assert self._visible(window, 'ftp') == []
         # Редактор точек .wpt и открытие в OziExplorer доступны из
@@ -685,8 +686,8 @@ class TestNavigation:
         assert menu.executed is True
         assert menu.items == ['Копировать имя', 'Копировать путь',
                               'Показать в проводнике', 'Переименовать…',
-                              'Переместить…', 'Открыть в OziExplorer',
-                              'Открыть']
+                              'Переместить…', 'Удалить…',
+                              'Открыть в OziExplorer', 'Открыть']
         assert opened == []                 # сам файл не открывается
         assert window._selected_path() == target
 
@@ -921,8 +922,8 @@ class TestContextMenu:
 
         assert menu.items == ['Копировать имя', 'Копировать путь',
                               'Показать в проводнике', 'Переименовать…',
-                              'Переместить…', 'Открыть в OziExplorer',
-                              'Открыть']
+                              'Переместить…', 'Удалить…',
+                              'Открыть в OziExplorer', 'Открыть']
 
     def test_kmz_file_menu_has_convert(self, window, files, monkeypatch,
                                        menus):
@@ -1584,6 +1585,86 @@ class TestTabGuards:
 
         assert window.notice_bar.isVisibleTo(window) is True
         assert 'файловый менеджер' in window.notice_label.text()
+
+
+@pytest.mark.story('Удаление локальных файлов')
+class TestLocalDelete:
+    def test_context_menu_has_delete(self, window, files, menus):
+        target = files / 'track.plt'
+        item = select(window, target)
+        index = window.tree_model.indexFromItem(item)
+
+        menu = window.build_element_menu(index, target)
+
+        assert 'Удалить…' in menu.items
+
+    def test_without_selection(self, window, msgbox):
+        window.on_delete_selected()
+
+        assert msgbox.kinds == ['information']
+        assert 'Выберите файл' in msgbox.texts()[0]
+
+    def test_directory_refused(self, window, files, msgbox):
+        folder = files / '2026-09-23_Moscow'
+        select(window, folder)
+
+        window.on_delete_selected()
+
+        assert 'Удаление папок не поддерживается' in msgbox.texts()[0]
+        assert folder.is_dir()
+
+    def test_ftp_tab_refused(self, window, files, tasks):
+        target = files / 'track.plt'
+        select(window, target)
+        window.tabs.setCurrentIndex(1)
+
+        window.on_delete_selected()
+
+        assert target.exists()
+        assert tasks.delete == []
+        assert window.notice_bar.isVisibleTo(window) is True
+        assert 'вкладке «Файлы»' in window.notice_label.text()
+
+    def test_cancel_keeps_file(self, window, files, msgbox, tasks):
+        target = files / 'track.plt'
+        select(window, target)
+        msgbox.answer = 'No'
+
+        window.on_delete_selected()
+
+        assert msgbox.kinds == ['question']
+        assert target.exists()
+        assert tasks.delete == []
+
+    @pytest.mark.smoke
+    def test_confirmed_delete_removes_file(self, window, files, msgbox, tasks):
+        target = files / 'track.plt'
+        select(window, target)
+
+        window.on_delete_selected()
+
+        assert not target.exists()
+        assert '[УДАЛЕНИЕ] Удалён:' in log_text(window)
+        assert tasks.delete == []
+        # После удаления выделение переходит на папку, а не остаётся
+        # на исчезнувшем файле.
+        assert window._selected_path() == files.resolve()
+
+    def test_unlink_error_is_reported(self, window, files, msgbox,
+                                      monkeypatch):
+        target = files / 'track.plt'
+        select(window, target)
+
+        def fail(self, *args, **kwargs):
+            raise OSError('нет прав')
+
+        monkeypatch.setattr(Path, 'unlink', fail)
+
+        window.on_delete_selected()
+
+        assert target.exists()
+        assert 'Не удалить track.plt' in window.notice_label.text()
+        assert 'нет прав' in log_text(window)
 
 
 @pytest.mark.story('Журнал: автопрокрутка')
